@@ -1,7 +1,7 @@
 # 规格：ForwardX 受管 Xray
 
 状态：已批准  
-版本：0.21
+版本：0.22
 日期：2026-09-04
 
 实现状态：第一版 `XRAY-TASK-001..037`、多协议基础 `XRAY-TASK-038..042`、Xray-native profile `XRAY-TASK-043..052`、MTProto 独立服务首片 `XRAY-TASK-053`、AmneziaWG userspace 独立服务 `XRAY-TASK-054`、出口节点/中转联动 `XRAY-TASK-055` 与六种本地转发方式出口引用 `XRAY-TASK-056` 已完成；DNSPod 快速配置 `XRAY-TASK-057` 与六引擎创建/切换 `XRAY-TASK-058` 的可体验主流程已实现，集中运行验证待补；TUN 保持 `NOT_IMPLEMENTED`。Reality 默认候选为 `v2`，固定 Xray 默认版本仍为 `v26.3.27`。
@@ -87,7 +87,7 @@
 - `XRAY-UI-003` 节点详情支持多个客户端的新增、启停、删除、VLESS URI 复制和二维码展示。
 - `XRAY-UI-004` Reality 私钥不在常规页面显示；分享链接只包含公钥和客户端所需字段。
 - `XRAY-UI-005` 节点删除请求受理后必须关闭该节点详情并清除 URL 中的详情身份，再刷新节点列表；不得重新查询可能已在 observed 收敛后物理清理的节点并把 `NOT_FOUND` 呈现为删除失败。
-- `XRAY-UI-006` 新安装和未迁移环境的普通升级继续默认关闭 Xray 管理员界面；管理员显式执行 `migrate-forwardx` 时，如果旧部署没有 `FORWARDX_XRAY_ENABLED` 设置，迁移安装器必须将其启用。为兼容首跳仍由已加载旧脚本重写 `.env` 的升级，只有显式 Xray 开关完全缺失且持久 `FORWARDPLUS_MIGRATE_AGENTS=true` 时，面板才恢复显示并由新版安装器在下次写环境时持久化为 `1`。已有显式设置和本次进程环境覆盖优先；空值、无法识别值和显式关闭均不得被迁移标记改为开启。
+- `XRAY-UI-006` 管理员 Xray 界面默认开启。为修复早期 ForwardX 迁移脚本留下 `FORWARDX_XRAY_ENABLED=0`、缺失开关或缺失迁移标记后永久隐藏入口的问题，安装器和面板运行时使用 `FORWARDPLUS_XRAY_UI_POLICY_VERSION=1` 区分当前策略与历史状态：策略标记缺失时，历史开关值不具备“管理员主动关闭”的可证明来源，首次启动及升级必须显示 Xray，并由新版安装器把开关和策略标记持久化为 `1`；策略标记为当前版本后，`FORWARDX_XRAY_ENABLED=0`、`false`、`off` 等显式关闭值必须在后续升级中保留。公共设置读取失败仍须隐藏入口，功能开关不得替代后端管理员鉴权。
 - `XRAY-AUTH-001` 所有 Xray 查询、变更、扫描、安装和升级接口只允许管理员调用。
 
 ### 3.7 暂不实现

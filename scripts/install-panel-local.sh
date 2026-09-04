@@ -11,6 +11,7 @@ unset FORWARDPLUS_GITHUB_TOKEN FORWARDX_GITHUB_TOKEN
 PANEL_BUNDLE_PREFIX="${FORWARDX_PANEL_BUNDLE_PREFIX:-forwardx-panel-v}"
 PNPM_VERSION="${FORWARDX_PNPM_VERSION:-10.28.1}"
 ASSETS_PENDING_EXIT_CODE=12
+XRAY_UI_POLICY_VERSION="1"
 ENABLE_ADMIN_ACCOUNT="false"
 MIGRATE_FORWARDX_AGENTS="false"
 GITHUB_ACCELERATOR_URL=""
@@ -136,7 +137,16 @@ normalize_xray_feature_flag() {
 }
 
 resolve_xray_feature_flag() {
-  local existing=""
+  local existing="" policy_version=""
+  if [ "${FORWARDPLUS_XRAY_UI_POLICY_VERSION+x}" = "x" ]; then
+    policy_version="$FORWARDPLUS_XRAY_UI_POLICY_VERSION"
+  else
+    policy_version="$(get_env_value FORWARDPLUS_XRAY_UI_POLICY_VERSION || true)"
+  fi
+  if [ "$policy_version" != "$XRAY_UI_POLICY_VERSION" ]; then
+    printf "1\n"
+    return
+  fi
   if [ "${FORWARDX_XRAY_ENABLED+x}" = "x" ]; then
     normalize_xray_feature_flag "$FORWARDX_XRAY_ENABLED"
     return
@@ -146,11 +156,7 @@ resolve_xray_feature_flag() {
     normalize_xray_feature_flag "$existing"
     return
   fi
-  if [ "$ACTION" = "migrate-forwardx" ] || [ "$MIGRATE_FORWARDX_AGENTS" = "true" ]; then
-    printf "1\n"
-  else
-    printf "0\n"
-  fi
+  printf "1\n"
 }
 
 normalize_github_accelerator_url() {
@@ -900,6 +906,7 @@ MYSQL_CONFIG_PATH=$APP_DIR/data/mysql.json
 JWT_SECRET=$jwt_secret
 XRAY_MASTER_KEY_PATH=$XRAY_MASTER_KEY_PATH
 FORWARDX_XRAY_ENABLED=$xray_enabled
+FORWARDPLUS_XRAY_UI_POLICY_VERSION=$XRAY_UI_POLICY_VERSION
 FORWARDX_PORT_CONFIG_PATH=$APP_DIR/.env
 FORWARDX_PORT_MANAGEMENT=local
 FORWARDX_GITHUB_ACCELERATOR_URL="$GITHUB_ACCELERATOR_URL"

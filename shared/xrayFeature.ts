@@ -1,8 +1,11 @@
+export const XRAY_UI_POLICY_VERSION = "1";
+
 export function isXrayUiFeatureEnabled(
   value: unknown,
-  migratedFromForwardx = false,
+  usesCurrentDefaultOnPolicy = false,
 ): boolean {
-  if (value === undefined) return migratedFromForwardx;
+  if (!usesCurrentDefaultOnPolicy) return true;
+  if (value === undefined) return true;
   if (typeof value !== "string") return false;
   return ["1", "true", "on"].includes(value.trim().toLowerCase());
 }

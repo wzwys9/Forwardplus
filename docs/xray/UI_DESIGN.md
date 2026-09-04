@@ -1,6 +1,6 @@
 # Xray 面板设计
 
-状态：第一版界面已实施；多协议创建流程已批准并按 profile 垂直切片增量开放；DNSPod + Realm 快速配置界面已批准。与 `SPEC.md` 0.21 配套。
+状态：第一版界面已实施；多协议创建流程已批准并按 profile 垂直切片增量开放；DNSPod + Realm 快速配置界面已批准。与 `SPEC.md` 0.22 配套。
 
 ## 1. 导航
 
@@ -18,8 +18,8 @@ Xray 节点
 
 - 路由建议 `/xray`。
 - 使用 admin route，普通用户既不显示菜单也不能访问路由。
-- 第一版发布继续受 `FORWARDX_XRAY_ENABLED` 管理员功能开关保护。新安装和未迁移环境的普通升级默认关闭；显式执行 `migrate-forwardx` 视为管理员已选择切换到 Forwardplus，旧环境没有该设置时迁移安装器自动启用。如果首跳由已经加载到内存的旧升级脚本删除了该字段，持久 `FORWARDPLUS_MIGRATE_AGENTS=true` 可在字段缺失期间恢复界面，新版安装器随后写回规范值。已有显式设置和本次进程环境覆盖优先，显式关闭不得被迁移或后续升级改写为开启。
-- `FORWARDX_XRAY_ENABLED` 仅在字符串值为 `1`、`true` 或 `on`（忽略大小写和首尾空白）时显式开启；一旦字段存在，空值、无法识别值和关闭值均保持关闭。只有字段完全缺失且上述持久迁移标记为真时允许兼容恢复；公共设置查询失败仍保持关闭。
+- 管理员 Xray UI 受 `FORWARDX_XRAY_ENABLED` 控制并默认开启。`FORWARDPLUS_XRAY_UI_POLICY_VERSION=1` 表示部署已经完成默认开启策略迁移；标记缺失的历史部署在首次启动和安装器升级时都按开启处理，不依赖早期迁移是否留下 `FORWARDPLUS_MIGRATE_AGENTS`。
+- 当前策略下，`FORWARDX_XRAY_ENABLED` 的 `1`、`true`、`on`（忽略大小写和首尾空白）表示开启，其他字符串值表示管理员显式关闭；字段缺失仍默认开启。策略标记写入前的历史 `0` 无法证明是管理员设置，会在一次性迁移中改为 `1`。公共设置查询失败仍保持关闭。
 - `system.publicInfo.xrayEnabled` 只公开上述布尔结果，侧边栏和 `/xray` 路由共用该结果；开关不替代后端各 Xray procedure 的管理员鉴权。
 
 ## 2. 页面结构

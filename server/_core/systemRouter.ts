@@ -105,7 +105,10 @@ import {
   type GithubAcceleratorConfig,
   type GithubAcceleratorSettings,
 } from "../../shared/githubAccelerator";
-import { isXrayUiFeatureEnabled } from "../../shared/xrayFeature";
+import {
+  isXrayUiFeatureEnabled,
+  XRAY_UI_POLICY_VERSION,
+} from "../../shared/xrayFeature";
 import { withGithubAuth } from "../githubAuth";
 import { mobileReleaseDownloadPath } from "../mobileReleaseRoute";
 
@@ -1631,7 +1634,7 @@ function publicSystemSettings(all: Record<string, string | null>, activeProtocol
     pluginsEnabled: all.pluginsEnabled === "true",
     xrayEnabled: isXrayUiFeatureEnabled(
       process.env.FORWARDX_XRAY_ENABLED,
-      ENV.migrateForwardxAgents,
+      process.env.FORWARDPLUS_XRAY_UI_POLICY_VERSION === XRAY_UI_POLICY_VERSION,
     ),
     publicHostMonitor: {
       enabled: all.publicHostMonitorEnabled === "true",
@@ -1767,7 +1770,7 @@ export const systemRouter = router({
       pluginsEnabled: all.pluginsEnabled === "true",
       xrayEnabled: isXrayUiFeatureEnabled(
         process.env.FORWARDX_XRAY_ENABLED,
-        ENV.migrateForwardxAgents,
+        process.env.FORWARDPLUS_XRAY_UI_POLICY_VERSION === XRAY_UI_POLICY_VERSION,
       ),
       updateAutoCheckEnabled: isUpdateAutoCheckEnabled(all),
       publicHostMonitor: {

@@ -4,7 +4,7 @@
 
 ### 新增
 
-- 增加默认关闭的管理员受管 Xray 第一版：支持 Linux amd64/arm64 Agent 上固定 Xray-core v26.3.27 的 VLESS + Reality 节点、多客户端、分享二维码、Reality 公网目标检查、端口探测和运行环境管理。
+- 增加管理员受管 Xray 第一版：支持 Linux amd64/arm64 Agent 上固定 Xray-core v26.3.27 的 VLESS + Reality 节点、多客户端、分享二维码、Reality 公网目标检查、端口探测和运行环境管理。
 - 增加 Xray 制品校验、desired/observed generation/hash 同步、配置预检、原子应用、last-good 回滚，以及 Token/面板离线不主动停止既有数据面的安全生命周期。
 - 生产面板在数据库就绪后自动缓存固定 Xray v26.3.27 的 Linux amd64/arm64 制品，完整验证后供所有 Agent 从面板按需下载。
 - 增加 Xray 敏感字段的面板主密钥加密、日志/审计/支持包脱敏，并在密码加密完整备份中认证包装主密钥。
@@ -20,8 +20,19 @@
 
 ### 升级说明
 
-- `FORWARDX_XRAY_ENABLED` 默认关闭；升级面板后由管理员显式设置为 `1`、`true` 或 `on` 才显示入口。旧 Agent 会安全报告能力不足，不会收到 Xray 任务，建议先升级面板再逐台升级 Agent。
+- `FORWARDX_XRAY_ENABLED` 在当前策略中默认开启；旧部署首次升级时会写入策略标记，之后仍可显式关闭。旧 Agent 会安全报告能力不足，不会收到 Xray 任务，建议先升级面板再逐台升级 Agent。
 - 原始数据库备份不包含 Xray 面板主密钥；启用 Xray 后请使用密码加密完整备份，或单独安全备份部署数据目录中的 `xray-master.key`。
+
+## [2.3.282] - 2026-09-04
+
+### 修复与优化
+
+- 修复早期从原版 ForwardX 迁移的面板因遗留 `FORWARDX_XRAY_ENABLED=0` 或缺少迁移标记，导致 Xray 节点入口在反复升级后仍持续隐藏的问题。
+- 增加版本化 Xray UI 策略标记：旧部署首次升级到当前策略时自动开启并持久化；完成迁移后，管理员再次显式关闭会在后续升级中保留。
+
+### 版本
+
+- 面板与 APK Release `2.3.282`，Agent `2.3.0`，ForwardX FXP runtime `2.2.116`，Android APP `2.3.97`。
 
 ## [2.3.281] - 2026-09-04
 

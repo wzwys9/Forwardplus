@@ -88,6 +88,7 @@ function runHarness(options: {
   };
   delete childEnv.FORWARDX_GITHUB_ACCELERATOR_URL;
   delete childEnv.FORWARDX_XRAY_ENABLED;
+  delete childEnv.FORWARDPLUS_XRAY_UI_POLICY_VERSION;
   Object.assign(childEnv, options.env || {});
   const result = spawnSync(bash, [harness, ...(options.args || [])], {
     encoding: "utf8",
@@ -326,7 +327,7 @@ test("both installers expose an explicit ForwardX migration action and persist a
   assert.match(dockerSource, /FORWARDPLUS_MIGRATE_AGENTS: \$\{MIGRATE_FORWARDX_AGENTS\}/);
 });
 
-test("migrate-forwardx enables Xray only when no explicit setting exists", { skip: !bash }, () => {
+test("pre-policy migrations default Xray on while the current policy honors an explicit disable", { skip: !bash }, () => {
   for (const installer of installers) {
     const endMarker = installer.name === "local" ? "install_panel() {" : "ensure_xray_master_key() {";
     const writeCall = installer.name === "local" ? "write_env" : 'write_env "ghcr.io/wzwys9/forwardplus:v2.3.280"';
@@ -349,7 +350,10 @@ sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
       endMarker,
       args: ["migrate-forwardx"],
       prepare: (directory) => {
-        fs.writeFileSync(path.join(directory, ".env"), "FORWARDX_XRAY_ENABLED=off\n");
+        fs.writeFileSync(
+          path.join(directory, ".env"),
+          "FORWARDX_XRAY_ENABLED=off\nFORWARDPLUS_XRAY_UI_POLICY_VERSION=1\n",
+        );
       },
       body: `
 JWT_SECRET=test-secret
@@ -365,9 +369,15 @@ sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
       installer,
       endMarker,
       args: ["migrate-forwardx"],
-      env: { FORWARDX_XRAY_ENABLED: "false" },
+      env: {
+        FORWARDX_XRAY_ENABLED: "false",
+        FORWARDPLUS_XRAY_UI_POLICY_VERSION: "1",
+      },
       prepare: (directory) => {
-        fs.writeFileSync(path.join(directory, ".env"), "FORWARDX_XRAY_ENABLED=on\n");
+        fs.writeFileSync(
+          path.join(directory, ".env"),
+          "FORWARDX_XRAY_ENABLED=on\nFORWARDPLUS_XRAY_UI_POLICY_VERSION=1\n",
+        );
       },
       body: `
 JWT_SECRET=test-secret
@@ -381,7 +391,7 @@ sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
   }
 });
 
-test("new installs and ordinary upgrades default Xray off while upgrades preserve an enabled setting", { skip: !bash }, () => {
+test("new installs and ordinary upgrades default Xray on and persist the current policy", { skip: !bash }, () => {
   for (const installer of installers) {
     const endMarker = installer.name === "local" ? "install_panel() {" : "ensure_xray_master_key() {";
     const writeCall = installer.name === "local" ? "write_env" : 'write_env "ghcr.io/wzwys9/forwardplus:v2.3.280"';
@@ -394,11 +404,11 @@ test("new installs and ordinary upgrades default Xray off while upgrades preserv
 JWT_SECRET=test-secret
 XRAY_MASTER_KEY_PATH="$APP_DIR/data/xray-master.key"
 ${writeCall}
-sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
+sed -n -e 's/^FORWARDX_XRAY_ENABLED=/XRAY=/p' -e 's/^FORWARDPLUS_XRAY_UI_POLICY_VERSION=/POLICY=/p' "$APP_DIR/.env"
 `,
       });
       assert.equal(defaulted.status, 0, defaulted.stderr);
-      assert.equal(defaulted.stdout.trim(), "0");
+      assert.equal(defaulted.stdout, "XRAY=1\nPOLICY=1\n");
     }
 
     const preserved = runHarness({
@@ -406,7 +416,10 @@ sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
       endMarker,
       args: ["upgrade"],
       prepare: (directory) => {
-        fs.writeFileSync(path.join(directory, ".env"), "FORWARDX_XRAY_ENABLED=On\n");
+        fs.writeFileSync(
+          path.join(directory, ".env"),
+          "FORWARDX_XRAY_ENABLED=On\nFORWARDPLUS_XRAY_UI_POLICY_VERSION=1\n",
+        );
       },
       body: `
 JWT_SECRET=test-secret
@@ -420,7 +433,7 @@ sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
   }
 });
 
-test("ordinary upgrades recover a missing Xray flag from the durable migration marker", { skip: !bash }, () => {
+test("the current Xray policy defaults a missing flag on and preserves an explicit disable", { skip: !bash }, () => {
   for (const installer of installers) {
     const endMarker = installer.name === "local" ? "install_panel() {" : "ensure_xray_master_key() {";
     const writeCall = installer.name === "local" ? "write_env" : 'write_env "ghcr.io/wzwys9/forwardplus:v2.3.280"';
@@ -429,7 +442,10 @@ test("ordinary upgrades recover a missing Xray flag from the durable migration m
       endMarker,
       args: ["upgrade"],
       prepare: (directory) => {
-        fs.writeFileSync(path.join(directory, ".env"), "FORWARDPLUS_MIGRATE_AGENTS=true\n");
+        fs.writeFileSync(
+          path.join(directory, ".env"),
+          "FORWARDPLUS_XRAY_UI_POLICY_VERSION=1\nFORWARDPLUS_MIGRATE_AGENTS=true\n",
+        );
       },
       body: `
 JWT_SECRET=test-secret
@@ -448,7 +464,7 @@ sed -n -e 's/^FORWARDX_XRAY_ENABLED=/XRAY=/p' -e 's/^FORWARDPLUS_MIGRATE_AGENTS=
       prepare: (directory) => {
         fs.writeFileSync(
           path.join(directory, ".env"),
-          "FORWARDX_XRAY_ENABLED=off\nFORWARDPLUS_MIGRATE_AGENTS=true\n",
+          "FORWARDX_XRAY_ENABLED=off\nFORWARDPLUS_XRAY_UI_POLICY_VERSION=1\nFORWARDPLUS_MIGRATE_AGENTS=true\n",
         );
       },
       body: `
@@ -463,8 +479,32 @@ sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
   }
 });
 
+test("ordinary upgrades promote a legacy automatic Xray zero to the current default-on policy", { skip: !bash }, () => {
+  for (const installer of installers) {
+    const endMarker = installer.name === "local" ? "install_panel() {" : "ensure_xray_master_key() {";
+    const writeCall = installer.name === "local" ? "write_env" : 'write_env "ghcr.io/wzwys9/forwardplus:v2.3.281"';
+    const upgraded = runHarness({
+      installer,
+      endMarker,
+      args: ["upgrade"],
+      prepare: (directory) => {
+        fs.writeFileSync(path.join(directory, ".env"), "FORWARDX_XRAY_ENABLED=0\n");
+      },
+      body: `
+JWT_SECRET=test-secret
+XRAY_MASTER_KEY_PATH="$APP_DIR/data/xray-master.key"
+${writeCall}
+sed -n -e 's/^FORWARDX_XRAY_ENABLED=/XRAY=/p' -e 's/^FORWARDPLUS_XRAY_UI_POLICY_VERSION=/POLICY=/p' "$APP_DIR/.env"
+`,
+    });
+    assert.equal(upgraded.status, 0, upgraded.stderr);
+    assert.equal(upgraded.stdout, "XRAY=1\nPOLICY=1\n");
+  }
+});
+
 test("Docker Compose passes the persisted Xray feature flag into the panel", () => {
-  assert.match(dockerSource, /FORWARDX_XRAY_ENABLED: \$\{FORWARDX_XRAY_ENABLED:-0\}/);
+  assert.match(dockerSource, /FORWARDX_XRAY_ENABLED: \$\{FORWARDX_XRAY_ENABLED:-1\}/);
+  assert.match(dockerSource, /FORWARDPLUS_XRAY_UI_POLICY_VERSION: \$\{FORWARDPLUS_XRAY_UI_POLICY_VERSION:-1\}/);
 });
 
 test("the local installer validates the complete archive before removing the current panel", () => {

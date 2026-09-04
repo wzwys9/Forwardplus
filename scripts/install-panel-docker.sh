@@ -12,6 +12,7 @@ IMAGE_REPO="${FORWARDX_IMAGE_REPO:-ghcr.io/wzwys9/forwardplus}"
 GITHUB_TOKEN="${FORWARDPLUS_GITHUB_TOKEN:-${FORWARDX_GITHUB_TOKEN:-}}"
 unset FORWARDPLUS_GITHUB_TOKEN FORWARDX_GITHUB_TOKEN
 ASSETS_PENDING_EXIT_CODE=12
+XRAY_UI_POLICY_VERSION="1"
 ENABLE_ADMIN_ACCOUNT="false"
 MIGRATE_FORWARDX_AGENTS="false"
 EXPLICIT_FORWARDX_IMAGE="${FORWARDX_IMAGE:-}"
@@ -190,7 +191,16 @@ normalize_xray_feature_flag() {
 }
 
 resolve_xray_feature_flag() {
-  local existing=""
+  local existing="" policy_version=""
+  if [ "${FORWARDPLUS_XRAY_UI_POLICY_VERSION+x}" = "x" ]; then
+    policy_version="$FORWARDPLUS_XRAY_UI_POLICY_VERSION"
+  else
+    policy_version="$(get_env_value FORWARDPLUS_XRAY_UI_POLICY_VERSION || true)"
+  fi
+  if [ "$policy_version" != "$XRAY_UI_POLICY_VERSION" ]; then
+    printf "1\n"
+    return
+  fi
   if [ "${FORWARDX_XRAY_ENABLED+x}" = "x" ]; then
     normalize_xray_feature_flag "$FORWARDX_XRAY_ENABLED"
     return
@@ -200,11 +210,7 @@ resolve_xray_feature_flag() {
     normalize_xray_feature_flag "$existing"
     return
   fi
-  if [ "$ACTION" = "migrate-forwardx" ] || [ "$MIGRATE_FORWARDX_AGENTS" = "true" ]; then
-    printf "1\n"
-  else
-    printf "0\n"
-  fi
+  printf "1\n"
 }
 
 normalize_github_accelerator_url() {
@@ -740,7 +746,8 @@ services:
       POSTGRES_SSL: ${POSTGRES_SSL:-false}
       JWT_SECRET: ${JWT_SECRET:-change-me-to-a-random-string}
       XRAY_MASTER_KEY_PATH: ${XRAY_MASTER_KEY_PATH:-/data/xray-master.key}
-      FORWARDX_XRAY_ENABLED: ${FORWARDX_XRAY_ENABLED:-0}
+      FORWARDX_XRAY_ENABLED: ${FORWARDX_XRAY_ENABLED:-1}
+      FORWARDPLUS_XRAY_UI_POLICY_VERSION: ${FORWARDPLUS_XRAY_UI_POLICY_VERSION:-1}
       FORWARDPLUS_GITHUB_TOKEN: ${FORWARDPLUS_GITHUB_TOKEN:-}
       FORWARDPLUS_MIGRATE_AGENTS: ${MIGRATE_FORWARDX_AGENTS}
     volumes:
@@ -789,6 +796,7 @@ FORWARDX_PUBLIC_PORT=$PORT
 JWT_SECRET=$jwt_secret
 XRAY_MASTER_KEY_PATH=$xray_master_key_path
 FORWARDX_XRAY_ENABLED=$xray_enabled
+FORWARDPLUS_XRAY_UI_POLICY_VERSION=$XRAY_UI_POLICY_VERSION
 COMPOSE_PROJECT_NAME=$PROJECT_NAME
 FORWARDX_CONTAINER_NAME=$CONTAINER_NAME
 FORWARDX_IMAGE=$image

@@ -1,6 +1,6 @@
 # Xray 测试计划
 
-状态：已批准。测试名称和命令在实施任务中补充，但验收场景不得删除或弱化；TASK057 采用风险聚焦的精简矩阵。与 `SPEC.md` 0.21 配套。
+状态：已批准。测试名称和命令在实施任务中补充，但验收场景不得删除或弱化；TASK057 采用风险聚焦的精简矩阵。与 `SPEC.md` 0.22 配套。
 
 TASK057 端口资源归属补充只跑聚焦矩阵：一个 SQLite repository 目标覆盖 A 唯一资源复用、B 自动资源、引用数、重复收敛和停用拒绝；schema 目标检查新增列/索引及 MySQL/PostgreSQL 描述；前端以 TypeScript 和一次相关页面构建验证移除主机投影、计数和开关锁定。Agent payload 未变化，不因此运行 Go 全量或 Xray 协议矩阵。
 
@@ -67,6 +67,8 @@ TASK057 端口资源归属补充只跑聚焦矩阵：一个 SQLite repository �
 
 ## 6. 制品安装和升级
 
+- 无 `FORWARDPLUS_XRAY_UI_POLICY_VERSION` 的历史 systemd/Docker 部署，无论 Xray 开关缺失或为旧安装器写入的 `0`，升级后公共设置均返回 `xrayEnabled=true`，安装器持久化 `FORWARDX_XRAY_ENABLED=1` 与策略版本 `1`。
+- 已写入当前策略版本的部署保留管理员后续显式关闭；当前策略下缺失开关默认开启。Docker Compose 必须把开关和策略版本同时传入面板容器。
 - 同版本或更高版本但缺少/不是 `forwardplus` 来源的 Agent 仍列入迁移候选。
 - `forwardplus` 来源但真实版本落后的 Agent 仍列入升级候选；来源和版本都满足才清除升级状态。
 - 注册、完整/压缩心跳和 SSE 握手都能持久化同一真实版本、来源和 build id；非法/超长 identity 不进入数据库。

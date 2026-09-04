@@ -3,24 +3,18 @@ import test from "node:test";
 
 import { isXrayUiFeatureEnabled } from "./xrayFeature";
 
-test("the Xray UI feature flag is fail-closed and accepts only explicit true values", () => {
+test("pre-policy installations open the admin Xray UI even when an old installer wrote zero", () => {
   for (const value of [undefined, null, "", "0", "false", "off", "yes", true, 1]) {
-    assert.equal(isXrayUiFeatureEnabled(value), false, String(value));
-  }
-  for (const value of ["1", "true", "TRUE", "on", " ON "]) {
-    assert.equal(isXrayUiFeatureEnabled(value), true, String(value));
+    assert.equal(isXrayUiFeatureEnabled(value, false), true, String(value));
   }
 });
 
-test("a durable ForwardX migration marker recovers only a missing Xray UI flag", () => {
+test("the current default-on policy still honors a later explicit disable", () => {
   assert.equal(isXrayUiFeatureEnabled(undefined, true), true);
-  assert.equal(isXrayUiFeatureEnabled(undefined, false), false);
-
-  for (const explicitValue of [null, "", "0", "false", "off", "yes", true, 1]) {
-    assert.equal(
-      isXrayUiFeatureEnabled(explicitValue, true),
-      false,
-      `explicit ${String(explicitValue)} must override the migration fallback`,
-    );
+  for (const value of ["1", "true", "TRUE", "on", " ON "]) {
+    assert.equal(isXrayUiFeatureEnabled(value, true), true, String(value));
+  }
+  for (const value of [null, "", "0", "false", "off", "yes", true, 1]) {
+    assert.equal(isXrayUiFeatureEnabled(value, true), false, String(value));
   }
 });
