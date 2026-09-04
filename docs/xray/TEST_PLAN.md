@@ -1,5 +1,12 @@
 # Xray 测试计划
 
+## MAINT-026 移动端路径设计预览关键回归
+
+- `node --import tsx --test client/src/components/xray/xrayQuickConfigPaths.test.ts`：有序草稿、独立复制、入口不参与中转排序、上限、不同下一跳冲突、重复主机、失效地址/离线与受管本机直达零转发段。
+- `corepack pnpm exec playwright test --config tests/xray-path-preview.playwright.config.ts`：隔离的无后端 UI 夹具，覆盖 320×500/768/1024/1440、内容无横向溢出/可滚至落地、固定底栏、44px 关闭按钮、手机选择 IPv6/新增排序复制删除/关闭确认/返回焦点与本机直达提示。不连接真实 DNSPod/Agent；示例地址不代表实际网络可用。
+- 如果环境在探测未启动本地 HTTP 端口时卡住，先运行 `corepack pnpm exec vite --host 127.0.0.1 --port 43179 --strictPort`，再用 `FORWARDPLUS_PATH_PREVIEW_SERVER=existing` 前缀运行上述 Playwright 命令；只复用自行启动的隔离夹具服务，完成后停止。
+- TypeScript、前端与文档构建；真实手机系统键盘/读屏、完整 Tab/Escape 矩阵与实际多跳下发留给后续切片，不跑无关后端/Go 全量。
+
 ## MAINT-024 编辑 DNS 差量复用关键回归
 
 - 10 条自身托管 A 完全一致及顺序改变：预览全部 REUSE，无替换/删除；执行零 provider 写。
