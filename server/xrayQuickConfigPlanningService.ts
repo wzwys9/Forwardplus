@@ -39,6 +39,7 @@ import {
   type QuickConfigEntryHostEndpoint,
 } from "./xrayQuickConfigEntryHosts";
 import { listXrayQuickConfigForwardEngines } from "./xrayQuickConfigForwardEngineService";
+import { planQuickConfigDnsDiff } from "./xrayQuickConfigDnsDiff";
 import {
   createXrayPortProbeOperation,
   getXrayPortProbeOperationResult,
@@ -258,12 +259,9 @@ export type QuickConfigPreviewDto = Readonly<{
       recordType: "A" | "AAAA";
       value: string;
       ttl: number;
-      action: "CREATE" | "REPLACE";
+      action: "CREATE" | "REPLACE" | "REUSE";
     }>;
-  conflictingRecords: ReadonlyArray<
-    | (DomainRecordProjection & { recordType: "A" | "AAAA"; action: "REPLACE" })
-    | (DomainRecordProjection & { recordType: "CNAME"; action: "DELETE" })
-  >;
+  conflictingRecords: ReadonlyArray<DomainRecordProjection & { action: "REPLACE" | "DELETE" }>;
   preservedRecords: DomainRecordProjection[];
   allocation: { port: number; mode: "TARGET_ALIAS" | "RESERVE_NEW"; rewritten: boolean };
   warnings: ReadonlyArray<{ code: string; message: string }>;
@@ -1411,11 +1409,6 @@ function selectedCandidates(payload: ProbeResultTokenPayload, input: ReadonlyArr
   });
 }
 
-function dnsAction(domain: ResolvedQuickConfigDomain, recordType: "A" | "AAAA", providerLineId: string): "CREATE" | "REPLACE" {
-  return domain.conflicts.some((record) => record.recordType === recordType && record.providerLineId === providerLineId)
-    ? "REPLACE" : "CREATE";
-}
-
 async function previewWithoutToken(input: {
   domain: ResolvedQuickConfigDomain;
   carriers: ResolvedCarrierRoute[];
@@ -1452,7 +1445,6 @@ async function previewWithoutToken(input: {
       recordType,
       value: endpoint.address,
       ttl: DNS_TTL,
-      action: dnsAction(input.domain, recordType, route.providerLineId),
     };
   }));
   const defaultLine = input.domain.zone.carrierLines.find((line) => line.category === "DEFAULT");
@@ -1466,12 +1458,18 @@ async function previewWithoutToken(input: {
       recordType,
       value: candidate.address,
       ttl: DNS_TTL,
-      action: dnsAction(input.domain, recordType, defaultLine.providerLineId),
     };
   });
-  const conflictingRecords = input.domain.conflicts.map((record) => record.recordType === "CNAME"
-    ? { ...record, recordType: "CNAME" as const, action: "DELETE" as const }
-    : { ...record, recordType: record.recordType as "A" | "AAAA", action: "REPLACE" as const });
+  const desiredRecords = [...carrierRecords, ...defaultRecords];
+  const { dnsRecords, conflictingRecords } = input.domain.editIdentity
+    ? planQuickConfigDnsDiff(desiredRecords, input.domain.conflicts, input.domain.ownedRecordRefs)
+    : {
+      dnsRecords: desiredRecords.map(record => ({ ...record, action: input.domain.conflicts.some(previous =>
+        previous.recordType === record.recordType && previous.providerLineId === record.providerLineId)
+        ? "REPLACE" as const : "CREATE" as const })),
+      conflictingRecords: input.domain.conflicts.map(record => ({ ...record,
+        action: record.recordType === "CNAME" ? "DELETE" as const : "REPLACE" as const })),
+    };
   const warnings: Array<{ code: string; message: string }> = [];
   if (input.probe.rewritten) warnings.push({ code: "PUBLIC_PORT_REWRITTEN", message: "The public port differs from the target port." });
   if (conflictingRecords.length > 0) warnings.push({ code: "DNS_RECORDS_WILL_CHANGE", message: "Confirmed DNS records will be replaced or removed during apply." });
@@ -1486,7 +1484,7 @@ async function previewWithoutToken(input: {
       port: target.endpoint.port,
     },
     rules,
-    dnsRecords: [...carrierRecords, ...defaultRecords],
+    dnsRecords,
     conflictingRecords,
     preservedRecords: input.domain.preservedRecords,
     allocation: {

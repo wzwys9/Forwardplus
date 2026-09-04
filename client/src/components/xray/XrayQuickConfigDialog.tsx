@@ -154,7 +154,7 @@ function targetTypeLabel(target: XrayQuickConfigTarget) {
 
 function DomainRecordList({ title, records, tone }: {
   title: string;
-  records: ReadonlyArray<XrayQuickConfigDomainCheck["conflicts"][number]>;
+  records: ReadonlyArray<XrayQuickConfigDomainCheck["conflicts"][number] & { action?: "REPLACE" | "DELETE" }>;
   tone: "warning" | "neutral";
 }) {
   if (records.length === 0) return null;
@@ -167,6 +167,7 @@ function DomainRecordList({ title, records, tone }: {
             <Badge variant="outline">{record.recordType}</Badge>
             <span className="max-w-full break-all font-mono text-xs">{record.value}</span>
             <span className="text-xs text-muted-foreground">{record.lineName} · TTL {record.ttl}</span>
+            {record.action && <Badge variant="secondary">{record.action === "DELETE" ? "删除" : "修改"}</Badge>}
           </li>
         ))}
       </ul>
@@ -555,17 +556,25 @@ function PreviewStep(props: {
   editDraft?: XrayQuickConfigEditDraft;
 }) {
   const preview = props.preview;
+  const dnsCounts = {
+    reuse: preview.dnsRecords.filter(record => record.action === "REUSE").length,
+    create: preview.dnsRecords.filter(record => record.action === "CREATE").length,
+    replace: preview.dnsRecords.filter(record => record.action === "REPLACE").length,
+    remove: preview.conflictingRecords.filter(record => record.action === "DELETE").length,
+  };
   return (
     <div className="space-y-5">
-      <Alert><Clock3 className="h-4 w-4" /><AlertTitle>目前只是预览</AlertTitle><AlertDescription>{props.editing ? "当前生效配置尚未改变。点击最终确认后，将先建立新规则并验证，再切换 DNS 和清理旧规则。" : "尚未创建转发规则，也没有修改 DNSPod。点击最终确认后才开始持久编排。"}</AlertDescription></Alert>
+      <Alert><Clock3 className="h-4 w-4" /><AlertTitle>目前只是预览</AlertTitle><AlertDescription>{props.editing ? "当前生效配置尚未改变。点击最终确认后，将先确认转发规则，再按差异更新 DNS 和清理不再使用的规则；一致的托管解析只验证，不重复写入。" : "尚未创建转发规则，也没有修改 DNSPod。点击最终确认后才开始持久编排。"}</AlertDescription></Alert>
       <section className="rounded-lg border p-4"><h3 className="font-semibold">{preview.fqdn}:{preview.publicPort}</h3><p className="mt-1 break-all text-sm text-muted-foreground">落地：{preview.target.targetName} · {formatXrayEndpoint(preview.target.address, preview.target.port)}</p>{preview.allocation.rewritten && <Badge className="mt-3" variant="secondary">对外端口已改写</Badge>}</section>
       {props.editDraft?.fqdn && props.editDraft.fqdn !== preview.fqdn && <section className="space-y-3">
         <Alert className="border-amber-500/40"><AlertTriangle className="h-4 w-4" /><AlertTitle>确认域名切换</AlertTitle><AlertDescription><p className="break-all">{props.editDraft.fqdn} → {preview.fqdn}</p><p className="mt-2">新解析验证成功后，清理下列旧托管 A/AAAA 解析，保留其他手动记录。请更新客户端连接域名。</p></AlertDescription></Alert>
         <DomainRecordList title="原域名下将清理的托管解析" records={props.editDraft.managedDnsRecords ?? []} tone="warning" />
       </section>}
       <section className="space-y-3"><h3 className="font-semibold">转发规则（{preview.rules.length}）</h3>{preview.rules.length === 0 ? <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">全部流量在受管落地主机直达，不需要新建转发规则。</p> : <div className="space-y-2">{preview.rules.map((rule) => <div key={rule.ruleKey} className="rounded-lg border p-3 text-sm"><div className="flex flex-wrap items-center gap-2"><span className="font-medium">{rule.hostName}</span><Badge variant="outline">{rule.engine}</Badge><Badge variant="secondary">{rule.action === "REUSE" ? "复用" : "新建"}</Badge></div><p className="mt-1 break-all font-mono text-xs text-muted-foreground">:{rule.listenPort} → {formatXrayEndpoint(rule.targetAddress, rule.targetPort)}</p></div>)}</div>}</section>
-      <section className="space-y-3"><h3 className="font-semibold">DNS 解析（{preview.dnsRecords.length}）</h3><div className="space-y-2">{preview.dnsRecords.map((record, index) => <div key={`${record.routeKind}:${record.providerLineId}:${record.recordType}:${record.value}:${index}`} className="flex min-w-0 flex-wrap items-center gap-2 rounded-lg border p-3 text-sm"><Badge variant="outline">{record.recordType}</Badge><Badge variant="secondary">{record.routeKind === "DEFAULT" ? "默认" : carrierLabels[record.carrier]}</Badge><span className="break-all font-mono text-xs">{record.value}</span><span className="ml-auto text-xs text-muted-foreground">{record.action === "REPLACE" ? "替换" : "新建"}</span></div>)}</div></section>
-      <DomainRecordList title="将替换或删除的同名记录" records={preview.conflictingRecords} tone="warning" />
+      <section className="space-y-3"><h3 className="font-semibold">DNS 解析（{preview.dnsRecords.length}）</h3>
+        {props.editing && <p className="text-sm text-muted-foreground">复用 {dnsCounts.reuse} 条 · 新建 {dnsCounts.create} 条 · 修改 {dnsCounts.replace} 条 · 删除 {dnsCounts.remove} 条。复用记录仅实时验证，不改写 DNSPod。</p>}
+        <div className="space-y-2">{preview.dnsRecords.map((record, index) => <div key={`${record.routeKind}:${record.providerLineId}:${record.recordType}:${record.value}:${index}`} className="flex min-w-0 flex-wrap items-center gap-2 rounded-lg border p-3 text-sm"><Badge variant="outline">{record.recordType}</Badge><Badge variant="secondary">{record.routeKind === "DEFAULT" ? "默认" : carrierLabels[record.carrier]}</Badge><span className="break-all font-mono text-xs">{record.value}</span><span className="text-xs text-muted-foreground">TTL {record.ttl}</span><span className="ml-auto text-xs text-muted-foreground">{{ REUSE: "复用（不改写）", REPLACE: "修改", CREATE: "新建" }[record.action]}</span></div>)}</div></section>
+      <DomainRecordList title="将修改或删除的同名记录" records={preview.conflictingRecords} tone="warning" />
       <DomainRecordList title="将保留的其他记录" records={preview.preservedRecords} tone="neutral" />
       {preview.warnings.length > 0 && <section className="space-y-2">{preview.warnings.map((warning) => <Alert key={warning.code}><AlertTriangle className="h-4 w-4" /><AlertTitle>{warning.code}</AlertTitle><AlertDescription>{warning.message}</AlertDescription></Alert>)}</section>}
       {props.error && <Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>提交失败</AlertTitle><AlertDescription>{props.error}</AlertDescription></Alert>}

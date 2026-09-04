@@ -177,6 +177,7 @@ export type ResolvedQuickConfigDomain = Readonly<{
   confirmationHash: string;
   action: DomainAction;
   conflicts: DomainRecordProjection[];
+  ownedRecordRefs: string[];
   preservedRecords: DomainRecordProjection[];
 }>;
 
@@ -662,6 +663,27 @@ export function isQuickConfigDnsRecordOwned(record: DnsPodRecord, stored: Row, z
     });
 }
 
+async function ownedDomainRecordRefs(input: {
+  quickConfigId: number; accountId: number; zoneId: number; fqdn: string; zoneName: string;
+  records: readonly DnsPodRecord[]; key: Buffer;
+}): Promise<string[]> {
+  const q = quoteIdentifier;
+  const owned = await queryRaw<Row>(
+    `SELECT r.* FROM ${q("xray_quick_config_dns_records")} r
+      JOIN ${q("xray_quick_config_routes")} rt ON rt.${q("id")} = r.${q("routeId")}
+      JOIN ${q("xray_quick_configs")} qc ON qc.${q("id")} = r.${q("quickConfigId")}
+     WHERE qc.${q("id")} = ? AND r.${q("dnsAccountId")} = ? AND r.${q("zoneId")} = ?
+       AND r.${q("fqdn")} = ? AND r.${q("status")} <> 'REMOVED'
+       AND rt.${q("topologyRevisionId")} = qc.${q("activeTopologyRevisionId")}`,
+    [input.quickConfigId, input.accountId, input.zoneId, input.fqdn],
+  );
+  const byId = new Map(owned.map(row => [String(row.providerRecordId), row]));
+  return input.records.filter(record => {
+    const stored = byId.get(record.providerRecordId);
+    return stored && isQuickConfigDnsRecordOwned(record, stored, input.zoneName);
+  }).map(record => recordRef(record, input.accountId, input.zoneId, input.key));
+}
+
 function exactRecordSetHash(records: readonly DnsPodRecord[]): string {
   return sha256(stableJson(records.map((record) => ({
     providerRecordId: record.providerRecordId,
@@ -772,21 +794,10 @@ export async function createQuickConfigDomainCheck(input: {
     const projection = projectRecords(records, context.accountId, context.zoneId, key);
     let ownedRecordRefs: string[] | undefined;
     if (editIdentity) {
-      const q = quoteIdentifier;
-      const owned = await queryRaw<Row>(
-        `SELECT r.* FROM ${q("xray_quick_config_dns_records")} r
-          JOIN ${q("xray_quick_config_routes")} rt ON rt.${q("id")} = r.${q("routeId")}
-          JOIN ${q("xray_quick_configs")} qc ON qc.${q("id")} = r.${q("quickConfigId")}
-         WHERE qc.${q("id")} = ? AND r.${q("dnsAccountId")} = ? AND r.${q("zoneId")} = ?
-           AND r.${q("fqdn")} = ? AND r.${q("status")} <> 'REMOVED'
-           AND rt.${q("topologyRevisionId")} = qc.${q("activeTopologyRevisionId")}`,
-        [editIdentity.quickConfigId, context.accountId, context.zoneId, domain.fqdn],
-      );
-      const byId = new Map(owned.map((row) => [String(row.providerRecordId), row]));
-      ownedRecordRefs = records.filter((record) => {
-        const stored = byId.get(record.providerRecordId);
-        return stored && isQuickConfigDnsRecordOwned(record, stored, context.zone.name);
-      }).map((record) => recordRef(record, context.accountId, context.zoneId, key));
+      ownedRecordRefs = await ownedDomainRecordRefs({
+        quickConfigId: editIdentity.quickConfigId, accountId: context.accountId, zoneId: context.zoneId,
+        fqdn: domain.fqdn, zoneName: context.zone.name, records, key,
+      });
     }
     const displayHash = confirmationHash(domain.fqdn, projection);
     const payload = newTokenPayload({
@@ -942,6 +953,10 @@ export async function resolveConfirmedQuickConfigDomain(input: {
       confirmationHash: payload.confirmationHash,
       action: payload.action,
       conflicts: projection.conflicts,
+      ownedRecordRefs: editIdentity ? await ownedDomainRecordRefs({
+        quickConfigId: editIdentity.quickConfigId, accountId: context.accountId, zoneId: context.zoneId,
+        fqdn: domain.fqdn, zoneName: context.zone.name, records, key,
+      }) : [],
       preservedRecords: projection.preservedRecords,
     };
   } catch (error) {
