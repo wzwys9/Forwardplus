@@ -69,6 +69,7 @@ fwdx-secret:v1:<keyId>:<base64url nonce+ciphertext+tag>
 - desired config 通过现有 HTTPS 和加密 envelope 传输，服务端和 Agent 均不得打印 payload。
 - Agent 只在受管配置工作副本中保存运行所需的明文私钥/UUID，目录 `0700`、文件 `0600`、root 所有。
 - Agent observed state、task result 和支持包禁止回传完整 config。
+- `agentDistribution` 是受鉴权 Agent 的有界声明，不是远程证明；只接受已知规范值，并继续要求对应版本、capability、制品和 observed 校验。缺失或未知来源 fail closed，不因高版本号开放 Forwardplus 专有 desired/task。
 - Agent 本地 pending task result 不含 configJson 或凭据。
 - Agent 对受管目录、版本、manifest、二进制、配置、hash、state、事务标记和 current symlink 逐级执行所有者、类型、权限、边界与大小检查；所有最终受管对象必须属于运行 Agent 的有效用户，拒绝符号链接和不受信所有者。
 - config 临时文件和 last-good 使用同样权限；失败/删除时清理固定路径，不使用宽泛 glob 删除。

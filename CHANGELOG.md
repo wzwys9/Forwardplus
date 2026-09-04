@@ -23,6 +23,22 @@
 - `FORWARDX_XRAY_ENABLED` 默认关闭；升级面板后由管理员显式设置为 `1`、`true` 或 `on` 才显示入口。旧 Agent 会安全报告能力不足，不会收到 Xray 任务，建议先升级面板再逐台升级 Agent。
 - 原始数据库备份不包含 Xray 面板主密钥；启用 Xray 后请使用密码加密完整备份，或单独安全备份部署数据目录中的 `xray-master.key`。
 
+## [2.3.279] - 2026-09-04
+
+### 新增
+
+- Agent 增加独立 Forwardplus 发行来源和 build id，上报的 `2.3.0` 仍是真实版本；面板以“来源 + 版本”识别原版 ForwardX 迁移，不再依赖动态抬高版本。
+- Docker 与本地安装器增加 `migrate-forwardx` 动作；切换面板后，来源未确认或不是 Forwardplus 的旧 Agent 会在重连时自动迁移。
+
+### 修复与优化
+
+- 主机列表、批量升级、升级完成判定和 Forwardplus 专有 Xray/快速配置门控统一检查发行来源，避免原版高版本 Agent 被误判为兼容。
+- 主机卡片、表格和升级确认继续显示 Agent 真实版本，并补充 Forwardplus、ForwardX 或来源未确认标记。
+
+### 版本
+
+- 面板与 APK Release `2.3.279`，Agent `2.3.0`，ForwardX FXP runtime `2.2.116`，Android APP `2.3.97`。
+
 ## [2.3.278] - 2026-08-30
 
 ### 修复与优化

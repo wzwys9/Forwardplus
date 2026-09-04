@@ -17,6 +17,12 @@ if [ -z "$AGENT_VERSION" ]; then
   exit 1
 fi
 VERSION="${AGENT_VERSION#v}"
+AGENT_DISTRIBUTION="forwardplus"
+AGENT_BUILD_ID="${AGENT_BUILD_ID:-$(git -C "$ROOT_DIR" rev-parse --short=12 HEAD 2>/dev/null || printf dev)}"
+if [[ ! "$AGENT_BUILD_ID" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+  echo "[agent] AGENT_BUILD_ID must contain 1-64 letters, numbers, dots, underscores, or hyphens" >&2
+  exit 1
+fi
 if [ -n "$REQUESTED_TAG" ] && [ "${REQUESTED_TAG#v}" != "$VERSION" ]; then
   echo "[agent] release tag ${REQUESTED_TAG} detected; building Agent version ${VERSION} from shared/versions.ts"
 fi
@@ -69,7 +75,7 @@ build_one() {
   (
     cd "$ROOT_DIR/agent"
     CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
-      go build -trimpath -ldflags "-s -w -X main.Version=$VERSION" -o "$OUT_DIR/$out" .
+      go build -trimpath -ldflags "-s -w -X main.Version=$VERSION -X main.Distribution=$AGENT_DISTRIBUTION -X main.BuildID=$AGENT_BUILD_ID" -o "$OUT_DIR/$out" .
   )
 }
 

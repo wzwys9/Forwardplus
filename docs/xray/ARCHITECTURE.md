@@ -1,6 +1,6 @@
 # Xray 集成架构
 
-状态：第一版、Xray-native 多协议、独立受管服务与 DNSPod + Realm 快速配置架构均已批准，与 `SPEC.md` 0.20 配套。
+状态：第一版、Xray-native 多协议、独立受管服务与 DNSPod + Realm 快速配置架构均已批准，与 `SPEC.md` 0.21 配套。
 
 ## 1. 系统边界
 
@@ -23,6 +23,8 @@
 ```
 
 面板是控制面，Agent 是执行器和节点现场传感器，Xray 与批准的独立 sidecar 是数据面。控制面故障不能自动转化为数据面故障。
+
+Agent 发行身份采用独立的真实 `agentVersion`、规范 `agentDistribution` 和诊断 `agentBuildId`。语义版本只回答新旧关系，不能证明二次开发能力来源；Forwardplus 专有控制面必须同时要求受鉴权 Agent 明确报告 `agentDistribution=forwardplus`。旧 Agent 缺字段时维持既有数据面，只开放兼容心跳与升级路径。
 
 ## 2. 所有权
 

@@ -37,7 +37,15 @@ import (
 	"golang.org/x/time/rate"
 )
 
-var Version = "2.2.192"
+var Version = "2.3.0"
+var Distribution = "forwardplus"
+var BuildID = "dev"
+
+func appendAgentIdentity(payload map[string]any) {
+	payload["agentVersion"] = Version
+	payload["agentDistribution"] = Distribution
+	payload["agentBuildId"] = BuildID
+}
 var agentProcessStartedAt = time.Now()
 var agentBootID = readAgentBootID()
 var runtimeAgentToken atomic.Value
@@ -3555,10 +3563,10 @@ func register(cfg Config) error {
 		"osInfo":                    osInfo(),
 		"cpuInfo":                   cpuInfo(),
 		"memoryTotal":               memTotal(),
-		"agentVersion":              Version,
 		"xrayCapability":            currentXrayCapability(),
 		"managedServicesCapability": currentManagedServicesCapability(),
 	}
+	appendAgentIdentity(payload)
 	var out map[string]any
 	return post(cfg, "/api/agent/register", payload, &out)
 }
@@ -3830,9 +3838,9 @@ func heartbeat(cfg Config, forceReconcile ...bool) (heartbeatResult, error) {
 			"diskTotal":    diskTotal,
 			"uptime":       uptimeValue,
 			"cpuInfo":      currentStatic.CPUInfo,
-			"agentVersion": Version,
 		}
 	}
+	appendAgentIdentity(payload)
 	if len(forceReconcile) > 0 && forceReconcile[0] {
 		payload["forceReconcile"] = true
 	}
@@ -3851,7 +3859,6 @@ func heartbeat(cfg Config, forceReconcile ...bool) (heartbeatResult, error) {
 	}
 	if compactEnabled && shouldReportStatic {
 		payload["cpuInfo"] = currentStatic.CPUInfo
-		payload["agentVersion"] = Version
 	}
 	if shouldReportStatic {
 		payload["xrayCapability"] = currentXrayCapability()
@@ -4089,8 +4096,8 @@ func heartbeatKeepalive(cfg Config) (heartbeatResult, error) {
 	}
 	if compactAgentReports.Load() && shouldReportStatic {
 		payload["cpuInfo"] = currentStatic.CPUInfo
-		payload["agentVersion"] = Version
 	}
+	appendAgentIdentity(payload)
 	if shouldReportStatic {
 		payload["xrayCapability"] = currentXrayCapability()
 		payload["managedServicesCapability"] = currentManagedServicesCapability()
@@ -4754,7 +4761,9 @@ func agentEventStream(cfg Config) {
 }
 
 func runAgentEventStream(cfg Config) error {
-	env, err := encrypt(map[string]any{"agentVersion": Version}, cfg.Token)
+	identity := map[string]any{}
+	appendAgentIdentity(identity)
+	env, err := encrypt(identity, cfg.Token)
 	if err != nil {
 		return err
 	}

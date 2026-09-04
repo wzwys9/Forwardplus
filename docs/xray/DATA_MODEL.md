@@ -1,6 +1,6 @@
 # Xray 数据模型
 
-状态：第一版、多协议增量模型与独立 managed-services 模型已实施；DNSPod + Realm 快速配置模型已批准，与 `SPEC.md` 0.20 配套。
+状态：第一版、多协议增量模型与独立 managed-services 模型已实施；DNSPod + Realm 快速配置模型已批准，与 `SPEC.md` 0.21 配套。
 
 ## 1. 设计原则
 
@@ -33,6 +33,18 @@ hosts 1 ─── N xray_managed_services 1 ─── N xray_managed_service_acc
 
 xray_managed_service_artifacts 按 kind/version/os/arch 保存固定 sidecar 制品
 ```
+
+### 2.1 现有 `hosts` 表的 Agent 发行身份扩展
+
+以下字段是向后兼容的可空扩展；旧 Agent 与旧数据库迁移后保持可读：
+
+| 字段 | 类型 | 约束/默认 | 所有者 | 说明 |
+|---|---|---|---|---|
+| `agentDistribution` | varchar(32) | nullable | Agent 报告 | 规范发行来源；本项目固定为 `forwardplus`，缺失按 `unknown` |
+| `agentBuildId` | varchar(64) | nullable | Agent 报告 | 构建提交或可追踪构建标识，不替代真实版本 |
+| `agentUpgradeTargetDistribution` | varchar(32) | nullable | 面板 | 本次升级期望来源；Forwardplus 迁移固定为 `forwardplus` |
+
+`agentVersion` 继续保存 Agent 的真实版本。升级完成必须同时满足目标来源与目标版本；不能通过改写版本号伪造迁移完成。注册、心跳和 SSE 只接受有界规范值，未知发行字符串按未确认处理。
 
 ## 3. `xray_inbounds`
 

@@ -1,6 +1,8 @@
 # Xray 面板 API 契约
 
-状态：第一版契约已实施；多协议 additive 契约已批准并按任务增量落地；DNSPod + Realm 快速配置契约已批准。与 `SPEC.md` 0.20 配套。ForwardX 使用 tRPC，本文件描述 procedure、输入输出和错误语义；实现以共享 Zod schema 和类型测试固化。
+状态：第一版契约已实施；多协议 additive 契约已批准并按任务增量落地；DNSPod + Realm 快速配置契约已批准。与 `SPEC.md` 0.21 配套。ForwardX 使用 tRPC，本文件描述 procedure、输入输出和错误语义；实现以共享 Zod schema 和类型测试固化。
+
+主机列表、状态摘要和 Agent 升级接口将真实 `agentVersion` 与可空 `agentDistribution`、`agentBuildId` 分开返回。升级候选定义为“来源不是 `forwardplus` 或版本低于面板目标”；单台/批量升级请求写入 `targetDistribution=forwardplus`，只有后续报告同时满足来源和版本才返回完成。来源未知的旧 Agent 不能因为版本较高而绕过 Forwardplus 专有功能门控。
 
 ## 1. 通用规则
 

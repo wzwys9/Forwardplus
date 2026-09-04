@@ -1,6 +1,6 @@
 # Xray Agent 协议
 
-状态：Xray v1 合同已实施；UDP 使用 v1 envelope 的可选能力扩展；managed services v1 合同已批准并首先实施 MTProto；TASK057 快速配置复用既有探测/规则合同，并为隧道派生端口回收增加可选运行观测字段。与 `SPEC.md` 0.20 配套。
+状态：Xray v1 合同已实施；UDP 使用 v1 envelope 的可选能力扩展；managed services v1 合同已批准并首先实施 MTProto；TASK057 快速配置复用既有探测/规则合同，并为隧道派生端口回收增加可选运行观测字段。与 `SPEC.md` 0.21 配套。
 
 ## 1. 传输原则
 
@@ -11,6 +11,22 @@
 - 所有列表、字符串、JSON 和输出都有明确上限，禁止无界 payload。
 
 ## 2. Capability
+
+在注册、完整/压缩心跳和加密 SSE 握手中，Agent 与现有 `agentVersion` 一起发送以下向后兼容字段：
+
+```json
+{
+  "agentVersion": "2.3.0",
+  "agentDistribution": "forwardplus",
+  "agentBuildId": "0123456789ab"
+}
+```
+
+- `agentVersion` 始终是真实语义版本，不能为迁移临时抬高。
+- Forwardplus 官方构建固定发送 `agentDistribution=forwardplus`；`agentBuildId` 最大 64 字符，只用于诊断和发布追踪。
+- 旧 Agent 缺少来源时仍能注册和保持现有数据面，但面板把它标为来源未确认并列入迁移候选。
+- Forwardplus 专有 desired state、typed task 和能力判断除原版本/capability 条件外，还必须要求发行来源为 `forwardplus`。来源不匹配时只允许既有兼容心跳、升级命令和安全迁移，不把更高版本号当作专有能力证明。
+- 升级请求可携带可选 `targetDistribution`；Agent 可忽略该加法字段。面板必须等后续报告同时满足来源和版本才清除升级请求。
 
 Agent 在心跳静态信息发生变化或周期刷新时上报：
 

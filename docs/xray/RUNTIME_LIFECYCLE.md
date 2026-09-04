@@ -1,6 +1,6 @@
 # Xray 运行生命周期
 
-状态：已批准。Supervisor 为 Agent 直接子进程；Agent service 重启允许短暂中断并在认证前恢复；TASK057 快速配置使用面板持久 saga。与 `SPEC.md` 0.20 配套。
+状态：已批准。Supervisor 为 Agent 直接子进程；Agent service 重启允许短暂中断并在认证前恢复；TASK057 快速配置使用面板持久 saga。与 `SPEC.md` 0.21 配套。
 
 ## 1. 目标
 
@@ -8,6 +8,7 @@
 - Agent Token、面板网络或 Agent 控制循环故障时，最后一次成功的数据面继续运行。
 - 配置和二进制升级是可验证、原子、可回滚的。
 - Agent 重启后可以仅凭本地状态恢复管理，不要求先成功连接面板。
+- 显式 `migrate-forwardx` 开启来源迁移后，来源不匹配的 Agent 在受鉴权心跳中加入持久升级队列；升级失败或面板不可达时保留旧 Agent 与其数据面，后续重连重试。只有新进程回报真实目标版本和 `forwardplus` 来源后才完成。
 
 ## 2. 受管路径
 

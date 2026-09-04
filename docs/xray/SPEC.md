@@ -1,7 +1,7 @@
 # 规格：ForwardX 受管 Xray
 
 状态：已批准  
-版本：0.20
+版本：0.21
 日期：2026-09-04
 
 实现状态：第一版 `XRAY-TASK-001..037`、多协议基础 `XRAY-TASK-038..042`、Xray-native profile `XRAY-TASK-043..052`、MTProto 独立服务首片 `XRAY-TASK-053`、AmneziaWG userspace 独立服务 `XRAY-TASK-054`、出口节点/中转联动 `XRAY-TASK-055` 与六种本地转发方式出口引用 `XRAY-TASK-056` 已完成；DNSPod 快速配置 `XRAY-TASK-057` 与六引擎创建/切换 `XRAY-TASK-058` 的可体验主流程已实现，集中运行验证待补；TUN 保持 `NOT_IMPLEMENTED`。Reality 默认候选为 `v2`，固定 Xray 默认版本仍为 `v26.3.27`。
@@ -54,6 +54,7 @@
 
 ### 3.4 安装、升级和运行
 
+- `XRAY-RUN-000` Agent 的真实语义版本与发行来源是两个独立身份。新 Forwardplus Agent 必须上报 `agentDistribution=forwardplus` 和有界 `agentBuildId`；旧 Agent 缺失来源时按 `unknown` 处理，不能因其版本号较高而推断包含 Forwardplus 能力。面板在来源不匹配或真实版本落后任一条件成立时提示/执行迁移，且只有来源匹配并满足目标版本才把升级标记完成。界面始终显示 Agent 上报的真实版本，不生成临时虚高版本。
 - `XRAY-RUN-001` Xray 按需安装；没有任何 inbound 的主机不要求预装 Xray。
 - `XRAY-RUN-002` Agent 从面板的受鉴权制品接口下载 Xray，不直接依赖目标服务器访问 GitHub。
 - `XRAY-RUN-003` 面板按版本、操作系统和 CPU 架构缓存并校验制品；Agent 必须在安装前校验 SHA-256。
