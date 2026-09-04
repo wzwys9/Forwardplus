@@ -1,132 +1,207 @@
-# Forwardplus
+# Forwardplus 转发与 Xray 管理面板
 
-Forwardplus 是基于 [ForwardX](https://github.com/poouo/Forwardx) 二次开发的多主机端口转发、隧道和 Xray 节点管理面板。项目包含 React 管理界面、Express/tRPC 服务端、Go Agent，以及 Go FXP 隧道运行时。
+[![CI](https://github.com/wzwys9/Forwardplus/actions/workflows/ci.yml/badge.svg)](https://github.com/wzwys9/Forwardplus/actions/workflows/ci.yml)
+[![Docs](https://github.com/wzwys9/Forwardplus/actions/workflows/docs.yml/badge.svg)](https://wzwys9.github.io/Forwardplus/)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 
-本仓库公开发布，安装脚本和 Release 可匿名访问。Agent 安装仍优先使用面板自带接口，以便安装来源与当前面板版本保持一致。
+Forwardplus 基于 [ForwardX](https://github.com/poouo/Forwardx) 二次开发，通过轻量 Agent 集中管理多台 Linux 服务器上的端口转发、加密隧道、转发链、故障转移和受管 Xray 服务。项目包含 React 管理面板、Express/tRPC 服务端、Go Agent 与 Go FXP 隧道运行时。
+
+面板不保存主机 SSH 密钥。Xray、DNSPod 和外部出口节点的敏感材料由服务端加密保存，不会通过普通列表接口返回。
+
+## 链接
+
+- [使用文档](https://wzwys9.github.io/Forwardplus/)
+- [GitHub Releases](https://github.com/wzwys9/Forwardplus/releases)
+- [更新日志](CHANGELOG.md)
+- [问题反馈](https://github.com/wzwys9/Forwardplus/issues)
 
 ## 主要功能
 
-- 多主机 Agent 管理、在线状态、流量统计和批量操作
-- Realm、Gost 等端口转发与链路管理
-- FXP 隧道、转发组、入口组和出口组
-- Xray 入站、外部出口节点、快速配置和 DNSPod 联动
-- SQLite、MySQL、PostgreSQL 数据库支持
-- Docker、Linux systemd 和 Android 客户端构建
+- 创建 TCP、UDP 或 TCP+UDP 转发规则，支持 `iptables`、`nftables`、`Realm`、`Socat`、`GOST` 和 `Nginx`。
+- 管理 GOST、ForwardX V1/V2 和 Nginx Stream 隧道，支持多跳、入口组、出口组和多出口。
+- 使用转发链组织固定入口、中转与出口路径，使用转发组实现多入口复用和故障转移。
+- 管理主机状态、规则流量、延迟趋势、链路图、自测结果、系统日志和批量任务。
+- 管理用户权限、端口与流量额度、套餐、余额、兑换码、折扣码及支付通道。
+- 提供邮件、Telegram 通知、插件系统、Android 客户端和面板/Agent 更新。
+- 集中管理受管 Xray 节点、客户端、TLS 证书、运行环境及独立代理服务。
+- 支持导入 VLESS Reality Vision、Shadowsocks、SOCKS5 外部出口，并绑定到 Xray 节点或六种 TCP 转发引擎。
+- 支持 DNSPod 全局账号、运营商线路解析、IPv4/IPv6 入口选择、全局端口分配和出口快速配置。
 
-## 环境要求
+## 资源模型
 
-- Node.js 22
-- pnpm 10（建议通过 Corepack 使用）
-- Go 1.25（构建 Agent 和 FXP 时需要）
-- Linux 生产服务器建议使用 root 或 sudo
+链路资源在「链路管理」中创建，业务入口端口与目标在「转发规则」中配置；Xray 相关资源统一在「Xray 管理」中维护。
 
-## 获取代码
+| 资源 | 典型路径 | 适用场景 |
+| --- | --- | --- |
+| 端口转发 | 用户 → 单台主机 → 目标 | 单台入口可以直接访问目标 |
+| 隧道 | 用户 → 入口 → 隧道 → 出口 → 目标 | 入口与出口不同，或需要加密传输 |
+| 转发链 | 用户 → 入口 → 多级中转 → 出口 → 目标 | 固定多跳路径 |
+| 转发组 | 多个入口 → 同一目标 | 多入口复用、故障转移和 DDNS |
+| Xray 节点 | 客户端 → 受管 Xray inbound → direct/外部出口 | 类型化代理节点与出口路由 |
+| 快速配置 | 运营商 DNS → 多入口规则 → Xray/外部落地 | 自动编排 DNS、端口和转发规则 |
 
-直接克隆公开仓库：
+入口组用于复用多台入口主机，出口组用于复用多个隧道出口。同一链路资源可以被多条规则引用；快速配置创建的规则也会出现在原有链路与转发规则界面中。
 
-```bash
-git clone https://github.com/wzwys9/Forwardplus.git
-cd Forwardplus
-```
+## 快速部署
 
-## 本地开发
+面板默认访问端口为 `9810`。以下命令请使用 `root` 执行；普通用户可在管道后的 `bash` 前增加 `sudo`。
 
-```bash
-corepack enable
-corepack pnpm install --frozen-lockfile
-cp .env.example .env
-corepack pnpm dev:panel
-```
+### Docker Compose
 
-开发面板默认使用 `http://localhost:5173`，后端默认使用 `http://localhost:3000`。首次打开面板后按向导创建管理员账号。
-
-生产环境必须把 `.env` 中的 `JWT_SECRET` 改为足够长的随机值，例如：
+安装：
 
 ```bash
-openssl rand -hex 32
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh" | bash -s -- install'
 ```
 
-## 生产部署
+升级：
 
-### 使用本地安装脚本
+```bash
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh" | bash -s -- upgrade'
+```
 
-发布版本及面板构建产物后，可直接运行公开安装脚本：
+卸载：
+
+```bash
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh" | bash -s -- uninstall'
+```
+
+Docker 默认拉取 `ghcr.io/wzwys9/forwardplus:latest`。数据库配置和 SQLite 数据保存在数据卷中；升级会保留 `.env`、数据卷和业务数据，卸载只有在用户明确确认后才会清理持久数据。
+
+### 本地 systemd
+
+安装：
 
 ```bash
 bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | sudo bash -s -- install'
 ```
 
-升级和卸载：
+升级与卸载：
 
 ```bash
 bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | sudo bash -s -- upgrade'
 bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | sudo bash -s -- uninstall'
 ```
 
-### Docker
+默认安装目录为 `/opt/forwardx-panel`，服务名为 `forwardx-panel.service`，数据目录为 `/opt/forwardx-panel/data`。
 
-当 `ghcr.io/wzwys9/forwardplus` 包设置为 Public 后，可以匿名拉取：
+详细部署、反向代理和数据库配置参见[部署面板](https://wzwys9.github.io/Forwardplus/guide/deploy-panel.html)。
+
+## 首次使用
+
+1. 打开 `http://服务器IP:9810`。
+2. 选择 SQLite、MySQL 或 PostgreSQL 并完成初始化。
+3. 创建首个管理员，或使用已有数据库中的管理员登录。
+4. 在「系统设置」中填写面板公开地址。
+5. 在「主机管理 → Token 管理」创建一次性 Agent Token。
+6. 复制面板生成的安装命令到目标 Linux 主机执行。
+7. 确认 Agent 在线后，创建链路资源、转发规则或 Xray 节点。
+
+Agent 安装命令由面板按照当前公开地址和 Token 生成，形式如下：
 
 ```bash
+curl -fsSL https://你的面板地址/api/agent/install.sh | bash -s -- install YOUR_AGENT_TOKEN
+```
+
+不要把真实 Agent Token 放进 README、工单、截图或公开日志。安装完成后可以在面板中撤销对应 Token。
+
+## Xray 管理
+
+Forwardplus 使用服务端控制的类型化 profile 生成完整 Xray 配置，不开放任意 JSON 或任意 Shell。当前已实现的范围包括：
+
+- VLESS、Trojan、VMess、Shadowsocks、Hysteria 2、WireGuard、认证 HTTP、Mixed 和固定目标 Tunnel profile。
+- RAW、mKCP、WebSocket、gRPC、HTTPUpgrade、XHTTP 等已经验证并由 profile 开放的传输组合。
+- Reality、TLS、Vision、客户端凭据、证书和分享链接管理。
+- MTProto 与 AmneziaWG userspace 独立受管服务。
+- VLESS Reality Vision、Shadowsocks、SOCKS5 外部出口节点导入与引用。
+- DNSPod 快速配置：域名检查、默认/电信/联通/移动/教育网线路、IPv4/IPv6 入口、端口冲突检查及规则编排。
+
+Xray 配置以面板数据库为唯一权威来源。每次变更按主机生成带 `generation` 和 `configHash` 的完整快照，Agent 验证成功后原子切换；失败时保留最近一次可用配置。当前不支持 TUN，也不提供任意路由、fallback、sniffing、订阅或 Xray 节点流量限额。
+
+## 隧道类型
+
+| 类型 | 说明 |
+| --- | --- |
+| GOST | TLS、WSS、TCP、MTLS、MWSS、MTCP 等传输模式 |
+| ForwardX V1 | FXP 加密传输，兼容既有部署 |
+| ForwardX V2 | Agent 内置 userspace WireGuard 外层 UDP，内层继续使用 FXP |
+| Nginx Stream | 独立 `forwardx-nginx` 四层 TCP/UDP 转发，TCP 可配置 TLS |
+
+ForwardX V2 不要求系统安装 `wg`，不会创建系统 WireGuard 网卡或修改主机路由。使用 UDP 隧道时仍需在防火墙与安全组中放行对应端口。
+
+## GitHub 下载加速
+
+访问 GitHub 不稳定时，可以给安装脚本添加加速地址：
+
+```bash
+curl -fsSL "https://mirror.example.com/https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh" \
+  | bash -s -- install --github-accelerator "https://mirror.example.com"
+```
+
+安装器会把加速地址保存到部署 `.env`，后续升级继续使用；失败时自动回退 GitHub 直连。该设置不代理 `ghcr.io`，Docker 镜像源需通过 `FORWARDX_IMAGE` 或 `FORWARDX_IMAGE_REPO` 单独配置。
+
+公开仓库无需 GitHub Token。请求频率较高时，可在服务端配置最小只读权限的 `FORWARDPLUS_GITHUB_TOKEN`，仅用于提高 GitHub API 限额。
+
+## 数据库
+
+Forwardplus 支持 SQLite、MySQL 和 PostgreSQL：
+
+- SQLite 适合单机部署，默认文件为 `/data/forwardx.db`。
+- MySQL 和 PostgreSQL 适合已有独立数据库运维的环境。
+- 原地升级会保留数据库配置和业务数据。
+- Xray 与 DNSPod 敏感数据备份需要同时保存面板主密钥，推荐使用面板的密码加密完整备份。
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PORT` | `9810` | 面板访问端口 |
+| `DATABASE_CONFIG_PATH` | `/data/database.json` | 数据库连接配置文件 |
+| `SQLITE_PATH` | `/data/forwardx.db` | SQLite 数据文件 |
+| `DATABASE_TYPE` / `DB_TYPE` | 空 | 指定 `sqlite`、`mysql` 或 `postgresql` |
+| `JWT_SECRET` | 自动生成 | 登录签名密钥，生产环境应固定配置 |
+| `TELEGRAM_BOT_TOKEN` | 空 | Telegram 机器人 Token |
+| `FORWARDX_IMAGE` | `ghcr.io/wzwys9/forwardplus:latest` | Docker 镜像 |
+| `FORWARDPLUS_GITHUB_TOKEN` | 空 | 可选，只读 GitHub Token |
+
+更多变量见[环境变量文档](https://wzwys9.github.io/Forwardplus/guide/env-vars.html)。
+
+## 本地开发
+
+环境要求：Node.js 22、pnpm 10；构建 Agent 和 FXP 时还需要 Go 1.25。
+
+```bash
+git clone https://github.com/wzwys9/Forwardplus.git
+cd Forwardplus
+corepack enable
+corepack pnpm install --frozen-lockfile
 cp .env.example .env
-docker compose up -d
+corepack pnpm dev:panel
 ```
 
-默认镜像为 `ghcr.io/wzwys9/forwardplus:latest`。首次发布镜像后，还需在 GitHub Packages 中确认该包的可见性为 Public。请在 `.env` 中设置随机 `JWT_SECRET`。
-
-## 添加主机 Agent
-
-先在面板的“主机管理/安装 Token”中生成一次性 Token。Forwardplus 会生成面板优先的安装命令，形式如下：
-
-```bash
-bash -c 'set -o pipefail; curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://YOUR_PANEL/api/agent/install.sh" | PANEL_URL='\''https://YOUR_PANEL'\'' FORWARDX_AGENT_PANEL_FIRST=true bash -s -- install YOUR_AGENT_TOKEN'
-```
-
-不要把真实 Agent Token 写进 README、工单或公开日志。安装完成后可在面板中撤销安装 Token。
-
-代码中的 GitHub 备用地址已改为：
-
-```text
-https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-agent.sh
-```
-
-该 Raw 地址可匿名访问，但正常安装仍优先使用面板的 `/api/agent/install.sh`，Raw 地址作为面板安装接口不可用时的备用来源。
-
-## 更新检查
-
-面板的仓库地址、Release、Tag、主分支版本检查和默认镜像已切换到 `wzwys9/Forwardplus`。公开仓库无需 Token；如检查频率较高，可在生产面板的 `.env` 中配置只读 Token，以提高 GitHub API 限额：
-
-```bash
-FORWARDPLUS_GITHUB_TOKEN=github_pat_replace_me
-```
-
-Token 只配置在服务端，建议限制到 `wzwys9/Forwardplus` 且仅授予 `Contents: read`。修改 `.env` 后重启面板。未配置 Token 时，面板使用 GitHub 匿名 API 限额，现有 Agent 数据面不受影响。
-
-每次发布新版本时应同步更新版本常量、创建 `vX.Y.Z` Release，并由 GitHub Actions 构建面板、Agent、FXP、Android 和 Docker 资产。
-
-## 关键检查
+关键检查：
 
 ```bash
 corepack pnpm check:versions
 corepack pnpm exec tsc --noEmit
+corepack pnpm test:server
 corepack pnpm build
+corepack pnpm docs:build
 (cd agent && go test ./... && go vet ./...)
 (cd forwardx-fxp && go test ./... && go vet ./...)
 ```
 
-仓库没有总入口 `pnpm test`。服务端测试使用：
+仓库没有总入口 `pnpm test`。开发与贡献约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-```bash
-corepack pnpm test:server
-```
+## 安全建议
 
-## 安全说明
+- 固定配置随机 `JWT_SECRET`，使用强管理员密码和 HTTPS。
+- 不需要公开注册时，在系统设置中关闭注册入口。
+- MySQL/PostgreSQL 使用独立账号并授予最小权限。
+- 妥善保存 Agent Token、DNSPod Secret 和 Xray 密钥，泄露后立即撤销或轮换。
+- `.env`、`vps*.txt`、数据库、日志、API Key、私钥和签名文件不得提交。
+- 定期备份数据库、面板数据目录和 Xray 面板主密钥。
 
-- `.env`、`vps*.txt`、数据库、日志、API Key、私钥和签名文件均不应提交。
-- Android Release 必须通过 GitHub Secrets 注入签名材料；仓库不提供签名私钥兜底。
-- 可选的 `FORWARDPLUS_GITHUB_TOKEN` 只应配置在服务端，并使用最小只读权限。
-- 推送前建议检查 `git status`，并执行一次敏感信息扫描。
+## License 与来源
 
-## 许可证与来源
+Forwardplus 基于 ForwardX 修改，继续使用 [GNU Affero General Public License v3.0 only](LICENSE)。通过网络向用户提供修改后的服务时，请遵守 AGPL 对应源代码提供义务。
 
-本项目基于 ForwardX 修改，继续遵循 [GNU Affero General Public License v3.0](LICENSE)。第三方组件和数据来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 及各插件目录中的说明。
+第三方组件、许可证和数据来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。ForwardX Agent 中的第三方 userspace WireGuard 实现按其 MIT License 使用。
