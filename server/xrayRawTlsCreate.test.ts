@@ -252,7 +252,7 @@ test("createV2 is profile-gated, certificate-bound, and secret-safe", () => {
       assert.deepEqual(catalog.filter((profile) => profile.security === "TLS").map((profile) => profile.id), [
         "VLESS_RAW_TLS", "VLESS_RAW_TLS_VISION", "TROJAN_RAW_TLS", "VLESS_WEBSOCKET_TLS", "TROJAN_WEBSOCKET_TLS",
         "VLESS_GRPC_TLS", "TROJAN_GRPC_TLS", "VLESS_HTTP_UPGRADE_TLS", "TROJAN_HTTP_UPGRADE_TLS",
-        "VLESS_XHTTP_TLS", "TROJAN_XHTTP_TLS", "VLESS_MKCP_TLS", "TROJAN_MKCP_TLS", "VMESS_RAW_TLS",
+        "VLESS_XHTTP_TLS", "TROJAN_XHTTP_TLS", "VLESS_MKCP_TLS", "TROJAN_MKCP_TLS", "VMESS_RAW_TLS", "HYSTERIA2_TLS",
       ]);
 
       const vmessReservation = await reserve(10, 29115);

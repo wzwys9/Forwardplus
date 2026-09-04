@@ -102,7 +102,9 @@ test("UDP TLS profiles require capabilities/reservations and keep credentials ge
         .map((profile) => [profile.id, profile.isAvailable, profile.unavailableReasonCode]), [
         ["VLESS_MKCP_TLS", false, "UDP_CAPABILITY_REQUIRED"],
         ["TROJAN_MKCP_TLS", false, "UDP_CAPABILITY_REQUIRED"],
+        ["SHADOWSOCKS_2022_RAW_TCP_UDP_NONE", false, "UDP_CAPABILITY_REQUIRED"],
         ["HYSTERIA2_TLS", false, "UDP_CAPABILITY_REQUIRED"],
+        ["WIREGUARD_UDP_NONE", false, "UDP_CAPABILITY_REQUIRED"],
       ]);
       await expectCode(
         inboundService.createXrayInboundV2(input("VLESS_MKCP_TLS", vlessReservation), enableUdpProfiles),
@@ -116,7 +118,7 @@ test("UDP TLS profiles require capabilities/reservations and keep credentials ge
       assert.deepEqual((await caller.profiles.catalog({ hostId: 10 }))
         .filter((profile) => profile.listenerNetworks.includes("UDP"))
         .map((profile) => [profile.isAvailable, profile.unavailableReasonCode]), [
-        [true, null], [true, null], [true, null],
+        [true, null], [true, null], [true, null], [true, null], [true, null],
       ]);
       assert.equal((await inboundService.createXrayInboundV2(
         input("VLESS_MKCP_TLS", vlessReservation), enableUdpProfiles,
