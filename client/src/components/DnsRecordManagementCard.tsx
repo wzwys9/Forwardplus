@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   AlertTriangle,
   ChevronLeft,
@@ -8,6 +8,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Save,
   ShieldCheck,
   Trash2,
 } from "lucide-react";
@@ -30,6 +31,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { saveDnsRecordDrafts, stageDnsRecordDraft, type DnsRecordDraft, type DnsRecordItem as RecordItem } from "./dnsRecordDraft";
+import { DnsRecordPendingChanges } from "./DnsRecordPendingChanges";
 
 const RECORD_TYPES = ["A", "AAAA", "CNAME"] as const;
 type RecordType = typeof RECORD_TYPES[number];
@@ -50,20 +53,6 @@ export type DnsRecordManagementZone = Readonly<{
   }>;
 }>;
 
-type RecordItem = Readonly<{
-  providerRecordId: string;
-  subdomain: string;
-  fqdn: string;
-  recordType: string;
-  providerLineId: string;
-  lineName: string;
-  value: string;
-  ttl: number;
-  status: string | null;
-  recordRevision: string;
-  inUse: boolean;
-}>;
-
 type EditorState = Readonly<{
   mode: "create" | "update";
   record: RecordItem | null;
@@ -72,6 +61,7 @@ type EditorState = Readonly<{
   lineId: string;
   value: string;
   ttl: string;
+  draftKey?: string;
 }>;
 
 const DNS_ERROR_MESSAGES: Record<string, string> = {
@@ -137,6 +127,7 @@ function RecordEditorDialog({
   state,
   zone,
   pending,
+  staging,
   onChange,
   onClose,
   onSubmit,
@@ -144,6 +135,7 @@ function RecordEditorDialog({
   state: EditorState | null;
   zone: DnsRecordManagementZone;
   pending: boolean;
+  staging: boolean;
   onChange: (state: EditorState) => void;
   onClose: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
@@ -153,10 +145,10 @@ function RecordEditorDialog({
   const availableLines = zone.lines.filter((line) => line.status === "AVAILABLE");
   return (
     <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
-      <DialogContent className="flex max-h-[92svh] max-w-xl flex-col gap-0 p-0">
+      <DialogContent className="flex max-h-[92svh] max-w-xl flex-col gap-0 p-0" onInteractOutside={event => event.preventDefault()}>
         <DialogHeader className="shrink-0 border-b p-5 pr-12 sm:p-6 sm:pr-12">
           <DialogTitle>{state.mode === "create" ? "添加 DNS 记录" : "编辑 DNS 记录"}</DialogTitle>
-          <DialogDescription>{zone.name} · 支持 A、AAAA 和 CNAME</DialogDescription>
+          <DialogDescription>{zone.name} · 支持 A、AAAA 和 CNAME{staging && " · 此处仅暂存，点击管理页的保存后才生效"}</DialogDescription>
         </DialogHeader>
         <form className="flex min-h-0 flex-1 flex-col" onSubmit={onSubmit}>
           <div className="grid min-h-0 flex-1 gap-4 overflow-y-auto overscroll-contain p-5 sm:grid-cols-2 sm:p-6">
@@ -224,7 +216,7 @@ function RecordEditorDialog({
             <Button type="button" variant="outline" onClick={onClose}>取消</Button>
             <Button type="submit" disabled={pending || !state.lineId}>
               {pending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              {state.mode === "create" ? "添加记录" : "保存修改"}
+              {staging ? "暂存修改" : "添加记录"}
             </Button>
           </DialogFooter>
         </form>
@@ -248,17 +240,29 @@ export default function DnsRecordManagementCard({
   const [subdomain, setSubdomain] = useState<string | null>(null);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [removing, setRemoving] = useState<RecordItem | null>(null);
-  const selectedZone = availableZones.find((zone) => zone.zoneId === selectedZoneId) ?? availableZones[0] ?? null;
+  const [editing, setEditing] = useState(false);
+  const [drafts, setDrafts] = useState<DnsRecordDraft[]>([]);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const draftSequenceRef = useRef(0);
+  const [saveFailure, setSaveFailure] = useState<{ message: string; failedKey: string; completed: number } | null>(null);
+  const [discardOpen, setDiscardOpen] = useState(false);
+  const selectedZone = editing ? zones.find(zone => zone.zoneId === selectedZoneId) ?? null
+    : availableZones.find((zone) => zone.zoneId === selectedZoneId) ?? availableZones[0] ?? null;
   const utils = trpc.useUtils();
 
   useEffect(() => {
+    if (editing) return;
     if (selectedZoneId !== null && availableZones.some((zone) => zone.zoneId === selectedZoneId)) return;
     setSelectedZoneId(availableZones[0]?.zoneId ?? null);
     setSubdomain(null);
     setEditor(null);
     setRemoving(null);
+    setEditing(false);
+    setDrafts([]);
+    setSaveFailure(null);
     setPage(1);
-  }, [availableZones, selectedZoneId]);
+  }, [availableZones, selectedZoneId, editing]);
 
   const groupsQuery = trpc.xray.dnsRecords.groups.useQuery({
     zoneId: selectedZone?.zoneId ?? 1, search: search || undefined, page, pageSize: 20,
@@ -277,19 +281,28 @@ export default function DnsRecordManagementCard({
     retry: false,
     refetchOnWindowFocus: false,
   });
-  const createMutation = trpc.xray.dnsRecords.create.useMutation({ gcTime: 0 });
-  const updateMutation = trpc.xray.dnsRecords.update.useMutation({ gcTime: 0 });
-  const removeMutation = trpc.xray.dnsRecords.remove.useMutation({ gcTime: 0 });
+  const createMutation = trpc.xray.dnsRecords.create.useMutation({ gcTime: 0, retry: false });
+  const updateMutation = trpc.xray.dnsRecords.update.useMutation({ gcTime: 0, retry: false });
+  const removeMutation = trpc.xray.dnsRecords.remove.useMutation({ gcTime: 0, retry: false });
   const currentSubdomainInUse = subdomain !== null && (recordsQuery.data?.subdomain?.inUse ?? true);
   const activeQuery = subdomain === null ? groupsQuery : recordsQuery;
   const totalPages = Math.max(1, Math.ceil((activeQuery.data?.total ?? 0) / 20));
-  const mutationPending = createMutation.isPending || updateMutation.isPending;
+  const mutationPending = saving || createMutation.isPending || updateMutation.isPending || removeMutation.isPending;
+  const draftLocked = mutationPending || !!saveFailure || currentSubdomainInUse || !selectedZone || selectedZone.status !== "AVAILABLE" || !accountValid;
+
+  useEffect(() => {
+    if (!drafts.length && !saving) return;
+    const preventLeave = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", preventLeave);
+    return () => window.removeEventListener("beforeunload", preventLeave);
+  }, [drafts.length, saving]);
 
   useEffect(() => {
     if (activeQuery.data && page > totalPages) setPage(totalPages);
   }, [activeQuery.data, page, totalPages]);
 
   const openSubdomain = (name: string | null) => {
+    if (editing || savingRef.current) return;
     setSubdomain(name);
     setPage(1);
     setSearchInput("");
@@ -303,6 +316,7 @@ export default function DnsRecordManagementCard({
   };
 
   const chooseZone = (value: string) => {
+    if (editing || savingRef.current) return;
     setSelectedZoneId(Number(value));
     setSubdomain(null);
     setPage(1);
@@ -320,7 +334,7 @@ export default function DnsRecordManagementCard({
 
   const submitEditor = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!selectedZone || !editor || currentSubdomainInUse || !editor.lineId) return;
+    if (!selectedZone || !editor || currentSubdomainInUse || !editor.lineId || mutationPending) return;
     const payload = {
       zoneId: selectedZone.zoneId,
       subdomain: editor.subdomain.trim(),
@@ -329,18 +343,21 @@ export default function DnsRecordManagementCard({
       value: editor.value.trim(),
       ttl: Number(editor.ttl),
     };
+    if (subdomain !== null) {
+      if (!editing || draftLocked) return;
+      const { zoneId: _zoneId, ...values } = payload;
+      const key = editor.draftKey ?? editor.record?.providerRecordId ?? `new:${++draftSequenceRef.current}`;
+      setDrafts(current => stageDnsRecordDraft(current, {
+        key,
+        original: editor.record, values, deleted: false,
+      }, selectedZone.lines));
+      setEditor(null);
+      return;
+    }
     try {
-      if (editor.mode === "create") {
-        await createMutation.mutateAsync(payload);
-        toast.success("DNS 记录已添加");
-      } else if (editor.record) {
-        await updateMutation.mutateAsync({
-          ...payload,
-          providerRecordId: editor.record.providerRecordId,
-          expectedRecordRevision: editor.record.recordRevision,
-        });
-        toast.success("DNS 记录已更新");
-      }
+      if (editor.mode !== "create") return;
+      await createMutation.mutateAsync(payload);
+      toast.success("DNS 记录已添加");
       openSubdomain(payload.subdomain.toLowerCase());
       await refreshRecords();
     } catch (error) {
@@ -352,20 +369,46 @@ export default function DnsRecordManagementCard({
   };
 
   const confirmRemove = async () => {
-    if (!selectedZone || !removing || currentSubdomainInUse || removing.inUse) return;
+    if (!selectedZone || !removing || !editing || draftLocked || removing.inUse) return;
+    const fields = recordEditor(removing, selectedZone);
+    setDrafts(current => stageDnsRecordDraft(current, {
+      key: removing.providerRecordId, original: removing, deleted: true,
+      values: { subdomain: fields.subdomain, recordType: fields.recordType, lineId: Number(fields.lineId), value: fields.value, ttl: Number(fields.ttl) },
+    }, selectedZone.lines));
+    setRemoving(null);
+  };
+
+  const editDraft = (draft: DnsRecordDraft) => {
+    if (!selectedZone || draftLocked) return;
+    setEditor({ mode: draft.original ? "update" : "create", record: draft.original, draftKey: draft.key,
+      ...draft.values, lineId: String(draft.values.lineId), ttl: String(draft.values.ttl) });
+  };
+
+  const endEditing = () => {
+    if (savingRef.current) return;
+    setEditing(false); setDrafts([]); setSaveFailure(null); setDiscardOpen(false); setEditor(null); setRemoving(null);
+    void refreshRecords().catch(() => toast.error("刷新失败，请重新读取 DNS 记录。"));
+  };
+
+  const saveChanges = async () => {
+    if (!selectedZone || !editing || draftLocked || !drafts.length || savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    let completed = 0;
     try {
-      await removeMutation.mutateAsync({
-        zoneId: selectedZone.zoneId,
-        providerRecordId: removing.providerRecordId,
-        expectedRecordRevision: removing.recordRevision,
-      });
-      setRemoving(null);
-      toast.success("DNS 记录已删除");
+      const result = await saveDnsRecordDrafts(drafts, selectedZone.zoneId, {
+        create: input => createMutation.mutateAsync(input), update: input => updateMutation.mutateAsync(input), remove: input => removeMutation.mutateAsync(input),
+      }, key => { completed += 1; setDrafts(current => current.filter(draft => draft.key !== key)); });
+      if (result.status === "FAILED") {
+        setSaveFailure({ message: dnsErrorMessage(result.error, "保存未完成，请核对远端记录后重新编辑。"), failedKey: result.failedKey, completed });
+      } else {
+        setEditing(false);
+        toast.success(`已保存 ${completed} 条 DNS 变更`);
+      }
       await refreshRecords();
-    } catch (error) {
-      toast.error(dnsErrorMessage(error, "DNS 记录删除失败，请稍后重试。"));
     } finally {
-      removeMutation.reset();
+      savingRef.current = false; setSaving(false);
+      createMutation.reset(); updateMutation.reset(); removeMutation.reset();
     }
   };
 
@@ -381,23 +424,32 @@ export default function DnsRecordManagementCard({
             </div>
             <div>
               <CardTitle>DNS 管理</CardTitle>
-              <CardDescription className="mt-1.5">按子域名查看解析，进入管理页增删改查 A、AAAA 和 CNAME。</CardDescription>
+              <CardDescription className="mt-1.5">按子域名查看解析，点击编辑后统一调整 A、AAAA 和 CNAME，保存才生效。</CardDescription>
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button type="button" variant="outline" onClick={() => activeQuery.refetch()} disabled={!selectedZone || activeQuery.isFetching}>
+            <Button type="button" variant="outline" onClick={() => activeQuery.refetch()} disabled={!selectedZone || activeQuery.isFetching || editing || mutationPending}>
               {activeQuery.isFetching ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
               刷新记录
             </Button>
-            <Button
+            {(subdomain === null || editing) && <Button
               type="button"
               onClick={() => selectedZone && setEditor({ ...emptyEditor(selectedZone), subdomain: subdomain ?? "" })}
-              disabled={!selectedZone || currentSubdomainInUse || mutationPending || removeMutation.isPending}
+              disabled={!selectedZone || currentSubdomainInUse || mutationPending || !!saveFailure}
               title={currentSubdomainInUse ? "该子域名正在被系统使用" : undefined}
             >
               <Plus className="mr-2 h-4 w-4" />
               {subdomain === null ? "添加子域名" : "添加解析"}
-            </Button>
+            </Button>}
+            {subdomain !== null && !editing && <Button type="button" onClick={() => setEditing(true)} disabled={currentSubdomainInUse || recordsQuery.isFetching || !!recordsQuery.error || mutationPending}>
+              <Pencil className="mr-2 h-4 w-4" />编辑
+            </Button>}
+            {editing && <>
+              <Button type="button" variant="outline" disabled={mutationPending} onClick={() => drafts.length || saveFailure ? setDiscardOpen(true) : endEditing()}>{saveFailure ? "结束编辑并刷新" : "取消编辑"}</Button>
+              <Button type="button" onClick={saveChanges} disabled={draftLocked || !drafts.length || editor !== null || removing !== null}>
+                {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}保存{drafts.length > 0 ? `（${drafts.length}）` : ""}
+              </Button>
+            </>}
           </div>
         </div>
       </CardHeader>
@@ -413,7 +465,7 @@ export default function DnsRecordManagementCard({
             <div className="grid gap-3 lg:grid-cols-[minmax(14rem,24rem)_1fr] lg:items-end">
               <div className="space-y-2">
                 <Label htmlFor="dns-record-zone">域名</Label>
-                <Select value={selectedZone ? String(selectedZone.zoneId) : undefined} disabled={mutationPending || removeMutation.isPending} onValueChange={chooseZone}>
+                <Select value={selectedZone ? String(selectedZone.zoneId) : undefined} disabled={mutationPending || editing} onValueChange={chooseZone}>
                   <SelectTrigger id="dns-record-zone"><SelectValue placeholder="选择域名" /></SelectTrigger>
                   <SelectContent>
                     {availableZones.map((zone) => <SelectItem key={zone.zoneId} value={String(zone.zoneId)}>{zone.name}</SelectItem>)}
@@ -425,19 +477,20 @@ export default function DnsRecordManagementCard({
                   <Label htmlFor="dns-record-search">搜索记录</Label>
                   <Input
                     id="dns-record-search"
+                    disabled={mutationPending}
                     value={searchInput}
                     onChange={(event) => setSearchInput(event.target.value)}
                     placeholder="主机记录、类型、线路或记录值"
                     maxLength={128}
                   />
                 </div>
-                <Button type="submit" variant="outline" className="mt-7">搜索</Button>
+                <Button type="submit" variant="outline" className="mt-7" disabled={mutationPending}>搜索</Button>
               </form>
             </div>
 
             {subdomain !== null && (
               <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-muted/15 p-3">
-                <Button type="button" variant="outline" size="sm" disabled={mutationPending || removeMutation.isPending} onClick={() => openSubdomain(null)}><ChevronLeft className="mr-1 h-4 w-4" />返回子域名列表</Button>
+                <Button type="button" variant="outline" size="sm" disabled={mutationPending || editing} onClick={() => openSubdomain(null)}><ChevronLeft className="mr-1 h-4 w-4" />返回子域名列表</Button>
                 <span className="min-w-0 break-all font-medium">{subdomain === "@" ? selectedZone?.name : `${subdomain}.${selectedZone?.name}`}</span>
               </div>
             )}
@@ -451,6 +504,12 @@ export default function DnsRecordManagementCard({
                 </AlertDescription>
               </Alert>
             )}
+
+            {saveFailure && <Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>保存未完全成功</AlertTitle><AlertDescription>
+              已确认保存 {saveFailure.completed} 条，剩余 {drafts.length} 条未确认或未执行。{saveFailure.message} 当前草稿已保留，不能直接再次保存；请先结束编辑并刷新、核对实际解析后重新编辑。已成功的变更不会被取消或回滚。
+            </AlertDescription></Alert>}
+            {editing && selectedZone && <DnsRecordPendingChanges drafts={drafts} lines={selectedZone.lines} locked={draftLocked} failedKey={saveFailure?.failedKey}
+              onEdit={editDraft} onUndo={key => setDrafts(current => current.filter(draft => draft.key !== key))} />}
 
             {activeQuery.isLoading ? (
               <div className="flex min-h-40 items-center justify-center rounded-lg border text-sm text-muted-foreground">
@@ -501,7 +560,8 @@ export default function DnsRecordManagementCard({
                   </TableHeader>
                   <TableBody>
                     {recordsQuery.data?.items.map((record) => {
-                      const writable = writableRecordType(record.recordType) && !record.inUse && !currentSubdomainInUse;
+                      const draft = drafts.find(item => item.key === record.providerRecordId);
+                      const writable = editing && writableRecordType(record.recordType) && !record.inUse && !draftLocked;
                       return (
                         <TableRow key={record.providerRecordId}>
                           <TableCell className="font-medium" title={record.fqdn}>{record.subdomain}</TableCell>
@@ -509,17 +569,17 @@ export default function DnsRecordManagementCard({
                           <TableCell>{record.lineName}</TableCell>
                           <TableCell className="max-w-[22rem] truncate font-mono text-xs" title={record.value}>{record.value}</TableCell>
                           <TableCell>{record.ttl}</TableCell>
-                          <TableCell>{record.status === "ENABLE" ? "启用" : record.status === "DISABLE" ? "停用" : record.status ?? "—"}</TableCell>
+                          <TableCell>{record.status === "ENABLE" ? "启用" : record.status === "DISABLE" ? "停用" : record.status ?? "—"}{draft && <Badge className="ml-2" variant={draft.deleted ? "destructive" : "secondary"}>{draft.deleted ? "待删除" : "待修改"}</Badge>}</TableCell>
                           <TableCell>
-                            <div className="flex justify-end gap-1">
+                            {editing ? <div className="flex justify-end gap-1">
                               <Button
                                 type="button"
                                 variant="ghost"
                                 size="icon"
                                 aria-label={`编辑 ${record.fqdn}`}
                                 title={!writable ? record.inUse ? "子域名正在使用，当前只读" : "只编辑 A、AAAA 和 CNAME" : "编辑记录"}
-                                disabled={!writable}
-                                onClick={() => selectedZone && setEditor(recordEditor(record, selectedZone))}
+                                disabled={!writable || draft?.deleted}
+                                onClick={() => draft ? editDraft(draft) : selectedZone && setEditor(recordEditor(record, selectedZone))}
                               >
                                 <Pencil className="h-4 w-4" />
                               </Button>
@@ -530,12 +590,12 @@ export default function DnsRecordManagementCard({
                                 className="text-destructive hover:text-destructive"
                                 aria-label={`删除 ${record.fqdn}`}
                                 title={!writable ? record.inUse ? "子域名正在使用，当前只读" : "只删除 A、AAAA 和 CNAME" : "删除记录"}
-                                disabled={!writable}
+                                disabled={!writable || draft?.deleted}
                                 onClick={() => setRemoving(record)}
                               >
                                 <Trash2 className="h-4 w-4" />
                               </Button>
-                            </div>
+                            </div> : <span className="block text-right text-xs text-muted-foreground">{record.inUse || !writableRecordType(record.recordType) ? "只读" : "点击上方编辑"}</span>}
                           </TableCell>
                         </TableRow>
                       );
@@ -549,10 +609,10 @@ export default function DnsRecordManagementCard({
               <div className="flex flex-col gap-3 text-sm text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
                 <span>共 {activeQuery.data.total} {subdomain === null ? "个域名" : "条解析"} · 第 {activeQuery.data.page} / {totalPages} 页</span>
                 <div className="flex gap-2">
-                  <Button type="button" size="sm" variant="outline" disabled={page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
+                  <Button type="button" size="sm" variant="outline" disabled={mutationPending || page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
                     <ChevronLeft className="mr-1 h-4 w-4" />上一页
                   </Button>
-                  <Button type="button" size="sm" variant="outline" disabled={page >= totalPages} onClick={() => setPage((value) => Math.min(totalPages, value + 1))}>
+                  <Button type="button" size="sm" variant="outline" disabled={mutationPending || page >= totalPages} onClick={() => setPage((value) => Math.min(totalPages, value + 1))}>
                     下一页<ChevronRight className="ml-1 h-4 w-4" />
                   </Button>
                 </div>
@@ -567,17 +627,18 @@ export default function DnsRecordManagementCard({
           state={editor}
           zone={selectedZone}
           pending={mutationPending}
+          staging={editing}
           onChange={setEditor}
-          onClose={() => setEditor(null)}
+          onClose={() => { if (!mutationPending) setEditor(null); }}
           onSubmit={submitEditor}
         />
       )}
 
       <Dialog open={removing !== null} onOpenChange={(open) => { if (!open) setRemoving(null); }}>
-        <DialogContent className="max-w-md">
+        <DialogContent className="max-w-md" onInteractOutside={event => event.preventDefault()}>
           <DialogHeader>
-            <DialogTitle>删除 DNS 记录</DialogTitle>
-            <DialogDescription>此操作会直接删除 DNSPod 中的记录，无法由面板自动恢复。</DialogDescription>
+            <DialogTitle>标记删除 DNS 记录</DialogTitle>
+            <DialogDescription>现在只标记为待删除，可撤销。点击管理页的“保存”后才会从 DNSPod 删除，删除后无法自动恢复。</DialogDescription>
           </DialogHeader>
           {removing && (
             <div className="rounded-lg border bg-muted/20 p-4 text-sm">
@@ -587,11 +648,17 @@ export default function DnsRecordManagementCard({
           )}
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => setRemoving(null)}>取消</Button>
-            <Button type="button" variant="destructive" onClick={confirmRemove} disabled={removeMutation.isPending || currentSubdomainInUse || removing?.inUse}>
-              {removeMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              确认删除
+            <Button type="button" variant="destructive" onClick={confirmRemove} disabled={draftLocked || removing?.inUse}>
+              标记删除
             </Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={discardOpen} onOpenChange={setDiscardOpen}>
+        <DialogContent className="max-w-md" onInteractOutside={event => event.preventDefault()}>
+          <DialogHeader><DialogTitle>{saveFailure ? "结束本次编辑？" : "放弃未保存的修改？"}</DialogTitle>
+            <DialogDescription>{saveFailure ? "将丢弃尚未确认的本地草稿并重新读取 DNSPod，请核对真实结果后再编辑。已经保存的变更不会回滚。" : "本次暂存的新增、修改和删除都未写入 DNSPod，放弃后保留原解析。"}</DialogDescription></DialogHeader>
+          <DialogFooter><Button type="button" variant="outline" onClick={() => setDiscardOpen(false)}>继续查看草稿</Button><Button type="button" variant="destructive" disabled={mutationPending} onClick={endEditing}>{saveFailure ? "结束并刷新" : "放弃修改"}</Button></DialogFooter>
         </DialogContent>
       </Dialog>
     </Card>
