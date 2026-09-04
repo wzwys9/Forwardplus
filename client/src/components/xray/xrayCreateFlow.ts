@@ -33,8 +33,16 @@ export const XRAY_WIREGUARD_BLOCKING_WARNING = "WireGuard 外层特征明显，�
 export const XRAY_HTTP_PLAINTEXT_AUTH_WARNING = "该 HTTP 代理未使用 TLS，Basic 用户名和密码可能被链路观察者读取；仅在受信网络或额外加密隧道中使用";
 export const XRAY_MIXED_PLAINTEXT_AUTH_WARNING = "该 Mixed 代理未使用 TLS，SOCKS5 用户名/密码和 HTTP Basic 凭据可能被链路观察者读取；仅在受信网络或额外加密隧道中使用";
 
+const XRAY_CREATE_VISIBLE_PROTOCOLS = new Set<XrayCreateProfileOption["protocol"]>([
+  "VLESS",
+  "TROJAN",
+  "SHADOWSOCKS",
+  "HTTP",
+  "MIXED",
+]);
+
 export function availableXrayCreateProfiles(profiles: readonly XrayCreateProfileOption[]) {
-  return profiles.filter((profile) => profile.isAvailable);
+  return profiles.filter((profile) => profile.isAvailable && XRAY_CREATE_VISIBLE_PROTOCOLS.has(profile.protocol));
 }
 
 export function listenerNetworkForXrayProfile(profile?: XrayCreateProfileOption | null): "TCP" | "UDP" {

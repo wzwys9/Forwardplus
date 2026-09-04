@@ -261,7 +261,7 @@ Xray：v26.3.27 · 运行中 · 4 个节点
 多协议阶段把现有四步 Dialog 演进为 profile 驱动的宽 Dialog。信息架构借鉴 3X-UI 创建入站时的分区方式，但保留 ForwardX 的服务端 profile 权威和部署状态机。顶部固定为七个分区：
 
 1. `基础配置`：主机、节点名称和公网地址。
-2. `协议`：只显示 catalog 中至少存在一个可用 profile 的协议。
+2. `协议`：先按 catalog 的可用 profile 判定，再应用当前产品可见性列表；只显示 VLESS、Trojan、Shadowsocks、HTTP 和 Mixed。VMess、Hysteria 2、WireGuard 与 Tunnel 暂时不提供新建入口，但已有节点仍在列表和详情中正常显示和管理。
 3. `传输`：从当前协议的可用 profile 派生 RAW/gRPC/XHTTP 等选择，并仅显示对应严格字段。
 4. `端口`：只在协议与传输已确定一个 profile 后可用；按 `listenerNetworks` 直接探测 TCP、UDP 或同端口 TCP+UDP。Hysteria 2 直接进入 UDP 探测，不先创建 TCP 探测。
 5. `安全`：从当前协议+传输的可用 profile 派生；Reality 显示目标扫描，TLS 显示受管证书选择，none 不显示伪安全字段。
@@ -276,7 +276,7 @@ TLS profile 逐项开放后，安全分区要求先选主机级证书，再从�
 
 TLS VLESS 也使用 generic access id 管理账户，详情不显示 UUID；分享 Dialog 可以在内存中展示带证书 pin 的 URI。Dialog 应说明该 URI 不使用 `allowInsecure`，关闭时沿用现有清理；证书轮换确认必须明确“新配置应用后，现有 TLS 分享链接的证书 pin 将失效，需要重新分享给客户端”。
 
-VMess/Shadowsocks 在协议卡片、确认摘要和详情中始终显示“兼容协议，固定 Xray 核心已标记 deprecated；新节点优先使用 VLESS/Trojan”，并且不作为打开 Dialog 时的默认 profile。告警来自 catalog `advisoryCode=CORE_DEPRECATED`，前端不通过 profile id 自行猜测。
+Shadowsocks 在当前协议卡片、确认摘要和详情中显示“兼容协议，固定 Xray 核心已标记 deprecated；新节点优先使用 VLESS/Trojan”，并且不作为打开 Dialog 时的默认 profile。VMess 当前不显示创建卡片，但已有节点的摘要和详情仍保留同一告警；以后恢复创建入口时也必须显示。告警来自 catalog `advisoryCode=CORE_DEPRECATED`，前端不通过 profile id 自行猜测。
 
 `VMESS_RAW_TLS` 只显示 RAW 和受管 TLS 证书/SNI，账户分区只填名称；确认页显示“VMess AEAD · AUTO”，不显示 `alterId/aid`、密码算法、flow 或明文 UUID 输入。`SHADOWSOCKS_2022_RAW_NONE` 只显示 RAW/TCP、固定 `2022-blake3-aes-256-gcm` 和“协议层加密（无 TLS/Reality）”，不显示 method 下拉、服务端 PSK 或用户 PSK 输入。尝试停用/删除最后一个有效 Shadowsocks 账户时显示“启用中的 Shadowsocks 2022 节点至少需要一个账户；请先停用节点”。
 
