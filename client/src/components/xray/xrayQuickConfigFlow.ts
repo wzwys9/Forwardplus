@@ -1,4 +1,5 @@
 import type { AppRouterOutputs } from "@/lib/trpc";
+import type { QuickConfigPaths } from "./xrayQuickConfigPaths";
 
 export const XRAY_QUICK_CONFIG_STEPS = [
   "DOMAIN",
@@ -71,6 +72,7 @@ export type XrayQuickConfigApplyResult = AppRouterOutputs["xray"]["quickConfigs"
   | AppRouterOutputs["xray"]["quickConfigs"]["editApply"];
 
 export type XrayQuickConfigEditDraft = Readonly<{
+  carrierPaths?: QuickConfigPaths;
   quickConfigId: number;
   expectedRevision: number;
   zoneId: number;
@@ -98,6 +100,7 @@ export function xrayQuickConfigEditIdentity(
 }
 
 export type XrayQuickConfigFlowState = {
+  carrierPaths: QuickConfigPaths | null;
   editDomainMode: "KEEP" | "CHANGE" | null;
   step: XrayQuickConfigStep;
   furthestStepIndex: number;
@@ -119,6 +122,7 @@ export type XrayQuickConfigFlowState = {
 };
 
 export type XrayQuickConfigFlowAction =
+  | { type: "SET_CARRIER_PATHS"; paths: QuickConfigPaths }
   | { type: "SET_DOMAIN_MODE"; mode: "KEEP" | "CHANGE"; zoneId: number; relativeName: string }
   | { type: "SET_DOMAIN"; zoneId: number | null; relativeName: string }
   | { type: "DOMAIN_CHECKED"; result: XrayQuickConfigDomainCheck }
@@ -143,6 +147,7 @@ export const XRAY_QUICK_CONFIG_CARRIERS: readonly XrayQuickConfigCarrier[] = [
 
 export function initialXrayQuickConfigFlowState(draft?: XrayQuickConfigEditDraft): XrayQuickConfigFlowState {
   return {
+    carrierPaths: draft?.carrierPaths ?? null,
     editDomainMode: draft ? "KEEP" : null,
     step: "DOMAIN",
     furthestStepIndex: 0,
@@ -197,7 +202,7 @@ export function reduceXrayQuickConfigFlow(
       ...initialXrayQuickConfigFlowState(),
       ...(state.editDomainMode === null ? {} : {
         editDomainMode: state.editDomainMode,
-        carrierEndpoints: state.carrierEndpoints, engine: state.engine, manualPort: state.manualPort,
+        carrierEndpoints: state.carrierEndpoints, carrierPaths: state.carrierPaths, engine: state.engine, manualPort: state.manualPort,
         editDefaultRoutes: state.editDefaultRoutes,
       }),
       ...(action.type === "SET_DOMAIN_MODE" ? { editDomainMode: action.mode } : {}),
@@ -212,6 +217,7 @@ export function reduceXrayQuickConfigFlow(
       confirmedDomainToken: null,
       confirmedDomainExpiresAt: null,
       carrierEndpoints: state.editDomainMode === null ? { TELECOM: [], UNICOM: [], MOBILE: [], EDUCATION: [] } : state.carrierEndpoints,
+      carrierPaths: state.editDomainMode === null ? null : state.carrierPaths,
       engine: state.editDomainMode === null ? null : state.engine,
       manualPort: state.editDomainMode === null ? "" : state.manualPort,
       portCheckId: null,
@@ -231,17 +237,22 @@ export function reduceXrayQuickConfigFlow(
       furthestStepIndex: Math.max(state.furthestStepIndex, 1),
     };
   }
-  if (action.type === "TOGGLE_CARRIER_ENDPOINT") {
-    const current = state.carrierEndpoints[action.carrier];
-    const selected = current.includes(action.endpointKey);
+  if (action.type === "TOGGLE_CARRIER_ENDPOINT" || action.type === "SET_CARRIER_PATHS") {
+    if (action.type === "SET_CARRIER_PATHS" && XRAY_QUICK_CONFIG_CARRIERS.every(carrier =>
+      JSON.stringify(action.paths[carrier].map(path => path.hops)) === JSON.stringify(
+        state.carrierPaths?.[carrier].map(path => path.hops) ?? state.carrierEndpoints[carrier].map(key => [key]),
+      ))) return state;
+    const endpoints = { ...state.carrierEndpoints };
+    if (action.type === "SET_CARRIER_PATHS") {
+      for (const carrier of XRAY_QUICK_CONFIG_CARRIERS) endpoints[carrier] = action.paths[carrier].flatMap(path => path.hops[0] ? [path.hops[0]] : []);
+    } else {
+      const current = endpoints[action.carrier];
+      endpoints[action.carrier] = current.includes(action.endpointKey) ? current.filter(key => key !== action.endpointKey) : [...current, action.endpointKey];
+    }
     return {
       ...state,
-      carrierEndpoints: {
-        ...state.carrierEndpoints,
-        [action.carrier]: selected
-          ? current.filter((key) => key !== action.endpointKey)
-          : [...current, action.endpointKey],
-      },
+      carrierEndpoints: endpoints,
+      carrierPaths: action.type === "SET_CARRIER_PATHS" ? structuredClone(action.paths) : null,
       engine: null,
       manualPort: "",
       portCheckId: null,

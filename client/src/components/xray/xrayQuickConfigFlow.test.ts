@@ -19,6 +19,25 @@ const success = {
   defaultRouteCandidates: [],
 } satisfies XrayQuickConfigPortSuccess;
 
+test("saving multihop paths keeps relay order and invalidates downstream proofs without losing the old reservation token", () => {
+  const paths = { TELECOM: [{ id: "t", hops: ["1:IPV4", "2:IPV6", "3:IPV4"] }], UNICOM: [], MOBILE: [], EDUCATION: [] };
+  const state = reduceXrayQuickConfigFlow(successfulState(), { type: "SET_CARRIER_PATHS", paths });
+  assert.deepEqual(state.carrierPaths, paths);
+  assert.deepEqual(state.carrierEndpoints.TELECOM, ["1:IPV4"]);
+  assert.equal(state.portResult, null);
+  assert.equal(state.preview, null);
+  assert.equal(state.engine, null);
+  assert.equal(state.replaceProbeResult?.token, success.probeResultToken);
+  paths.TELECOM[0].hops.reverse();
+  assert.deepEqual(state.carrierPaths?.TELECOM[0].hops, ["1:IPV4", "2:IPV6", "3:IPV4"]);
+});
+
+test("accepting unchanged paths does not discard an already checked port", () => {
+  const state = successfulState();
+  const path = [{ id: "copy", hops: ["1:IPV4"] }];
+  assert.equal(reduceXrayQuickConfigFlow(state, { type: "SET_CARRIER_PATHS", paths: { TELECOM: path, UNICOM: path, MOBILE: path, EDUCATION: path } }), state);
+});
+
 function successfulState(): XrayQuickConfigFlowState {
   return reduceXrayQuickConfigFlow({
     ...initialXrayQuickConfigFlowState(),

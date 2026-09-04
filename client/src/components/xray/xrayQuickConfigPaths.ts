@@ -54,7 +54,7 @@ export function quickConfigPathEndpoint(key: string | null, hosts: readonly Xray
 }
 
 type PathIssueCode = "MISSING_PATH" | "MISSING_ENDPOINT" | "ENDPOINT_UNAVAILABLE"
-  | "REPEATED_HOST" | "LANDING_AS_RELAY" | "NEXT_HOP_CONFLICT";
+  | "REPEATED_HOST" | "LANDING_AS_RELAY" | "NEXT_HOP_CONFLICT" | "PATH_LIMIT" | "DUPLICATE_ENTRY";
 export type QuickConfigPathIssue = {
   carrier: XrayQuickConfigCarrier; pathId: string | null; code: PathIssueCode; message: string;
 };
@@ -65,9 +65,14 @@ export function inspectQuickConfigPaths(paths: QuickConfigPaths, hosts: readonly
   const dnsEntries: Array<{ carrier: XrayQuickConfigCarrier; pathId: string; addressFamily: "IPV4" | "IPV6"; address: string }> = [];
   const listeners = new Map<number, Array<{ next: string; carrier: XrayQuickConfigCarrier; pathId: string }>>();
   for (const carrier of XRAY_QUICK_CONFIG_CARRIERS) {
+    if (paths[carrier].length > 32 || Object.values(paths).flat().length > 64) issues.push({ carrier, pathId: null, code: "PATH_LIMIT", message: "每类最多 32 条路径，四类合计最多 64 条" });
+    const ingress = new Set<string>();
     if (paths[carrier].length === 0) issues.push({ carrier, pathId: null, code: "MISSING_PATH", message: "尚未添加路径" });
     for (const path of paths[carrier]) {
       const addIssue = (code: PathIssueCode, message: string) => issues.push({ carrier, pathId: path.id, code, message });
+      if (!path.hops.length || path.hops.length > 9) addIssue("PATH_LIMIT", "每条路径需要入口，且最多 8 个中转");
+      if (path.hops[0] && ingress.has(path.hops[0])) addIssue("DUPLICATE_ENTRY", "同一运营商不能重复添加相同入口地址，请修改已有路径");
+      if (path.hops[0]) ingress.add(path.hops[0]);
       const seen = new Set<number>();
       path.hops.forEach((key, index) => {
         const endpoint = quickConfigPathEndpoint(key, hosts);
@@ -76,7 +81,7 @@ export function inspectQuickConfigPaths(paths: QuickConfigPaths, hosts: readonly
         if (seen.has(endpoint.hostId)) addIssue("REPEATED_HOST", "同一路径不能重复经过同一服务器（IPv4/IPv6 也视为同一台）");
         seen.add(endpoint.hostId);
         if (endpoint.hostId === landingHostId && path.hops.length > 1) {
-          addIssue("LANDING_AS_RELAY", "落地主机不能再次作为中转；如需本机端口改写，请使用当前正式快速配置");
+          addIssue("LANDING_AS_RELAY", "落地主机不能再次作为中转；本机直达路径不能再添加中转");
         }
         if (index === 0) dnsEntries.push({ carrier, pathId: path.id, addressFamily: endpoint.addressFamily, address: endpoint.address });
         if (endpoint.hostId === landingHostId && path.hops.length === 1) return;
@@ -94,5 +99,23 @@ export function inspectQuickConfigPaths(paths: QuickConfigPaths, hosts: readonly
     for (const entry of entries) issues.push({ ...entry, code: "NEXT_HOP_CONFLICT",
       message: `${hostName} 的下一跳不一致。同一服务器共用监听，不能按运营商或 IPv4/IPv6 分流到不同下一跳。请统一后续路径或改用其他服务器。` });
   }
+  if (listeners.size > 64) issues.push({ carrier: "TELECOM", pathId: null, code: "PATH_LIMIT", message: "一个快速配置最多使用 64 台转发服务器" });
   return { issues, dnsEntries, uniqueForwardHostCount: listeners.size };
+}
+
+export function quickConfigPathsFromEntries(entries: Record<XrayQuickConfigCarrier, string[]>): QuickConfigPaths {
+  const paths = emptyQuickConfigPaths();
+  for (const carrier of XRAY_QUICK_CONFIG_CARRIERS) paths[carrier] = entries[carrier].map((key, index) => ({ id: `${carrier}-${index}`, hops: [key] }));
+  return paths;
+}
+
+export function quickConfigPathInput(path: QuickConfigPath) {
+  const hops: Array<{ hostId: number; addressFamily: "IPV4" | "IPV6" }> = [];
+  for (const key of path.hops) {
+    const match = key?.match(/^([1-9]\d*):(IPV4|IPV6)$/);
+    if (!match || !Number.isSafeInteger(Number(match[1]))) return null;
+    hops.push({ hostId: Number(match[1]), addressFamily: match[2] as "IPV4" | "IPV6" });
+  }
+  if (!hops.length || hops.length > 9) return null;
+  return { ...hops[0], ...(hops.length > 1 ? { relays: hops.slice(1) } : {}) };
 }
