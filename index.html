@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+    <title>ForwardX</title>
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <script>
+      (function () {
+        try {
+          var theme = window.localStorage.getItem("forwardx-theme") || "light";
+          var resolved = theme === "system"
+            ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+            : theme;
+          document.documentElement.classList.remove("light", "dark");
+          document.documentElement.classList.add(resolved === "dark" ? "dark" : "light");
+        } catch (error) {
+          document.documentElement.classList.add("light");
+        }
+      })();
+    </script>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <div id="forwardx-overlay-root" data-forwardx-overlay-root></div>
+    <script type="module" src="/client/src/main.tsx"></script>
+  </body>
+
+</html>

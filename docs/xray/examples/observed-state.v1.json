@@ -1,0 +1,24 @@
+{
+  "xrayStateSignature": "1111111111111111111111111111111111111111111111111111111111111111",
+  "xrayState": {
+    "schemaVersion": 1,
+    "isInstalled": true,
+    "installedVersion": "v26.3.27",
+    "runningVersion": "v26.3.27",
+    "serviceStatus": "RUNNING",
+    "processId": 2145,
+    "binarySha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "appliedGeneration": 12,
+    "appliedConfigHash": "a850587f2d172f0a1be8669d5225d0292b19523db0489bef95a7d883e28f5e4f",
+    "listeners": [
+      {
+        "runtimeTag": "forwardx-inbound-01JEXAMPLE00000000000000",
+        "network": "tcp",
+        "port": 23456,
+        "status": "READY"
+      }
+    ],
+    "lastError": null,
+    "observedAt": "2026-09-01T08:00:05Z"
+  }
+}

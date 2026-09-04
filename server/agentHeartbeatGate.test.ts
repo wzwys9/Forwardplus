@@ -1,0 +1,715 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { mergeAgentReportedAddress } from "./agentAddressState";
+import {
+  allocateProtocolGuardPorts,
+  buildNginxCertificateCleanupCmd,
+  buildNginxRuntimeRetirementPlan,
+  buildNginxStreamConfig,
+  buildNginxStreamServerBlock,
+  buildNginxTunnelServerCertificate,
+  buildNginxTunnelTlsClientOptions,
+  buildGostRuleListener,
+  forwardXUDPTargetAddress,
+  selectEffectiveForwardRateLimit,
+  selectProtocolGuardRateLimit,
+  selectProtocolGuardProxyProtocol,
+  selectForwardChainListenerPort,
+  shouldReconcileProtocolGuardBackend,
+  stableDesiredStateHash,
+} from "./agentHeartbeatRoute";
+import { normalizeTransportTuningInput } from "./routers/rules.crud";
+import { hasAgentVersionChanged } from "./agentRouteUtils";
+import { HOST_ONLINE_TTL_MS } from "./repositories/hostRepository";
+import {
+  clearAuthenticatedAgentActivity,
+  hasRecentAuthenticatedAgentActivity,
+  partitionHostsByRecentAgentActivity,
+  recordAuthenticatedAgentActivity,
+} from "./agentActivity";
+import { isHostMetricsWatching, markHostMetricsWatching } from "./agentEvents";
+import {
+  AgentHeartbeatGate,
+  AgentStableHeartbeatPlanCache,
+  AGENT_IDLE_HEARTBEAT_INTERVAL_SECONDS,
+  AGENT_PRESENCE_INTERVAL_SECONDS,
+  buildBusyAgentHeartbeatResponse,
+  buildPresenceAgentHeartbeatResponse,
+  buildReportedRuntimeHeartbeatPatch,
+  selectAgentHeartbeatInterval,
+  selectAgentTrafficReportInterval,
+  shouldPersistAgentPresence,
+  shouldDeferAgentWorkForLocalState,
+} from "./agentHeartbeatGate";
+
+test("Realm legacy transport tuning is normalized off", () => {
+  const normalized = normalizeTransportTuningInput(
+    { tcpFastOpen: true, zeroCopy: true },
+    "tcp",
+    "realm",
+    false,
+    { clearUnsupported: true },
+  );
+
+  assert.equal(normalized.tcpFastOpen, false);
+  assert.equal(normalized.zeroCopy, false);
+  assert.throws(
+    () => normalizeTransportTuningInput({ tcpFastOpen: true }, "tcp", "realm", false),
+    /当前转发方式不支持 TCP Fast Open/,
+  );
+
+  const forwardx = normalizeTransportTuningInput(
+    { tcpFastOpen: true },
+    "tcp",
+    "gost",
+    false,
+    { tunnelRoute: true, forwardxTunnel: true },
+  );
+  assert.equal(forwardx.tcpFastOpen, true);
+});
+
+test("retires stale ForwardX Nginx state without requiring or reinstalling Nginx", () => {
+  const plan = buildNginxRuntimeRetirementPlan();
+  const commands = plan.commands.join("\n");
+
+  assert.deepEqual(plan.preCommands, []);
+  assert.deepEqual(plan.managedConfigs, []);
+  assert.equal(plan.commands.length, 3);
+  assert.match(commands, /systemctl disable 'forwardx-nginx'\.service/);
+  assert.match(commands, /rm -f "\$systemd_unit"/);
+  assert.match(commands, /\[\/]usr\/local\/bin\/forwardx-nginx\.\*\[\/]etc\/forwardx\/nginx\/nginx\[\.\]conf/);
+  assert.match(commands, /kill -KILL/);
+  assert.match(commands, /'\/etc\/forwardx\/nginx\/nginx\.conf\.forwardx-last-good'/);
+  assert.match(commands, /\.crt\.forwardx-last-good/);
+  assert.match(commands, /forwardx-nginx-session\.log/);
+  assert.match(commands, /config cleanup failed/);
+  assert.doesNotMatch(commands, /\/usr\/sbin\/nginx|install -m 0755|chmod 0755/);
+  assert.match(
+    plan.commands[1],
+    /managed process cleanup failed"; exit 1; fi; rm -f '\/etc\/forwardx\/nginx\/nginx\.conf'/,
+  );
+});
+
+test("Nginx TCP streams retain idle sessions and enable socket keepalive", () => {
+  const config = buildNginxStreamServerBlock({
+    name: "tunnel entry 7",
+    listenPort: 443,
+    proto: "tcp",
+    upstream: "fwx_tentry_7_tcp",
+    sslClient: { serverName: "edge.example.test" },
+  });
+
+  assert.match(config, /listen \[::\]:443 so_keepalive=60s:15s:4 ipv6only=off;/);
+  assert.match(config, /proxy_timeout 24h;/);
+  assert.match(config, /proxy_socket_keepalive on;/);
+  assert.match(config, /proxy_ssl on;/);
+  assert.match(config, /proxy_ssl_verify off;/);
+  assert.match(config, /proxy_ssl_name edge\.example\.test;/);
+  assert.doesNotMatch(config, /proxy_timeout 10m;/);
+});
+
+test("Nginx UDP streams keep their short session timeout without TCP keepalive directives", () => {
+  const config = buildNginxStreamServerBlock({
+    name: "rule 8 udp",
+    listenPort: 5353,
+    proto: "udp",
+    upstream: "fwx_rule_8_udp",
+  });
+
+  assert.match(config, /listen \[::\]:5353 udp reuseport ipv6only=off;/);
+  assert.match(config, /proxy_timeout 2m;/);
+  assert.doesNotMatch(config, /proxy_socket_keepalive|so_keepalive/);
+});
+
+test("guarded Nginx backends are reachable only through the Agent loopback proxy", () => {
+  const tcpConfig = buildNginxStreamServerBlock({
+    name: "guarded rule 9 tcp",
+    listenPort: 43009,
+    proto: "tcp",
+    upstream: "fwx_rule_9_tcp",
+    loopbackOnly: true,
+  });
+  const udpConfig = buildNginxStreamServerBlock({
+    name: "guarded rule 9 udp",
+    listenPort: 43009,
+    proto: "udp",
+    upstream: "fwx_rule_9_udp",
+    loopbackOnly: true,
+  });
+
+  assert.match(tcpConfig, /listen 127\.0\.0\.1:43009 so_keepalive=60s:15s:4;/);
+  assert.match(udpConfig, /listen 127\.0\.0\.1:43009 udp reuseport;/);
+  assert.doesNotMatch(`${tcpConfig}\n${udpConfig}`, /\[::\]|ipv6only=off/);
+});
+
+test("protocol guard rate limits require a supported rule and a current Agent", () => {
+  const enabled = selectProtocolGuardRateLimit({
+    agentVersion: "2.2.187",
+    hostId: 3,
+    rule: { forwardType: "realm", userId: 7 },
+    limitIn: 125_000,
+    limitOut: 250_000,
+  });
+  assert.deepEqual(enabled, {
+    rateLimitScope: "user-7-host-3",
+    limitIn: 125_000,
+    limitOut: 250_000,
+  });
+
+  const resourceLimited = selectProtocolGuardRateLimit({
+    agentVersion: "2.2.187",
+    hostId: 3,
+    rule: { forwardType: "nftables", userId: 7 },
+    rateLimitScope: "user-7-host-3-group-19",
+    limitIn: 125_000,
+    limitOut: 125_000,
+  });
+  assert.equal(resourceLimited.rateLimitScope, "user-7-host-3-group-19");
+
+  const nginxTunnelEntry = selectProtocolGuardRateLimit({
+    agentVersion: "2.2.187",
+    hostId: 3,
+    rule: { forwardType: "gost", userId: 7, tunnelId: 11, tunnelMode: "nginx_stream", tunnelEntry: true },
+    limitIn: 125_000,
+    limitOut: 125_000,
+  });
+  assert.deepEqual(nginxTunnelEntry, {
+    rateLimitScope: "user-7-host-3-tunnel-11",
+    limitIn: 125_000,
+    limitOut: 125_000,
+  });
+
+  for (const options of [
+    { agentVersion: "2.2.186", rule: { forwardType: "iptables", userId: 7 }, limitIn: 125_000 },
+    { agentVersion: "2.2.187", rule: { forwardType: "gost", userId: 7 }, limitIn: 125_000 },
+    { agentVersion: "2.2.187", rule: { forwardType: "gost", userId: 7, tunnelId: 11, tunnelMode: "nginx_stream", tunnelEntry: false }, limitIn: 125_000 },
+    { agentVersion: "2.2.187", rule: { forwardType: "nftables", userId: 7, tunnelId: 8 }, limitIn: 125_000 },
+    { agentVersion: "2.2.187", rule: { forwardType: "nginx", userId: 7 }, limitIn: 0 },
+  ]) {
+    assert.deepEqual(selectProtocolGuardRateLimit({
+      hostId: 3,
+      limitOut: 0,
+      ...options,
+    }), { rateLimitScope: "", limitIn: 0, limitOut: 0 });
+  }
+});
+
+test("resource rate limits use the strictest configured scope", () => {
+  const base = { userId: 7, hostId: 3, forwardGroupId: 19 };
+  assert.deepEqual(selectEffectiveForwardRateLimit(base), { mbps: 0, scope: "" });
+  assert.deepEqual(selectEffectiveForwardRateLimit({
+    ...base,
+    userLimitMbps: 200,
+    forwardGroupLimitMbps: 80,
+  }), { mbps: 80, scope: "user-7-host-3-group-19" });
+  assert.deepEqual(selectEffectiveForwardRateLimit({
+    ...base,
+    userLimitMbps: 80,
+    forwardGroupLimitMbps: 200,
+  }), { mbps: 80, scope: "user-7-host-3" });
+  assert.deepEqual(selectEffectiveForwardRateLimit({
+    ...base,
+    userLimitMbps: 80,
+    forwardGroupLimitMbps: 80,
+  }), { mbps: 80, scope: "user-7-host-3" });
+  assert.deepEqual(selectEffectiveForwardRateLimit({
+    ...base,
+    userLimitMbps: 300,
+    tunnelId: 11,
+    tunnelLimitMbps: 160,
+    forwardGroupLimitMbps: 120,
+  }), { mbps: 120, scope: "user-7-host-3-group-19" });
+});
+
+test("running process-backed Guards remain in desired reconciliation", () => {
+  for (const forwardType of ["gost", "realm", "socat", "nginx"]) {
+    assert.equal(shouldReconcileProtocolGuardBackend(true, forwardType), true, forwardType);
+  }
+  assert.equal(shouldReconcileProtocolGuardBackend(false, "realm"), false);
+  assert.equal(shouldReconcileProtocolGuardBackend(true, "iptables"), false);
+});
+
+test("Nginx guard strips received PROXY headers unless downstream sending is enabled", () => {
+  const nginxBackend = {
+    backendPort: 43009,
+    backendForwardType: "nginx",
+  };
+
+  assert.deepEqual(selectProtocolGuardProxyProtocol({
+    ...nginxBackend,
+    receive: true,
+    send: false,
+  }), {
+    proxyProtocolReceive: true,
+    proxyProtocolSend: false,
+  });
+  assert.deepEqual(selectProtocolGuardProxyProtocol({
+    ...nginxBackend,
+    receive: false,
+    send: true,
+  }), {
+    proxyProtocolReceive: false,
+    proxyProtocolSend: true,
+  });
+  assert.deepEqual(selectProtocolGuardProxyProtocol({
+    ...nginxBackend,
+    receive: true,
+    send: true,
+  }), {
+    proxyProtocolReceive: true,
+    proxyProtocolSend: true,
+  });
+});
+
+test("PROXY-aware Guard backends receive internal metadata before applying their send setting", () => {
+  for (const backendForwardType of ["gost", "realm"]) {
+    assert.deepEqual(selectProtocolGuardProxyProtocol({
+      backendPort: 43009,
+      backendForwardType,
+      receive: true,
+      send: false,
+    }), {
+      proxyProtocolReceive: true,
+      proxyProtocolSend: true,
+    });
+  }
+});
+
+test("protocol guard internal ports avoid public listeners and each other deterministically", () => {
+  const rules = [
+    { id: 1, sourcePort: 43001, targetPort: 39001 },
+    { id: 2001, sourcePort: 39001 },
+    { id: 4001, sourcePort: 45001 },
+  ];
+  const reservedPorts = [41001, 61000];
+  const plans = allocateProtocolGuardPorts(rules, reservedPorts);
+  const reversedPlans = allocateProtocolGuardPorts([...rules].reverse(), [...reservedPorts].reverse());
+
+  assert.deepEqual(Array.from(plans.entries()), Array.from(reversedPlans.entries()));
+  const publicPorts = new Set([
+    ...rules.map((rule) => rule.sourcePort),
+    ...rules.map((rule) => rule.targetPort).filter((port): port is number => Number.isInteger(port)),
+    ...reservedPorts,
+  ]);
+  const internalPorts = Array.from(plans.values()).flatMap((plan) => [
+    plan.guardListenPort,
+    plan.failoverProxyPort,
+    plan.guardBackendPort,
+  ]);
+  assert.equal(new Set(internalPorts).size, internalPorts.length);
+  for (const port of internalPorts) assert.equal(publicPorts.has(port), false, `port ${port} is publicly reserved`);
+  assert.notEqual(plans.get(1)?.guardBackendPort, 43001);
+  assert.notEqual(plans.get(2001)?.guardListenPort, 41001);
+
+  assert.deepEqual(allocateProtocolGuardPorts([{ id: 7, sourcePort: 10007 }]).get(7), {
+    guardListenPort: 39007,
+    failoverProxyPort: 41007,
+    guardBackendPort: 43007,
+  });
+});
+
+test("GOST UDP rule listeners retain active game sessions with bounded buffers", () => {
+  const listener = buildGostRuleListener("udp");
+  assert.deepEqual(listener, {
+    type: "udp",
+    metadata: {
+      keepalive: true,
+      ttl: "30s",
+      readBufferSize: "8192",
+      readQueueSize: "64",
+      backlog: "128",
+    },
+  });
+
+  const decoded = JSON.parse(JSON.stringify(listener));
+  assert.equal(typeof decoded.metadata.keepalive, "boolean");
+  for (const key of ["ttl", "readBufferSize", "readQueueSize", "backlog"]) {
+    assert.equal(typeof decoded.metadata[key], "string", `${key} must survive JSON decoding as GOST metadata`);
+  }
+});
+
+test("GOST TCP rule listeners remain free of UDP session metadata", () => {
+  assert.deepEqual(buildGostRuleListener("tcp"), { type: "tcp" });
+});
+
+test("ForwardX UDP targets prefer the heartbeat-resolved address", () => {
+  assert.equal(forwardXUDPTargetAddress({
+    targetIp: "192.0.2.20",
+    _originalTargetIp: "game.example.com",
+  }), "192.0.2.20");
+  assert.equal(forwardXUDPTargetAddress({
+    _originalTargetIp: "game.example.com",
+  }), "game.example.com");
+});
+
+test("Nginx session diagnostics retain timeout duration and selected upstream", () => {
+  const config = buildNginxStreamConfig({
+    upstreams: ["  upstream fwx_test {\n    server 127.0.0.1:9;\n  }"],
+    servers: [buildNginxStreamServerBlock({
+      name: "test",
+      listenPort: 8443,
+      proto: "tcp",
+      upstream: "fwx_test",
+    })],
+  });
+
+  assert.match(config, /error_log \/var\/log\/forwardx-agent\/forwardx-nginx-error\.log notice;/);
+  assert.match(config, /session_time=\$session_time/);
+  assert.match(config, /upstream=\$upstream_addr/);
+  assert.match(config, /access_log \/var\/log\/forwardx-agent\/forwardx-nginx-session\.log forwardx_session buffer=32k flush=5s;/);
+  assert.doesNotMatch(config, /\$forwardx_log_abnormal|\$remote_addr/);
+});
+
+test("Nginx entry TLS options never contain certificate or private-key material", () => {
+  const tunnel = {
+    id: 9,
+    certDomain: "exit.example.test",
+    certPem: "TEST CERTIFICATE",
+    certKeyPem: "TEST PRIVATE KEY",
+  };
+
+  const clientOptions = buildNginxTunnelTlsClientOptions(tunnel);
+  assert.deepEqual(clientOptions, { serverName: "exit.example.test" });
+  assert.doesNotMatch(JSON.stringify(clientOptions), /CERTIFICATE|PRIVATE KEY/);
+
+  const serverCertificate = buildNginxTunnelServerCertificate(tunnel);
+  assert.ok(serverCertificate);
+  assert.equal(serverCertificate.keyPem, "TEST PRIVATE KEY\n");
+  assert.match(serverCertificate.keyPath, /\/etc\/forwardx\/nginx\/certs\/tunnel-9-[a-f0-9]{16}\.key$/);
+});
+
+test("Nginx certificate cleanup preserves only active TLS server files", () => {
+  const activeCert = "/etc/forwardx/nginx/certs/tunnel-9-active.crt";
+  const activeKey = "/etc/forwardx/nginx/certs/tunnel-9-active.key";
+  const command = buildNginxCertificateCleanupCmd([activeCert, activeKey]);
+
+  assert.match(command, /base_cert_file=\$\{cert_file%\.forwardx-last-good\}/);
+  assert.match(command, /grep -Fq -- "\$base_cert_file" '\/etc\/forwardx\/nginx\/nginx\.conf'/);
+  assert.match(command, /case "\$base_cert_file" in/);
+  assert.match(command, /tunnel-9-active\.crt/);
+  assert.match(command, /tunnel-9-active\.key/);
+  assert.match(command, /rm -f -- "\$cert_file"/);
+});
+
+test("traffic reports use the steady window unless live metrics or strict accounting require it", () => {
+  assert.equal(selectAgentTrafficReportInterval({ metricsWatching: false, strictAccounting: false }), 30);
+  assert.equal(selectAgentTrafficReportInterval({ metricsWatching: true, strictAccounting: false }), 10);
+  assert.equal(selectAgentTrafficReportInterval({ metricsWatching: false, strictAccounting: true }), 10);
+});
+
+test("traffic reports return to the steady window when a metrics watcher expires", () => {
+  const hostId = 98_765;
+  markHostMetricsWatching([hostId], 6_000, 10_000);
+  assert.equal(selectAgentTrafficReportInterval({
+    metricsWatching: isHostMetricsWatching(hostId, 15_999),
+    strictAccounting: false,
+  }), 10);
+  assert.equal(selectAgentTrafficReportInterval({
+    metricsWatching: isHostMetricsWatching(hostId, 16_000),
+    strictAccounting: false,
+  }), 30);
+});
+
+test("coalesces overlapping and recent heartbeats for one host without blocking", () => {
+  let now = 10_000;
+  const gate = new AgentHeartbeatGate(1000, () => now);
+  const release = gate.tryAcquire(1);
+  assert.ok(release);
+  assert.equal(gate.tryAcquire(1), null);
+
+  const otherHostRelease = gate.tryAcquire(2);
+  assert.ok(otherHostRelease, "different hosts must reconcile in parallel");
+  otherHostRelease();
+
+  release();
+  assert.equal(gate.tryAcquire(1), null, "recent duplicate should be coalesced");
+  const forcedRelease = gate.tryAcquire(1, { force: true });
+  assert.ok(forcedRelease, "SSE configuration refresh must bypass the recent window");
+  forcedRelease();
+
+  now += 1001;
+  const nextRelease = gate.tryAcquire(1);
+  assert.ok(nextRelease);
+  nextRelease();
+});
+
+test("limits concurrent full heartbeats across different hosts", () => {
+  const gate = new AgentHeartbeatGate(1000, () => 10_000, 2);
+  const first = gate.tryAcquire(1);
+  const second = gate.tryAcquire(2);
+  assert.ok(first);
+  assert.ok(second);
+  assert.equal(gate.tryAcquire(3), null, "excess reconciliation must wait outside the database queue");
+  assert.equal(gate.tryAcquire(3, { force: true }), null, "forced refresh must still respect global backpressure");
+
+  first();
+  const third = gate.tryAcquire(3);
+  assert.ok(third, "capacity must be available immediately after a reconciliation completes");
+  third();
+  second();
+});
+
+test("serves saturated heartbeat reconciliation in FIFO order", () => {
+  const gate = new AgentHeartbeatGate(1000, () => 10_000, 2);
+  const first = gate.tryAcquire(1);
+  const second = gate.tryAcquire(2);
+  assert.ok(first);
+  assert.ok(second);
+
+  for (const hostId of [3, 4, 5, 6]) {
+    assert.equal(gate.tryAcquire(hostId), null);
+  }
+  first();
+  assert.equal(gate.tryAcquire(6, { force: true }), null, "forced work must not bypass older recovery work");
+
+  const releases: Array<() => void> = [];
+  for (const hostId of [3, 4, 5, 6]) {
+    const release = gate.tryAcquire(hostId);
+    assert.ok(release, `host ${hostId} should receive the next available slot`);
+    releases.push(release);
+    release();
+  }
+  second();
+});
+
+test("busy heartbeat responses preserve cached state sections on the Agent", () => {
+  const response = buildBusyAgentHeartbeatResponse({
+    panelUrl: "https://panel.example.test",
+    requestLocalState: false,
+  });
+  const stateSections = [
+    "runningRules",
+    "ruleLatencyProbes",
+    "tunnelProbes",
+    "forwardGroupProbes",
+    "hostProbeServices",
+    "guardRules",
+    "dnsWatch",
+    "stateSignatures",
+  ];
+  for (const section of stateSections) {
+    assert.equal(section in response, false, `${section} must be omitted from a coalesced heartbeat`);
+  }
+  assert.equal(response.nextInterval, 5);
+  assert.equal(response.panelUrl, "https://panel.example.test");
+  assert.equal(response.metricsOnly, false);
+});
+
+test("presence responses keep the liveness cadence inside the ten-second failure window", () => {
+  const response = buildPresenceAgentHeartbeatResponse({});
+  assert.equal(AGENT_PRESENCE_INTERVAL_SECONDS, 5);
+  assert.equal(response.nextPresenceInterval, AGENT_PRESENCE_INTERVAL_SECONDS);
+  assert.ok(response.nextPresenceInterval * 2 <= 10);
+});
+
+test("stable heartbeat plans require a completed plan and exact Agent acknowledgements", () => {
+  let now = 1_000;
+  const cache = new AgentStableHeartbeatPlanCache(10_000, () => now);
+  const input = {
+    localStateSignature: "local-a",
+    stateSignatures: { runningRules: "state-a", dnsWatch: "state-b" },
+    agentVersion: "2.3.0",
+    agentBootId: "boot-a",
+    agentProcessStartedAt: 900,
+    defaultNetworkInterface: "eth0",
+    pluginInventorySignature: "plugins-a",
+    mimicEnvironmentSignature: "mimic-a",
+    xrayCompatible: true,
+    xrayStateSignature: "a".repeat(64),
+    agentLastReceivedRevision: 12,
+    agentLastAppliedRevision: 12,
+    agentLastReceivedHash: "plan-a",
+    agentLastAppliedHash: "plan-a",
+  };
+
+  assert.equal(cache.match(7, input), null, "a panel restart must perform its first full plan");
+  assert.equal(cache.remember(7, {
+    plannedAt: now,
+    configRevision: 12,
+    desiredStateHash: "plan-a",
+    localStateSignature: "local-a",
+    stateSignatures: { runningRules: "state-a", dnsWatch: "state-b" },
+    agentVersion: "2.3.0",
+    agentBootId: "boot-a",
+    agentProcessStartedAt: 900,
+    defaultNetworkInterface: "eth0",
+    pluginInventorySignature: "plugins-a",
+    mimicEnvironmentSignature: "mimic-a",
+    xrayCompatible: true,
+    xrayStateSignature: "a".repeat(64),
+    idleNextInterval: 60,
+    panelUrl: "https://panel.example.test",
+  }), true);
+  assert.ok(cache.match(7, input));
+  assert.equal(cache.match(7, { ...input, agentLastAppliedHash: "action-a" }), null);
+  assert.equal(cache.match(7, { ...input, localStateSignature: "local-b" }), null);
+  assert.equal(cache.match(7, { ...input, stateSignatures: { ...input.stateSignatures, dnsWatch: "state-c" } }), null);
+  assert.equal(cache.match(7, { ...input, xrayStateSignature: "b".repeat(64) }), null);
+  assert.equal(cache.match(7, { ...input, xrayCompatible: false }), null);
+});
+
+test("desired-state aggregate hash ignores delivery timestamps and per-action transport hashes", () => {
+  const action = { ruleId: 7, op: "apply", configRevision: 12, issuedAt: 100, configHash: "delivery-a" };
+  assert.equal(
+    stableDesiredStateHash([action]),
+    stableDesiredStateHash([{ ...action, issuedAt: 200, configHash: "delivery-b" }]),
+  );
+  assert.notEqual(stableDesiredStateHash([action]), stableDesiredStateHash([{ ...action, ruleId: 8 }]));
+});
+
+test("forward-chain target reconciliation uses the downstream listener port", () => {
+  const childRules = [
+    { id: 11, forwardGroupMemberId: 101, hostId: 9, sourcePort: 42005, pendingDelete: false },
+    { id: 12, forwardGroupMemberId: 101, hostId: 1, sourcePort: 12007, pendingDelete: false },
+    { id: 13, forwardGroupMemberId: 102, hostId: 2, sourcePort: 22008, pendingDelete: false },
+    { id: 14, forwardGroupMemberId: 102, hostId: 2, sourcePort: 22009, pendingDelete: true },
+  ];
+
+  assert.equal(selectForwardChainListenerPort(childRules, 101, 1, 42005), 12007);
+  assert.equal(selectForwardChainListenerPort(childRules, 102, 2, 12007), 22008);
+  assert.equal(selectForwardChainListenerPort(childRules, 999, 9, 33000), 33000);
+});
+
+test("an Agent version change requires a fresh desired-state reconciliation", () => {
+  assert.equal(hasAgentVersionChanged("2.2.154", "2.2.155"), true);
+  assert.equal(hasAgentVersionChanged("v2.2.155", "2.2.155"), false);
+  assert.equal(hasAgentVersionChanged(null, "2.2.155"), true);
+  assert.equal(hasAgentVersionChanged("2.2.155", ""), false);
+});
+
+test("stable heartbeat plans yield to work and periodic full audits", () => {
+  let now = 1_000;
+  const cache = new AgentStableHeartbeatPlanCache(10_000, () => now);
+  cache.remember(8, {
+    plannedAt: now,
+    configRevision: 4,
+    desiredStateHash: "hash-a",
+    localStateSignature: "local-a",
+    stateSignatures: { runningRules: "state-a" },
+    agentVersion: "2.3.0",
+    agentBootId: "boot-a",
+    agentProcessStartedAt: 900,
+    defaultNetworkInterface: "eth0",
+    pluginInventorySignature: "plugins-a",
+    mimicEnvironmentSignature: "mimic-a",
+    xrayCompatible: false,
+    xrayStateSignature: "",
+    idleNextInterval: 60,
+    panelUrl: "https://panel.example.test",
+  });
+  const input = {
+    localStateSignature: "local-a",
+    stateSignatures: { runningRules: "state-a" },
+    agentVersion: "2.3.0",
+    agentBootId: "boot-a",
+    agentProcessStartedAt: 900,
+    defaultNetworkInterface: "eth0",
+    pluginInventorySignature: "plugins-a",
+    mimicEnvironmentSignature: "mimic-a",
+    xrayCompatible: false,
+    xrayStateSignature: "",
+    agentLastReceivedRevision: 4,
+    agentLastAppliedRevision: 4,
+    agentLastReceivedHash: "hash-a",
+    agentLastAppliedHash: "hash-a",
+  };
+
+  for (const blocker of [
+    { forceReconcile: true },
+    { hasBlockingWork: true },
+    { recoveryTriggered: true },
+    { addressChanged: true },
+    { hasDnsChanges: true },
+    { hasLocalStateUpload: true },
+    { hasEndpointEvents: true },
+  ]) {
+    assert.equal(cache.match(8, { ...input, ...blocker }), null);
+  }
+  now += 10_000;
+  assert.equal(cache.match(8, input), null, "periodic audit must rebuild even when SSE invalidation was missed");
+});
+
+test("metrics watcher busy heartbeats explicitly select the metrics-only mode", () => {
+  const response = buildBusyAgentHeartbeatResponse({
+    panelUrl: "https://panel.example.test",
+    requestLocalState: false,
+    metricsWatching: true,
+  });
+  assert.equal(response.metricsOnly, true);
+  assert.equal(response.nextInterval, 3);
+});
+
+test("metrics-only heartbeats do not erase the last reported mimic runtime state", () => {
+  assert.deepEqual(buildReportedRuntimeHeartbeatPatch({
+    hasLocalRuntimeState: false,
+    mimicRuntimeStatus: "not-configured",
+    mimicRuntimeMessage: null,
+  }), {});
+  const checkedAt = new Date("2026-07-24T00:00:00.000Z");
+  assert.deepEqual(buildReportedRuntimeHeartbeatPatch({
+    hasLocalRuntimeState: true,
+    mimicRuntimeStatus: "established",
+    mimicRuntimeMessage: "mimic@eth0:active",
+    checkedAt,
+  }), {
+    mimicRuntimeStatus: "established",
+    mimicRuntimeMessage: "mimic@eth0:active",
+    mimicRuntimeCheckedAt: checkedAt,
+  });
+});
+
+test("self-tests wait until a desired-state Agent uploads its requested local state", () => {
+  assert.equal(shouldDeferAgentWorkForLocalState({ supportsDesiredState: true, requestLocalState: true }), true);
+  assert.equal(shouldDeferAgentWorkForLocalState({ supportsDesiredState: true, requestLocalState: false }), false);
+  assert.equal(shouldDeferAgentWorkForLocalState({ supportsDesiredState: false, requestLocalState: true }), false);
+});
+
+test("heartbeat intervals slow down only when the Agent has no interactive work", () => {
+  const idle = {
+    requestLocalState: false,
+    hasInteractiveTasks: false,
+    metricsWatching: false,
+    serviceProbeIntervals: [],
+  };
+  assert.equal(selectAgentHeartbeatInterval(idle), AGENT_IDLE_HEARTBEAT_INTERVAL_SECONDS);
+  assert.equal(selectAgentHeartbeatInterval({ ...idle, metricsWatching: true }), 3);
+  assert.equal(selectAgentHeartbeatInterval({ ...idle, hasInteractiveTasks: true }), 2);
+  assert.equal(selectAgentHeartbeatInterval({ ...idle, requestLocalState: true }), 2);
+  assert.equal(selectAgentHeartbeatInterval({ ...idle, serviceProbeIntervals: [20, 120] }), 20);
+  assert.equal(selectAgentHeartbeatInterval({ ...idle, serviceProbeIntervals: [1] }), 5);
+  assert.equal(selectAgentHeartbeatInterval({ ...idle, serviceProbeIntervals: [0] }), 30);
+  assert.ok(HOST_ONLINE_TTL_MS > AGENT_IDLE_HEARTBEAT_INTERVAL_SECONDS * 2 * 1000);
+});
+
+test("presence persists liveness only when the database heartbeat is old", () => {
+  const now = Date.parse("2026-07-24T00:00:00.000Z");
+  assert.equal(shouldPersistAgentPresence({ wasOnline: false, lastHeartbeat: new Date(now - 1_000), nowMs: now }), true);
+  assert.equal(shouldPersistAgentPresence({ wasOnline: true, lastHeartbeat: new Date(now - 60_000), nowMs: now }), false);
+  assert.equal(shouldPersistAgentPresence({ wasOnline: true, lastHeartbeat: new Date(now - 90_000), nowMs: now }), true);
+});
+
+test("authenticated Agent reports protect a host from a stale heartbeat sweep", () => {
+  clearAuthenticatedAgentActivity();
+  recordAuthenticatedAgentActivity(7, 1_000);
+
+  assert.equal(hasRecentAuthenticatedAgentActivity(7, 1_500, 1_000), true);
+  assert.deepEqual(
+    partitionHostsByRecentAgentActivity([{ id: 7 }, { id: 8 }], 1_500, 1_000),
+    { active: [{ id: 7 }], stale: [{ id: 8 }] },
+  );
+  assert.equal(hasRecentAuthenticatedAgentActivity(7, 2_001, 1_000), false);
+  clearAuthenticatedAgentActivity();
+});
+
+test("empty address reports during Agent restart preserve the last valid addresses", () => {
+  const existing = {
+    ip: "198.51.100.8",
+    ipv4: "198.51.100.8",
+    ipv6: "2001:db8::8",
+  };
+  assert.deepEqual(mergeAgentReportedAddress({ ip: "unknown", ipv4: "", ipv6: "" }, existing), existing);
+  assert.deepEqual(mergeAgentReportedAddress({ ipv6: "2001:db8::9" }, existing), {
+    ...existing,
+    ipv6: "2001:db8::9",
+  });
+});

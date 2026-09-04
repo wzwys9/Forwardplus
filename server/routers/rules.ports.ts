@@ -1,0 +1,166 @@
+import { protectedProcedure, router } from "../_core/trpc";
+import { z } from "zod";
+import * as db from "../db";
+import {
+  requireHostUseAccess,
+  requireRuleAccess,
+  requireTrafficBillingAccessIfConfigured,
+  requireTunnelUseOrTrafficBillingAccess,
+} from "./helpers";
+import { combinePortPolicies, isPortAllowedByPolicy, portPolicyErrorMessage, portPolicyFrom } from "../portPolicy";
+
+const randomPortInputSchema = z.object({
+  hostId: z.number().optional(),
+  tunnelId: z.number().nullable().optional(),
+  forwardGroupId: z.number().optional(),
+  excludeRuleId: z.number().optional(),
+  protocol: z.enum(["tcp", "udp", "both"]).optional().default("both"),
+});
+
+async function requireForwardGroupPortAccess(ctx: { user: { id: number; role: string } }, forwardGroupId: number) {
+  if (ctx.user.role === "admin") return;
+  const isTrafficBillingResource = await requireTrafficBillingAccessIfConfigured(
+    ctx,
+    "forward_group",
+    forwardGroupId,
+  );
+  if (isTrafficBillingResource) return;
+  const hasPermission = await db.checkUserForwardGroupPermission(ctx.user.id, forwardGroupId);
+  if (!hasPermission) throw new Error("无权使用该转发组");
+}
+
+export const portsRulesRouter = router({
+  checkPort: protectedProcedure
+    .input(z.object({
+      hostId: z.number().int().positive().optional(),
+      forwardGroupId: z.number().int().positive().optional(),
+      tunnelId: z.number().nullable().optional(),
+      sourcePort: z.number().min(1).max(65535),
+      excludeRuleId: z.number().optional(),
+      protocol: z.enum(["tcp", "udp", "both"]).optional().default("both"),
+    }).refine(
+      (input) => !!input.hostId !== !!input.forwardGroupId,
+      { message: "请选择一个主机、隧道或转发组" },
+    ))
+    .query(async ({ input, ctx }) => {
+      if (input.excludeRuleId) {
+        await requireRuleAccess(ctx, input.excludeRuleId);
+      }
+      if (input.forwardGroupId) {
+        if (ctx.user.role !== "admin") {
+          await requireForwardGroupPortAccess(ctx, input.forwardGroupId);
+          const planRange = await db.getUserForwardGroupPlanPortRange(ctx.user.id, input.forwardGroupId);
+          if (planRange && !db.isPortAllowedByUserPlanRange(input.sourcePort, planRange)) {
+            const ranges = planRange.ranges.map((range) => `${range.start}-${range.end}`).join(",");
+            return { used: true, reason: `套餐端口必须在 ${ranges} 范围内` };
+          }
+        }
+        try {
+          await db.validateForwardGroupRuleConfig(input.forwardGroupId, {
+            sourcePort: input.sourcePort,
+            protocol: input.protocol,
+            excludeTemplateRuleId: input.excludeRuleId,
+          });
+          return { used: false };
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : "";
+          const isRangeError = /必须在.*(?:范围|区间)|must be.*range/i.test(reason);
+          return {
+            used: true,
+            ...(isRangeError ? { reason } : {}),
+          };
+        }
+      }
+
+      const hostId = Number(input.hostId);
+      let policy = portPolicyFrom(null);
+      if (input.tunnelId) {
+        const { tunnel } = await requireTunnelUseOrTrafficBillingAccess(ctx, input.tunnelId);
+        if (tunnel.entryHostId !== hostId) throw new Error("隧道入口主机与规则主机不一致");
+        const host = await db.getHostById(hostId);
+        policy = combinePortPolicies(
+          portPolicyFrom(host as any),
+          portPolicyFrom({
+            portRangeStart: (tunnel as any).portRangeStart,
+            portRangeEnd: (tunnel as any).portRangeEnd,
+          }),
+        );
+      } else {
+        const { host } = await requireHostUseAccess(ctx, hostId);
+        policy = portPolicyFrom(host as any);
+      }
+      if (!isPortAllowedByPolicy(input.sourcePort, policy)) {
+        return { used: true, reason: portPolicyErrorMessage(policy) };
+      }
+      if (ctx.user.role !== "admin") {
+        const planRange = await db.getUserPlanPortRange(ctx.user.id, hostId, input.tunnelId ?? undefined);
+        if (planRange) {
+          policy = combinePortPolicies(policy, portPolicyFrom({
+            portRanges: planRange.ranges,
+          }));
+        }
+        if (planRange && !isPortAllowedByPolicy(input.sourcePort, policy)) {
+          return { used: true, reason: portPolicyErrorMessage(policy, "套餐端口") };
+        }
+      }
+      const excludeRuleIds = input.excludeRuleId
+        ? [
+            input.excludeRuleId,
+            ...((await db.getForwardGroupChildRulesForTemplate(input.excludeRuleId)) as any[]).map((rule: any) => Number(rule.id)),
+          ]
+        : [];
+      const used = await db.isPortUsedOnHost(hostId, input.sourcePort, excludeRuleIds, input.protocol, undefined, false);
+      return { used };
+    }),
+  randomPort: protectedProcedure
+    .input(randomPortInputSchema)
+    .query(async ({ input, ctx }) => {
+      if (input.excludeRuleId) {
+        await requireRuleAccess(ctx, input.excludeRuleId);
+      }
+      if (input.forwardGroupId) {
+        let planRange: Awaited<ReturnType<typeof db.getUserForwardGroupPlanPortRange>> = null;
+        if (ctx.user.role !== "admin") {
+          await requireForwardGroupPortAccess(ctx, input.forwardGroupId);
+          planRange = await db.getUserForwardGroupPlanPortRange(ctx.user.id, input.forwardGroupId);
+        }
+        const port = await db.findAvailableForwardGroupPort(input.forwardGroupId, input.excludeRuleId, planRange, input.protocol);
+        if (!port) throw new Error("转发组入口端口区间内已无可用端口");
+        return { port };
+      }
+      if (!input.hostId) throw new Error("请选择主机");
+      let rangeStart: number | null | undefined;
+      let rangeEnd: number | null | undefined;
+      let planRange: Awaited<ReturnType<typeof db.getUserPlanPortRange>> = null;
+      if (input.tunnelId) {
+        const { tunnel } = await requireTunnelUseOrTrafficBillingAccess(ctx, input.tunnelId);
+        if (tunnel.entryHostId !== input.hostId) throw new Error("隧道入口主机与规则主机不一致");
+        rangeStart = (tunnel as any).portRangeStart;
+        rangeEnd = (tunnel as any).portRangeEnd;
+      } else {
+        await requireHostUseAccess(ctx, input.hostId);
+      }
+      if (ctx.user.role !== "admin") {
+        planRange = await db.getUserPlanPortRange(ctx.user.id, input.hostId, input.tunnelId ?? undefined);
+        // Keep the subscription's disjoint ranges intact. The repository
+        // intersects them with the host/tunnel policy when selecting a port.
+      }
+      const excludeRuleIds = input.excludeRuleId
+        ? [
+            input.excludeRuleId,
+            ...((await db.getForwardGroupChildRulesForTemplate(input.excludeRuleId)) as any[]).map((rule: any) => Number(rule.id)),
+          ]
+        : [];
+      const port = await db.findAvailablePort(
+        input.hostId,
+        rangeStart,
+        rangeEnd,
+        input.protocol,
+        [],
+        excludeRuleIds,
+        planRange?.ranges || [],
+      );
+      if (!port) throw new Error("该主机端口区间内已无可用端口");
+      return { port };
+    }),
+});

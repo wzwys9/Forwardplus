@@ -1,0 +1,116 @@
+name: Release Agent
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: forwardx-release-agent-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-agent:
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.x"
+          cache-dependency-path: |
+            agent/go.mod
+            forwardx-fxp/go.mod
+            forwardx-fxp/go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Resolve release version
+        id: release
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="$GITHUB_REF_NAME"
+          else
+            VERSION="v$(node -p "require('./package.json').version")"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check release versions and tag
+        env:
+          FORWARDX_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: npm run check:versions
+
+      - name: Run Agent tests and vet
+        shell: bash
+        run: |
+          (cd agent && go test ./... && go vet ./...)
+          (cd forwardx-fxp && go test ./... && go vet ./...)
+
+      - name: Build Linux Agent binaries
+        run: bash scripts/build-agent-release.sh
+
+      - name: Upload Agent binaries to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          files=(
+            dist/agent/forwardx-agent-linux-amd64
+            dist/agent/forwardx-agent-linux-arm64
+            dist/agent/forwardx-fxp-linux-amd64
+            dist/agent/forwardx-fxp-linux-arm64
+            dist/agent/forwardx-runtime-linux-amd64
+            dist/agent/forwardx-runtime-linux-arm64
+            dist/agent/SHA256SUMS
+            dist/agent/THIRD_PARTY_NOTICES.md
+          )
+
+          for file in "${files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "Missing release artifact: $file" >&2
+              exit 1
+            fi
+          done
+
+          attempt=1
+          until gh release view "$RELEASE_VERSION" >/dev/null 2>&1; do
+            if [ "$attempt" -ge 120 ]; then
+              echo "::error::GitHub Release $RELEASE_VERSION was not created by the panel workflow within 30 minutes"
+              exit 1
+            fi
+            echo "Waiting for panel workflow to create GitHub Release $RELEASE_VERSION (attempt ${attempt}/120)..."
+            sleep 15
+            attempt=$((attempt + 1))
+          done
+
+          upload_with_retry() {
+            local attempt=1
+            local max_attempts=5
+            local delay=8
+            until gh release upload "$RELEASE_VERSION" "${files[@]}" --clobber; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "GitHub Release upload failed after ${attempt} attempts" >&2
+                return 1
+              fi
+              echo "GitHub Release upload failed, retrying in ${delay}s (attempt ${attempt}/${max_attempts})..." >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          upload_with_retry

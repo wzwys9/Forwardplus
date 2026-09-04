@@ -1,0 +1,237 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash, randomUUID } from "node:crypto";
+import { and, desc, eq, inArray, like, max, ne, or } from "drizzle-orm";
+import { configAuditEvents } from "../drizzle/schema";
+import { getDb, insertAndGetId } from "./dbRuntime";
+import { invalidateAgentStableHeartbeatPlan } from "./agentHeartbeatGate";
+import { isXraySensitiveKey, scrubXraySensitiveText } from "./xrayObservability";
+
+export type ConfigAuditContext = {
+  actorUserId?: number | null;
+  actorName?: string | null;
+  source: string;
+  requestId?: string | null;
+  requestPath?: string | null;
+};
+
+export type AuditResourceType = "host" | "tunnel" | "forward_rule" | "runtime" | "xray_inbound" | "xray_client" | "xray_access_entry" | "xray_tls_certificate" | "xray_runtime" | "xray_managed_service" | "xray_managed_service_account";
+type AuditAction = "create" | "update" | "delete" | "dispatch";
+
+const auditContext = new AsyncLocalStorage<ConfigAuditContext>();
+const SECRET_KEY = /(password|passwd|secret|token|private.?key|certificate|authorization|cookie|credential|uuid|short.?id|stats.?key|config.?json|share.?uri|vless.?uri|ciphertext|encrypted|envelope|master.?key)/i;
+const VOLATILE_KEYS = new Set([
+  "createdAt", "updatedAt", "lastHeartbeat", "isOnline", "isRunning", "lastLatencyMs",
+  "lastTestAt", "lastTestStatus", "lastTestMessage", "lastError", "trafficUsed",
+  "lastDdnsValue", "lastDdnsAt", "lastDdnsError", "geoUpdatedAt", "mimicCheckedAt",
+  "mimicMessage", "mimicStatus", "mimicRuntimeStatus", "mimicRuntimeMessage",
+  "mimicRuntimeCheckedAt", "agentRecoveryStartedAt", "agentRecoveryCompletedAt",
+  "agentRecoveryExpected", "agentRecoveryReady", "agentLastReceivedRevision",
+  "agentLastAppliedRevision", "agentLastReceivedHash", "agentLastAppliedHash",
+]);
+
+type SecretMode = "redact" | "hash" | "plain";
+
+function normalize(value: any, omitVolatile = false, secretMode: SecretMode = "redact"): any {
+  if (value === null || value === undefined) return value ?? null;
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "bigint") return value.toString();
+  if (Array.isArray(value)) return value.map((item) => normalize(item, omitVolatile, secretMode));
+  if (typeof value === "string") {
+    if (secretMode === "plain") return value;
+    const scrubbed = scrubXraySensitiveText(value);
+    if (secretMode === "hash" && scrubbed !== value) {
+      return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+    }
+    return secretMode === "redact" ? scrubbed : value;
+  }
+  if (typeof value !== "object") return value;
+  const result: Record<string, any> = {};
+  for (const key of Object.keys(value).sort()) {
+    if (omitVolatile && VOLATILE_KEYS.has(key)) continue;
+    if ((SECRET_KEY.test(key) || isXraySensitiveKey(key)) && secretMode !== "plain") {
+      result[key] = secretMode === "redact"
+        ? "[REDACTED]"
+        : `sha256:${createHash("sha256").update(JSON.stringify(normalize(value[key], false, "plain")) ?? "null").digest("hex")}`;
+    } else {
+      result[key] = normalize(value[key], omitVolatile, secretMode);
+    }
+  }
+  return result;
+}
+
+function stableJson(value: any) {
+  return JSON.stringify(normalize(value));
+}
+
+export function hashConfig(value: any) {
+  return createHash("sha256").update(JSON.stringify(normalize(value, true, "hash"))).digest("hex");
+}
+
+export function shouldAuditConfigPatch(value: Record<string, any> | null | undefined) {
+  return !!value && Object.keys(value).some((key) => !VOLATILE_KEYS.has(key));
+}
+
+function buildDiff(before: any, after: any) {
+  const left = normalize(before || {}, true, "plain") as Record<string, any>;
+  const right = normalize(after || {}, true, "plain") as Record<string, any>;
+  const diff: Record<string, { before: any; after: any }> = {};
+  for (const key of Array.from(new Set([...Object.keys(left), ...Object.keys(right)])).sort()) {
+    const leftComparable = normalize({ [key]: left[key] }, false, "hash");
+    const rightComparable = normalize({ [key]: right[key] }, false, "hash");
+    if (JSON.stringify(leftComparable) !== JSON.stringify(rightComparable)) {
+      diff[key] = {
+        before: normalize({ [key]: left[key] }, false, "redact")[key] ?? null,
+        after: normalize({ [key]: right[key] }, false, "redact")[key] ?? null,
+      };
+    }
+  }
+  return diff;
+}
+
+export function runWithConfigAuditContext<T>(context: Partial<ConfigAuditContext>, callback: () => T): T {
+  return auditContext.run({
+    source: context.source || "system",
+    actorUserId: context.actorUserId || null,
+    actorName: context.actorName || null,
+    requestId: context.requestId || randomUUID(),
+    requestPath: context.requestPath || null,
+  }, callback);
+}
+
+export function currentConfigAuditContext() {
+  return auditContext.getStore();
+}
+
+export async function recordConfigAuditEvent(input: {
+  resourceType: AuditResourceType;
+  resourceId: number;
+  hostId?: number | null;
+  action: AuditAction;
+  before?: any;
+  after?: any;
+  source?: string;
+}) {
+  const resourceId = Math.floor(Number(input.resourceId || 0));
+  if (resourceId <= 0) return 0;
+  const before = normalize(input.before ?? null, true, "redact");
+  const after = normalize(input.after ?? null, true, "redact");
+  const diff = buildDiff(input.before, input.after);
+  if (input.action === "update" && Object.keys(diff).length === 0) return 0;
+  const context = currentConfigAuditContext();
+  try {
+    const revision = await insertAndGetId("config_audit_events", {
+      resourceType: input.resourceType,
+      resourceId,
+      hostId: Number(input.hostId || 0) > 0 ? Number(input.hostId) : null,
+      action: input.action,
+      source: input.source || context?.source || "system",
+      actorUserId: context?.actorUserId || null,
+      actorName: context?.actorName || null,
+      requestId: context?.requestId || null,
+      requestPath: context?.requestPath || null,
+      beforeJson: input.before === undefined ? null : stableJson(before),
+      afterJson: input.after === undefined ? null : stableJson(after),
+      diffJson: stableJson(diff),
+      configHash: hashConfig(input.after),
+    });
+    if (input.action !== "dispatch") {
+      const hostId = Number(input.hostId || 0);
+      invalidateAgentStableHeartbeatPlan(hostId > 0 ? hostId : undefined);
+    }
+    return revision;
+  } catch {
+    console.warn(`[ConfigAudit] write failed resource=${input.resourceType}:${resourceId}`);
+    return 0;
+  }
+}
+
+export async function latestConfigRevision() {
+  const db = await getDb();
+  if (!db) return 0;
+  const rows = await db.select({ id: configAuditEvents.id }).from(configAuditEvents)
+    .where(ne(configAuditEvents.action, "dispatch" as any)).orderBy(desc(configAuditEvents.id)).limit(1);
+  return Number(rows[0]?.id || 0);
+}
+
+export async function listRecentConfigAuditEvents(limit = 500) {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select().from(configAuditEvents).orderBy(desc(configAuditEvents.id)).limit(Math.min(2000, Math.max(1, limit)));
+}
+
+export async function getResourceConfigRevision(resourceType: string, resourceId: number) {
+  const db = await getDb();
+  if (!db) return 0;
+  const rows = await db.select({ id: configAuditEvents.id }).from(configAuditEvents)
+    .where(and(eq(configAuditEvents.resourceType, resourceType as any), eq(configAuditEvents.resourceId, resourceId)))
+    .orderBy(desc(configAuditEvents.id)).limit(1);
+  return Number(rows[0]?.id || 0);
+}
+
+export type MimicLifecycleResource = {
+  resourceType: "forward_rule" | "tunnel";
+  resourceId: number;
+};
+
+const MIMIC_LIFECYCLE_FIELDS: Record<MimicLifecycleResource["resourceType"], readonly string[]> = {
+  forward_rule: [
+    "isEnabled", "disabledByTunnel", "disabledByGroup", "disabledByUser", "pendingDelete",
+    "udpOverTcp", "forwardType", "protocol", "tunnelId", "hostId",
+  ],
+  tunnel: [
+    "isEnabled", "disabledByGroup", "udpOverTcp", "mode", "forwardxVersion",
+    "entryHostId", "exitHostId", "entryGroupId", "exitGroupId", "relayMode",
+  ],
+};
+
+export async function getMimicLifecycleRevisionSignature(resources: MimicLifecycleResource[]) {
+  const normalized = Array.from(new Map(resources
+    .map((resource) => ({
+      resourceType: resource.resourceType,
+      resourceId: Math.floor(Number(resource.resourceId) || 0),
+    }))
+    .filter((resource) => resource.resourceId > 0)
+    .map((resource) => [`${resource.resourceType}:${resource.resourceId}`, resource] as const)).values())
+    .sort((left, right) => left.resourceType.localeCompare(right.resourceType) || left.resourceId - right.resourceId);
+  if (normalized.length === 0) return "";
+
+  const db = await getDb();
+  if (!db) return normalized.map((resource) => `${resource.resourceType}:${resource.resourceId}:0`).join("|");
+
+  const revisionByResource = new Map<string, number>();
+  for (const resourceType of ["forward_rule", "tunnel"] as const) {
+    const ids = normalized
+      .filter((resource) => resource.resourceType === resourceType)
+      .map((resource) => resource.resourceId);
+    for (let offset = 0; offset < ids.length; offset += 400) {
+      const chunk = ids.slice(offset, offset + 400);
+      if (chunk.length === 0) continue;
+      const lifecycleChange = or(
+        eq(configAuditEvents.action, "create" as any),
+        eq(configAuditEvents.action, "delete" as any),
+        ...MIMIC_LIFECYCLE_FIELDS[resourceType].map((field) => (
+          like(configAuditEvents.diffJson, `%\"${field}\"%`)
+        )),
+      );
+      const rows = await db.select({
+        resourceType: configAuditEvents.resourceType,
+        resourceId: configAuditEvents.resourceId,
+        revision: max(configAuditEvents.id),
+      }).from(configAuditEvents).where(and(
+        eq(configAuditEvents.resourceType, resourceType as any),
+        inArray(configAuditEvents.resourceId, chunk),
+        lifecycleChange,
+      )).groupBy(configAuditEvents.resourceType, configAuditEvents.resourceId);
+      for (const row of rows) {
+        revisionByResource.set(
+          `${String(row.resourceType)}:${Number(row.resourceId)}`,
+          Number(row.revision || 0),
+        );
+      }
+    }
+  }
+
+  return normalized.map((resource) => (
+    `${resource.resourceType}:${resource.resourceId}:${revisionByResource.get(`${resource.resourceType}:${resource.resourceId}`) || 0}`
+  )).join("|");
+}

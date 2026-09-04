@@ -1,0 +1,234 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import crypto from "node:crypto";
+import {
+  buildForwardChainAgentSelfTestPayload,
+  buildMetaAgentSelfTestPayload,
+  buildRuleAgentSelfTestPayload,
+  buildTunnelAgentSelfTestPayload,
+} from "./agentRouteUtils";
+import {
+  FORWARDX_WIREGUARD_DEFAULT_MTU,
+  FORWARDX_WIREGUARD_MIMIC_MTU,
+  buildForwardXWireGuardMimicFilters,
+  buildForwardXWireGuardPlans,
+  deriveForwardXWireGuardKeyPair,
+  forwardXWireGuardMTU,
+} from "./forwardXWireGuard";
+
+test("derives stable, valid X25519 WireGuard keys", () => {
+  const left = deriveForwardXWireGuardKeyPair("seed", 12, 41);
+  const same = deriveForwardXWireGuardKeyPair("seed", 12, 41);
+  const right = deriveForwardXWireGuardKeyPair("seed", 12, 42);
+  assert.deepEqual(left, same);
+  assert.notEqual(left.privateKey, right.privateKey);
+  assert.match(left.privateKey, /^[a-f0-9]{64}$/);
+  assert.match(left.publicKey, /^[a-f0-9]{64}$/);
+
+  const privatePrefix = Buffer.from("302e020100300506032b656e04220420", "hex");
+  const publicPrefix = Buffer.from("302a300506032b656e032100", "hex");
+  const leftPrivate = crypto.createPrivateKey({ key: Buffer.concat([privatePrefix, Buffer.from(left.privateKey, "hex")]), format: "der", type: "pkcs8" });
+  const rightPrivate = crypto.createPrivateKey({ key: Buffer.concat([privatePrefix, Buffer.from(right.privateKey, "hex")]), format: "der", type: "pkcs8" });
+  const leftPublic = crypto.createPublicKey({ key: Buffer.concat([publicPrefix, Buffer.from(left.publicKey, "hex")]), format: "der", type: "spki" });
+  const rightPublic = crypto.createPublicKey({ key: Buffer.concat([publicPrefix, Buffer.from(right.publicKey, "hex")]), format: "der", type: "spki" });
+  assert.deepEqual(crypto.diffieHellman({ privateKey: leftPrivate, publicKey: rightPublic }), crypto.diffieHellman({ privateKey: rightPrivate, publicKey: leftPublic }));
+});
+
+test("builds bidirectional peers while only the dialing side carries an endpoint", () => {
+  const plans = buildForwardXWireGuardPlans({
+    tunnelId: 7,
+    seed: "tunnel-secret",
+    nodes: [
+      { hostId: 10 },
+      { hostId: 20, listenPort: 31000 },
+      { hostId: 30, listenPort: 32000 },
+    ],
+    links: [
+      { fromHostId: 10, toHostId: 20, endpointHost: "198.51.100.20", endpointPort: 31000 },
+      { fromHostId: 20, toHostId: 30, endpointHost: "2001:db8::30", endpointPort: 32000 },
+    ],
+  });
+  assert.equal(plans.size, 3);
+  assert.equal(plans.get(10)?.peers[0]?.endpointHost, "198.51.100.20");
+  assert.equal(plans.get(10)?.peers[0]?.persistentKeepalive, 25);
+  assert.equal(plans.get(20)?.peers.find((peer) => peer.hostId === 10)?.endpointHost, undefined);
+  assert.equal(plans.get(20)?.peers.find((peer) => peer.hostId === 30)?.endpointHost, "2001:db8::30");
+  assert.equal(plans.get(30)?.listenPort, 32000);
+  assert.equal(new Set(Array.from(plans.values()).map((plan) => plan.address)).size, 3);
+});
+
+test("keeps a private endpoint in the WireGuard peer plan", () => {
+  const plans = buildForwardXWireGuardPlans({
+    tunnelId: 9,
+    seed: "private-endpoint",
+    nodes: [{ hostId: 3 }, { hostId: 2, listenPort: 61561 }],
+    links: [{ fromHostId: 3, toHostId: 2, endpointHost: "10.23.0.8", endpointPort: 61561 }],
+  });
+  assert.equal(plans.get(3)?.peers.find((peer) => peer.hostId === 2)?.endpointHost, "10.23.0.8");
+});
+
+test("keeps a private endpoint in the Mimic remote filter", () => {
+  const plans = buildForwardXWireGuardPlans({
+    tunnelId: 9,
+    seed: "private-filter",
+    nodes: [{ hostId: 3 }, { hostId: 2, listenPort: 61561 }],
+    links: [{ fromHostId: 3, toHostId: 2, endpointHost: "10.23.0.8", endpointPort: 61561 }],
+  });
+
+  assert.deepEqual(buildForwardXWireGuardMimicFilters(plans.get(3)!), [
+    "remote=10.23.0.8:61561",
+  ]);
+});
+
+test("keeps private endpoints on every hop in a Mimic WireGuard chain", () => {
+  const plans = buildForwardXWireGuardPlans({
+    tunnelId: 11,
+    seed: "private-chain",
+    nodes: [
+      { hostId: 1 },
+      { hostId: 2, listenPort: 61561 },
+      { hostId: 3, listenPort: 61562 },
+    ],
+    links: [
+      { fromHostId: 1, toHostId: 2, endpointHost: "10.23.0.8", endpointPort: 61561 },
+      { fromHostId: 2, toHostId: 3, endpointHost: "10.23.0.9", endpointPort: 61562 },
+    ],
+  });
+
+  assert.deepEqual(buildForwardXWireGuardMimicFilters(plans.get(1)!), [
+    "remote=10.23.0.8:61561",
+  ]);
+  assert.deepEqual(buildForwardXWireGuardMimicFilters(plans.get(2)!), [
+    "local=0.0.0.0:61561",
+    "local=[::]:61561",
+    "remote=10.23.0.9:61562",
+  ]);
+  assert.equal(plans.get(1)?.peers.find((peer) => peer.hostId === 2)?.endpointHost, "10.23.0.8");
+  assert.equal(plans.get(2)?.peers.find((peer) => peer.hostId === 3)?.endpointHost, "10.23.0.9");
+});
+
+test("builds Mimic filters from the WireGuard peer plan", () => {
+  const plans = buildForwardXWireGuardPlans({
+    tunnelId: 10,
+    seed: "mimic-filters",
+    nodes: [{ hostId: 1 }, { hostId: 2, listenPort: 31002 }],
+    links: [{ fromHostId: 1, toHostId: 2, endpointHost: "2001:db8::2", endpointPort: 31002 }],
+  });
+
+  assert.deepEqual(buildForwardXWireGuardMimicFilters(plans.get(1)!), [
+    "remote=[2001:db8::2]:31002",
+  ]);
+  assert.deepEqual(buildForwardXWireGuardMimicFilters(plans.get(2)!), [
+    "local=0.0.0.0:31002",
+    "local=[::]:31002",
+  ]);
+});
+
+test("both Agent delivery paths retain the WireGuard peer for tunnel self-tests", () => {
+  const payload = buildTunnelAgentSelfTestPayload({ id: "91" }, {
+    kind: "tunnel-hop",
+    tunnelId: "7",
+    targetIp: "198.51.100.20",
+    targetPort: "31000",
+    wireGuardPeerId: "20",
+  } as any);
+  assert.deepEqual(payload, {
+    testId: 91,
+    kind: "tunnel-hop",
+    tunnelId: 7,
+    ruleId: 0,
+    forwardType: "gost-tunnel",
+    protocol: "tcp",
+    sourcePort: 0,
+    targetIp: "198.51.100.20",
+    targetPort: 31000,
+    wireGuardPeerId: "20",
+  });
+});
+
+test("forward-chain final domain probes bypass unrelated runtime waits", () => {
+  const payload = buildForwardChainAgentSelfTestPayload({ id: "92", ruleId: "18" }, {
+    kind: "forward-chain",
+    groupId: "7",
+    targetIp: "baidu.com",
+    targetPort: "80",
+    method: "tcp",
+    runtimeDependent: false,
+  } as any);
+  assert.deepEqual(payload, {
+    testId: 92,
+    kind: "forward-chain-target",
+    groupId: 7,
+    ruleId: 18,
+    forwardType: "forward-chain",
+    protocol: "tcp",
+    method: "tcp",
+    sourcePort: 0,
+    targetIp: "baidu.com",
+    targetPort: 80,
+  });
+});
+
+test("normalizes PostgreSQL string numbers for every Agent self-test payload", () => {
+  const metaPayload = buildMetaAgentSelfTestPayload({ id: "93", ruleId: "19" }, {
+    kind: "forward-via-tunnel-entry",
+    tunnelId: "8",
+    entryIp: "198.51.100.8",
+    entrySourcePort: "32000",
+    targetIp: "example.com",
+    targetPort: "443",
+    method: "tcp",
+  } as any);
+  assert.deepEqual(metaPayload, {
+    testId: 93,
+    kind: "forward-via-tunnel-entry",
+    tunnelId: 8,
+    ruleId: 19,
+    forwardType: "gost-tunnel",
+    protocol: "tcp",
+    method: "tcp",
+    sourcePort: 32000,
+    targetIp: "198.51.100.8",
+    targetPort: 32000,
+  });
+
+  const rulePayload = buildRuleAgentSelfTestPayload({ id: "94", ruleId: "20" }, {
+    id: "20",
+    forwardType: "iptables",
+    protocol: "tcp",
+    sourcePort: "18080",
+    targetIp: "example.com",
+    targetPort: "80",
+  });
+  assert.equal(typeof rulePayload.testId, "number");
+  assert.equal(typeof rulePayload.ruleId, "number");
+  assert.equal(typeof rulePayload.sourcePort, "number");
+  assert.equal(typeof rulePayload.targetPort, "number");
+  assert.deepEqual(rulePayload, {
+    testId: 94,
+    ruleId: 20,
+    forwardType: "iptables",
+    protocol: "tcp",
+    method: "tcp",
+    sourcePort: 18080,
+    targetIp: "example.com",
+    targetPort: 80,
+  });
+});
+
+test("reserves outer packet headroom only when Mimic is active", () => {
+  assert.equal(forwardXWireGuardMTU(false), FORWARDX_WIREGUARD_DEFAULT_MTU);
+  assert.equal(forwardXWireGuardMTU(true), FORWARDX_WIREGUARD_MIMIC_MTU);
+  assert.equal(FORWARDX_WIREGUARD_MIMIC_MTU, 1280);
+  assert.ok(FORWARDX_WIREGUARD_DEFAULT_MTU - FORWARDX_WIREGUARD_MIMIC_MTU >= 12);
+
+  const plans = buildForwardXWireGuardPlans({
+    tunnelId: 8,
+    seed: "mimic-mtu",
+    mtu: forwardXWireGuardMTU(true),
+    nodes: [{ hostId: 1 }, { hostId: 2, listenPort: 32000 }],
+    links: [{ fromHostId: 1, toHostId: 2, endpointHost: "2001:db8::2", endpointPort: 32000 }],
+  });
+  assert.equal(plans.get(1)?.mtu, FORWARDX_WIREGUARD_MIMIC_MTU);
+  assert.equal(plans.get(2)?.mtu, FORWARDX_WIREGUARD_MIMIC_MTU);
+});

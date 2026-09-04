@@ -1,0 +1,131 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+client/dist/
+docs/.vitepress/dist/
+docs/.vitepress/.temp/
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+*.tsbuildinfo
+
+# Environment variables and local credentials
+.env*
+!.env.example
+!.env.*.example
+.npmrc
+.pypirc
+.netrc
+credentials.json
+credentials.*.json
+secrets.json
+secrets.*.json
+*.secret
+*.secrets
+*.credentials
+*.token
+/vps*.txt
+/.aws/
+/.ssh/
+
+# Private keys, signing material and local certificates
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.der
+*.csr
+*.mobileprovision
+*.agekey
+*.kubeconfig
+*.tfstate
+*.tfstate.*
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+android/app/keystore/
+android/app/google-services.json
+ios/App/GoogleService-Info.plist
+
+# Database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+data/
+!plugins/**/data/
+!plugins/**/data/**
+.dev/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Lock files (keep pnpm-lock.yaml in repo)
+package-lock.json
+yarn.lock
+
+# Temporary files
+tmp/
+temp/
+.cache/
+.gocache/
+.tmp-*/
+
+# Local agent instructions and working notes (not project documentation)
+/AGENTS.md
+/CLAUDE.md
+/.claude/
+/.codex/
+/tasks/
+/*_NOTES.md
+/TODO.local.md
+
+# Local Docker deployment bundle generated for manual upload
+docker/Forwardx/
+
+# Local reference repository; never include it in ForwardX commits
+/3x-ui/
+
+# Go agent local build/caches
+agent/agent/
+agent/forwardx-agent-*
+agent/*.exe
+forwardx-fxp/dist/
+forwardx-fxp/forwardx-fxp*
+
+# Android local build output
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/capacitor-cordova-android-plugins/build/
+
+# iOS local build output
+ios/DerivedData/
+ios/build/
+ios/App/build/
+ios/App/Pods/
+ios/App/Podfile.lock

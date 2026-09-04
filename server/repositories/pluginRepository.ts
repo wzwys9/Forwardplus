@@ -1,0 +1,4254 @@
+import crypto from "crypto";
+import fs from "fs/promises";
+import path from "path";
+import zlib from "zlib";
+import { and, eq } from "drizzle-orm";
+import { hosts, pluginAgentStates, pluginAssets, plugins, pluginStoreSources } from "../../drizzle/schema";
+import {
+  BUILTIN_PLUGIN_STORE_ITEMS,
+  DEFAULT_PLUGIN_MANIFEST,
+  PLUGIN_ACTION_TYPES,
+  PLUGIN_ACTION_INTENTS,
+  PLUGIN_AGENT_EXECUTORS,
+  PLUGIN_AGENT_INTERPRETERS,
+  PLUGIN_AGENT_OUTPUT_TYPES,
+  PLUGIN_AGENT_TARGETS,
+  PLUGIN_EXTENSION_POINTS,
+  PLUGIN_HTTP_AUTH_TYPES,
+  PLUGIN_HTTP_METHODS,
+  PLUGIN_HTTP_RESPONSE_TYPES,
+  PLUGIN_MANIFEST_VERSION,
+  PLUGIN_PANEL_OPERATIONS,
+  PLUGIN_PERMISSION_KEYS,
+  PLUGIN_RESOURCE_COLUMN_TYPES,
+  PLUGIN_RESOURCE_CONDITION_OPERATORS,
+  PLUGIN_RESOURCE_FIELD_TYPES,
+  PLUGIN_RESOURCE_SOURCE_TRIGGERS,
+  PLUGIN_RESOURCE_VIEW_TYPES,
+  PLUGIN_RESULT_FIELD_TYPES,
+  PLUGIN_RESULT_SCHEMA_TYPES,
+  PLUGIN_USAGE_VIEW_TYPES,
+  PLUGIN_USAGE_FIELD_TYPES,
+  PLUGIN_SECURITY_MODEL,
+  PLUGIN_SETTING_FIELD_TYPES,
+  PLUGIN_PAGE_CONTENT_TYPES,
+  PLUGIN_SIDEBAR_TARGETS,
+  type ForwardxPluginManifest,
+  type PluginActionDefinition,
+  type PluginAgentRequestDefinition,
+  type PluginExtensionPoint,
+  type PluginFeatureDescription,
+  type PluginHttpAuthDefinition,
+  type PluginHttpRequestDefinition,
+  type PluginPageDefinition,
+  type PluginPanelRequestDefinition,
+  type PluginPermissionKey,
+  type PluginResourceColumnDefinition,
+  type PluginResourceCondition,
+  type PluginResourceDataSourceDefinition,
+  type PluginResourceFieldDefinition,
+  type PluginResourceOperationDefinition,
+  type PluginResourceOptionsSource,
+  type PluginResourceViewDefinition,
+  type PluginResultFieldDefinition,
+  type PluginResultSchemaDefinition,
+  type PluginSettingField,
+  type PluginSidebarDefinition,
+  type PluginStoreItem,
+  type PluginUsageFieldDefinition,
+  type PluginUsageOperationOption,
+  type PluginUsageOperationSelector,
+  type PluginUsageSelectorCopy,
+  type PluginUsageViewDefinition,
+} from "../../shared/pluginTypes";
+import type { TrpcContext } from "../_core/context";
+import { appendPanelLog } from "../_core/panelLogger";
+import { executeRaw, getDatabaseKind, getDb, insertAndGetId, nowDate } from "../dbRuntime";
+import { AGENT_PLUGIN_TASK_VERSION, compareVersions, isAgentVersionAtLeast } from "../agentRouteUtils";
+import { getAgentPluginInventory } from "../agentPluginInventory";
+import { pushAgentRefresh } from "../agentEvents";
+import { mapWithConcurrency } from "../asyncPool";
+import { enqueuePluginAgentTaskGroup, getPluginAgentTaskGroup, type PluginAgentTaskGroup } from "../pluginAgentTasks";
+import { isFreshHostHeartbeat } from "./hostRepository";
+import { assertSafePluginHttpUrl } from "../ssrf";
+import { executePluginPanelRequest, getPluginPanelOperationCapabilities } from "../pluginPanelApi";
+import { getSetting } from "./settingsRepository";
+import { withGithubAuth } from "../githubAuth";
+
+const GITHUB_RE = /^https:\/\/github\.com\/([^/\s]+)\/([^/\s#?]+)(?:[/?#].*)?$/i;
+const FORWARDX_REPO_URL = "https://github.com/wzwys9/Forwardplus";
+const MANIFEST_CANDIDATES = ["forwardx-plugin.json", "plugin.json", ".forwardx/plugin.json"];
+const OFFICIAL_STORE_PATH = "plugins/official-store.json";
+const DEFAULT_THIRD_PARTY_STORE_PATH = "forwardx-store.json";
+const MAX_PLUGIN_STORE_SOURCES = 32;
+const MAX_PLUGIN_STORE_ITEMS_PER_SOURCE = 200;
+const PLUGIN_STORE_SYNC_CONCURRENCY = 6;
+const PLUGIN_UPDATE_CHECK_CONCURRENCY = 4;
+const MAX_PLUGIN_UPLOAD_BYTES = PLUGIN_SECURITY_MODEL.maxUploadBytes;
+const MAX_PLUGIN_ASSET_BYTES = PLUGIN_SECURITY_MODEL.maxAssetBytes;
+const MAX_PLUGIN_ASSETS = 96;
+const MAX_PLUGIN_FIELDS = 50;
+const MAX_PLUGIN_PAGES = 12;
+const MAX_PLUGIN_ACTIONS = 20;
+const MAX_PLUGIN_FEATURES = 12;
+const MAX_PLUGIN_USAGE_VIEWS = 8;
+const MAX_PLUGIN_RESOURCE_VIEWS = 8;
+const MAX_PLUGIN_RESOURCE_SOURCES = 16;
+const MAX_PLUGIN_RESOURCE_COLUMNS = 24;
+const MAX_PLUGIN_PACKAGE_BYTES = 5 * 1024 * 1024;
+const MAX_PLUGIN_HTTP_TEMPLATE_BYTES = 64 * 1024;
+const MAX_PLUGIN_AGENT_INPUT_BYTES = 64 * 1024;
+const MAX_PLUGIN_AGENT_ARGUMENT_BYTES = 24 * 1024;
+const MAX_PLUGIN_HTTP_RESPONSE_BYTES = PLUGIN_SECURITY_MODEL.maxHttpResponseBytes;
+const MAX_PLUGIN_HTTP_TIMEOUT_MS = 30 * 1000;
+const DEFAULT_PLUGIN_HTTP_TIMEOUT_MS = 10 * 1000;
+const PLUGIN_HOST_ASSET_ROOT = "/var/lib/forwardx-agent/plugins";
+const MAX_PLUGIN_PACKAGE_FILES = 160;
+const PACKAGE_MANIFEST_CANDIDATES = ["forwardx-plugin.json", "plugin.json", ".forwardx/plugin.json"];
+const AUTO_DISCOVER_DATA_ROOTS = ["data/"];
+const DATA_ASSET_EXTENSIONS = new Set([".txt", ".list", ".dat", ".json", ".tsv", ".csv", ".md", ".conf", ".yaml", ".yml"]);
+const BUNDLED_PLUGIN_ROOT = path.resolve(process.cwd(), "plugins");
+const MAX_WHITELIST_USAGE_HOSTS = 256;
+const MAX_WHITELIST_USAGE_ASSETS = 16;
+const MAX_WHITELIST_USAGE_SYNC_BYTES = 1024 * 1024;
+const PLUGIN_SYNC_ENCODED_CHUNK_BYTES = 48 * 1024;
+const OFFICIAL_STORE_CACHE_TTL_MS = 10 * 60 * 1000;
+const PLUGIN_WARN_THROTTLE_MS = 5 * 60 * 1000;
+const PLUGIN_SIDEBAR_ENABLED_SETTING_KEY = "__forwardxSidebarEnabled";
+const LIVE2D_WIDGET_PLUGIN_ID = "live2d-widget";
+const LIVE2D_WIDGET_RUNTIME_VERSION = "1.0.1";
+const LIVE2D_WIDGET_TOOL_IDS = [
+  "hitokoto",
+  "asteroids",
+  "switch-model",
+  "switch-texture",
+  "photo",
+  "info",
+  "quit",
+] as const;
+const LIVE2D_WIDGET_DEFAULT_TOOLS = ["hitokoto", "switch-model", "switch-texture", "photo", "info", "quit"];
+const LIVE2D_WIDGET_RUNTIME = {
+  scriptUrl: `https://fastly.jsdelivr.net/npm/live2d-widgets@${LIVE2D_WIDGET_RUNTIME_VERSION}/dist/waifu-tips.js`,
+  styleUrl: `https://fastly.jsdelivr.net/npm/live2d-widgets@${LIVE2D_WIDGET_RUNTIME_VERSION}/dist/waifu.css`,
+  cubism2Path: `https://fastly.jsdelivr.net/npm/live2d-widgets@${LIVE2D_WIDGET_RUNTIME_VERSION}/dist/live2d.min.js`,
+  cubism5Path: "https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js",
+} as const;
+const LIVE2D_WIDGET_SETTINGS_SCHEMA: PluginSettingField[] = [
+  {
+    key: "displayScope",
+    label: "显示范围",
+    type: "select",
+    defaultValue: "authenticated",
+    options: [
+      { value: "authenticated", label: "已登录用户" },
+      { value: "all", label: "所有访问者（含登录页）" },
+      { value: "admin", label: "仅管理员" },
+    ],
+    description: "仅在允许的页面加载看板娘；未满足范围时不会请求上游资源。",
+  },
+  {
+    key: "showOnMobile",
+    label: "移动端显示",
+    type: "boolean",
+    defaultValue: false,
+    description: "移动设备默认关闭，避免小屏遮挡操作区域。",
+  },
+  {
+    key: "waifuPath",
+    label: "提示配置路径",
+    type: "url",
+    required: true,
+    defaultValue: "/plugins/live2d-widget/waifu-tips.json",
+    description: "JSON 提示配置；可使用面板内置文件或自托管文件。",
+  },
+  {
+    key: "cdnPath",
+    label: "模型 CDN 路径",
+    type: "url",
+    required: true,
+    defaultValue: "https://fastly.jsdelivr.net/gh/fghrsh/live2d_api/",
+    description: "目录中需要包含 model_list.json 和模型资源；模型仓库的许可由其维护者决定。",
+  },
+  {
+    key: "modelId",
+    label: "默认模型编号",
+    type: "number",
+    defaultValue: 0,
+    min: 0,
+    max: 999,
+    description: "只对浏览器首次选择模型时生效；上游会把用户选择保存在本地。",
+  },
+  {
+    key: "tools",
+    label: "工具按钮",
+    type: "multi-select",
+    defaultValue: [...LIVE2D_WIDGET_DEFAULT_TOOLS],
+    options: [
+      { value: "hitokoto", label: "一言" },
+      { value: "asteroids", label: "飞机大战" },
+      { value: "switch-model", label: "切换模型" },
+      { value: "switch-texture", label: "切换纹理" },
+      { value: "photo", label: "拍照" },
+      { value: "info", label: "项目说明" },
+      { value: "quit", label: "关闭" },
+    ],
+    description: "一言、飞机大战和模型资源可能访问各自的第三方服务。",
+  },
+  {
+    key: "drag",
+    label: "允许拖动",
+    type: "boolean",
+    defaultValue: false,
+  },
+  {
+    key: "showToggleAfterQuit",
+    label: "关闭后显示唤起按钮",
+    type: "boolean",
+    defaultValue: true,
+    description: "关闭后保留左下角唤起按钮；关闭此项会按上游行为永久隐藏，直到清除浏览器本地存储。",
+  },
+  {
+    key: "logLevel",
+    label: "日志等级",
+    type: "select",
+    defaultValue: "warn",
+    options: [
+      { value: "error", label: "错误" },
+      { value: "warn", label: "警告" },
+      { value: "info", label: "信息" },
+      { value: "trace", label: "详细" },
+    ],
+  },
+  {
+    key: "dock",
+    label: "停靠位置",
+    type: "select",
+    defaultValue: "right",
+    options: [
+      { value: "left", label: "左侧" },
+      { value: "right", label: "右侧" },
+    ],
+  },
+  {
+    key: "size",
+    label: "模型尺寸",
+    type: "number",
+    defaultValue: 280,
+    min: 200,
+    max: 420,
+    description: "画布边长，单位为 CSS 像素。",
+  },
+];
+const PACKAGE_ASSET_EXTENSIONS = new Set([
+  ...DATA_ASSET_EXTENSIONS,
+  ".html",
+  ".htm",
+  ".css",
+  ".svg",
+  ".sh",
+  ".py",
+]);
+const SKIPPED_DATA_PATH_PREFIXES = [".github/", "node_modules/", "dist/", "build/", "tests/"];
+let officialStoreCache: { items: PluginStoreItem[]; checkedAt: number } | null = null;
+let officialStoreFetchInFlight: Promise<PluginStoreItem[]> | null = null;
+const pluginWarnCache = new Map<string, number>();
+
+type GithubTreeItem = {
+  path?: string;
+  type?: string;
+  size?: number;
+};
+
+type AssetSyncResult = {
+  total: number;
+  synced: number;
+  skipped: number;
+  paths: string[];
+  errors: string[];
+};
+
+type AssetDeclaration = {
+  contentType: string;
+  remotePath: string;
+  isData: boolean;
+};
+
+type PluginPackageFile = {
+  path: string;
+  content: Buffer;
+};
+
+export type HostAssetSyncUsageConfig = {
+  enabled: boolean;
+  hostIds: number[];
+  assetPaths: string[];
+  mode: "sync-files";
+  operation?: string;
+  fieldValues?: Record<string, unknown>;
+  note?: string;
+  cleanupHostIds?: number[];
+  updatedAt?: string;
+};
+
+function parseJson<T>(value: unknown, fallback: T): T {
+  if (typeof value !== "string" || !value.trim()) return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function pluginSettingsValues(manifest: ForwardxPluginManifest): Record<string, unknown> {
+  const values = (manifest as any)?.settingsValues;
+  return values && typeof values === "object" && !Array.isArray(values) ? { ...values } : {};
+}
+
+function normalizePositiveIds(values: unknown) {
+  if (!Array.isArray(values)) return [];
+  return Array.from(new Set(values
+    .map((value) => Math.floor(Number(value)))
+    .filter((value) => Number.isInteger(value) && value > 0)))
+    .slice(0, MAX_WHITELIST_USAGE_HOSTS);
+}
+
+function normalizeUsageAssetPaths(values: unknown) {
+  if (!Array.isArray(values)) return [];
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values.slice(0, MAX_WHITELIST_USAGE_ASSETS)) {
+    try {
+      const path = normalizeAssetPath(value);
+      if (!path.startsWith("data/") || seen.has(path)) continue;
+      seen.add(path);
+      paths.push(path);
+    } catch {
+      continue;
+    }
+  }
+  return paths;
+}
+
+function usageViewAssetMode(view?: PluginUsageViewDefinition | null) {
+  return view?.assetMode === "all-plugin-assets" ? "all-plugin-assets" : "selected-assets";
+}
+
+export function pluginVersionHasUpdate(currentVersion: unknown, latestVersion: unknown) {
+  const current = String(currentVersion || "").trim();
+  const latest = String(latestVersion || "").trim();
+  return !!current && !!latest && compareVersions(latest, current) > 0;
+}
+
+function usageViewHostScope(view?: PluginUsageViewDefinition | null) {
+  return view?.hostScope === "all" ? "all" : "selected";
+}
+
+export function resolvePluginUsageHostIds(
+  view: PluginUsageViewDefinition | null | undefined,
+  usage: Pick<HostAssetSyncUsageConfig, "enabled" | "hostIds">,
+  knownHostIds: number[],
+) {
+  if (!usage.enabled) return [];
+  const known = Array.from(new Set(knownHostIds
+    .map((hostId) => Math.floor(Number(hostId)))
+    .filter((hostId) => Number.isInteger(hostId) && hostId > 0)));
+  if (usageViewHostScope(view) === "all") return known;
+  const selected = new Set(normalizePositiveIds(usage.hostIds));
+  return known.filter((hostId) => selected.has(hostId));
+}
+
+function defaultUsageOperation(view?: PluginUsageViewDefinition | null) {
+  const options = view?.operationSelector?.options || [];
+  const declaredDefault = String(view?.operationSelector?.defaultValue || "").trim();
+  if (declaredDefault && options.some((option) => option.value === declaredDefault)) return declaredDefault;
+  return options[0]?.value || "sync-files";
+}
+
+function normalizeUsageOperation(value: unknown, view?: PluginUsageViewDefinition | null) {
+  const operation = normalizePluginId(value).slice(0, 40);
+  const options = view?.operationSelector?.options || [];
+  if (!options.length) return operation || defaultUsageOperation(view);
+  return options.some((option) => option.value === operation) ? operation : defaultUsageOperation(view);
+}
+
+function normalizeUsageFieldValues(value: unknown, view?: PluginUsageViewDefinition | null) {
+  const raw = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const fields = view?.fields || [];
+  const values: Record<string, unknown> = {};
+  for (const field of fields) {
+    const incoming = raw[field.key] !== undefined ? raw[field.key] : field.defaultValue;
+    if (field.type === "boolean") {
+      values[field.key] = incoming === true;
+      continue;
+    }
+    if (field.type === "multi-select") {
+      const allowed = new Set((field.options || []).map((option) => option.value));
+      const selected = Array.isArray(incoming)
+        ? incoming.map((item) => String(item || "").trim()).filter((item) => item && (!allowed.size || allowed.has(item)))
+        : [];
+      values[field.key] = Array.from(new Set(selected)).slice(0, 80);
+      continue;
+    }
+    const textLimit = field.type === "textarea" ? 10000 : 1000;
+    const text = String(incoming ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").slice(0, textLimit);
+    if (field.type === "select" && field.options?.length) {
+      const allowed = new Set(field.options.map((option: { value: string }) => option.value));
+      values[field.key] = allowed.has(text) ? text : String(field.defaultValue || field.options[0]?.value || "");
+      continue;
+    }
+    values[field.key] = text;
+  }
+  return values;
+}
+
+function normalizeHostAssetSyncUsage(value: unknown, view?: PluginUsageViewDefinition | null): HostAssetSyncUsageConfig {
+  const raw = value && typeof value === "object" ? value as any : {};
+  return {
+    enabled: raw.enabled === true,
+    hostIds: normalizePositiveIds(raw.hostIds),
+    assetPaths: normalizeUsageAssetPaths(raw.assetPaths),
+    mode: "sync-files",
+    operation: normalizeUsageOperation(raw.operation || raw.action, view),
+    fieldValues: normalizeUsageFieldValues(raw.fieldValues, view),
+    note: String(raw.note || "").trim().slice(0, 500) || undefined,
+    cleanupHostIds: normalizePositiveIds(raw.cleanupHostIds),
+    updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : undefined,
+  };
+}
+
+function usageStorageKey(plugin: { pluginId?: string | null; manifest?: ForwardxPluginManifest }, usageViewId = "default") {
+  const view = (plugin.manifest?.usageViews || []).find((item) => item.id === usageViewId)
+    || (plugin.manifest?.usageViews || []).find((item) => item.type === "host-asset-sync");
+  return view?.storageKey || `${normalizePluginId(plugin.pluginId)}.${normalizePluginId(view?.id || usageViewId)}.usage`;
+}
+
+function normalizeUsageStorageKey(value: unknown) {
+  const key = String(value || "").trim().replace(/[^A-Za-z0-9._-]+/g, "").slice(0, 80);
+  return key || undefined;
+}
+
+function hostAssetSyncDir(pluginId: string, view?: PluginUsageViewDefinition | null) {
+  void view;
+  return `${PLUGIN_HOST_ASSET_ROOT}/${assertPluginId(pluginId)}`;
+}
+
+type PluginHostSyncFile = {
+  source: string;
+  sha256: string;
+  size: number;
+  content: string;
+};
+
+function pluginHostSyncFiles(
+  usageView: PluginUsageViewDefinition,
+  usage: HostAssetSyncUsageConfig,
+  assetRows: any[],
+) {
+  const allAssetsMode = usageViewAssetMode(usageView) === "all-plugin-assets";
+  const byPath = new Map<string, any>(assetRows.map((asset: any) => [String(asset?.path || ""), asset]));
+  const selectedRows = allAssetsMode
+    ? assetRows
+      .filter((asset: any) => isHostSyncAssetCandidate(String(asset?.path || ""), Number(asset?.size || 0)))
+      .sort((a: any, b: any) => String(a?.path || "").localeCompare(String(b?.path || ""), "zh-Hans-CN"))
+    : usage.assetPaths.flatMap((assetPath) => {
+      const asset = byPath.get(assetPath);
+      return asset ? [asset] : [];
+    });
+  let totalBytes = 0;
+  const skippedPaths: string[] = [];
+  const files: PluginHostSyncFile[] = [];
+  for (const asset of selectedRows) {
+    const source = String(asset?.path || "");
+    const hasContent = typeof asset?.content === "string";
+    const content = hasContent ? String(asset.content) : "";
+    const size = hasContent ? Buffer.byteLength(content, "utf8") : Math.max(0, Number(asset?.size || 0));
+    if (!source || size <= 0) continue;
+    if (totalBytes + size > MAX_WHITELIST_USAGE_SYNC_BYTES) {
+      skippedPaths.push(source);
+      continue;
+    }
+    const storedSha256 = String(asset?.sha256 || "").trim().toLowerCase();
+    const contentSha256 = /^[a-f0-9]{64}$/.test(storedSha256)
+      ? storedSha256
+      : hasContent
+        ? sha256(content)
+        : "";
+    if (!contentSha256) continue;
+    totalBytes += size;
+    files.push({
+      source,
+      size,
+      sha256: contentSha256,
+      content,
+    });
+  }
+  return { files, skippedPaths };
+}
+
+function pluginHostSyncSignature(
+  pluginId: string,
+  usageView: PluginUsageViewDefinition,
+  usage: HostAssetSyncUsageConfig,
+  targetDir: string,
+  files: PluginHostSyncFile[],
+) {
+  return sha256(JSON.stringify({
+    pluginId,
+    usageViewId: usageView.id,
+    operation: usage.operation || defaultUsageOperation(usageView),
+    fieldValues: usage.fieldValues || {},
+    note: usage.note || "",
+    updatedAt: usage.updatedAt || "",
+    targetDir,
+    files: files.map(({ source, sha256: fileSha256, size }) => ({ source, sha256: fileSha256, size })),
+  }));
+}
+
+function firstHostAssetSyncView(manifest?: ForwardxPluginManifest) {
+  return (manifest?.usageViews || []).find((item) => item.type === "host-asset-sync") || null;
+}
+
+function safeAgentPluginAssetName(assetPath: string) {
+  return normalizeAssetPath(assetPath)
+    .replace(/^data\//, "")
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 160) || "whitelist.txt";
+}
+
+function formatByteLimit(bytes: number) {
+  if (bytes >= 1024 * 1024) return `${Math.floor(bytes / 1024 / 1024)}MB`;
+  if (bytes >= 1024) return `${Math.floor(bytes / 1024)}KB`;
+  return `${bytes}B`;
+}
+
+function warnPluginThrottled(key: string, message: string) {
+  const now = Date.now();
+  const last = pluginWarnCache.get(key) || 0;
+  if (now - last < PLUGIN_WARN_THROTTLE_MS) return;
+  pluginWarnCache.set(key, now);
+  console.warn(message);
+}
+
+function uniqueValidPermissions(values: unknown): PluginPermissionKey[] {
+  const allowed = new Set<string>(PLUGIN_PERMISSION_KEYS);
+  if (!Array.isArray(values)) return [];
+  return Array.from(new Set(values.map((item) => String(item || "").trim()).filter((item) => allowed.has(item)))) as PluginPermissionKey[];
+}
+
+function uniqueValidExtensionPoints(values: unknown): PluginExtensionPoint[] {
+  const allowed = new Set<string>(PLUGIN_EXTENSION_POINTS);
+  if (!Array.isArray(values)) return [];
+  return Array.from(new Set(values.map((item) => String(item || "").trim()).filter((item) => allowed.has(item)))) as PluginExtensionPoint[];
+}
+
+function normalizePluginId(value: unknown) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 128);
+}
+
+function assertPluginId(value: unknown) {
+  const id = normalizePluginId(value);
+  if (!id || !/^[a-z0-9][a-z0-9._-]{1,127}$/.test(id)) {
+    throw new Error("插件 ID 只能包含小写字母、数字、点、短横线或下划线，长度至少 2 位");
+  }
+  return id;
+}
+
+function normalizeVersion(value: unknown) {
+  const text = String(value || "").trim().replace(/^v/i, "");
+  return text.slice(0, 64) || "0.0.0";
+}
+
+function normalizeOptionalText(value: unknown, maxLength: number) {
+  return String(value || "").trim().slice(0, maxLength) || undefined;
+}
+
+function normalizeDateText(value: unknown) {
+  const text = String(value || "").trim().slice(0, 32);
+  if (!text) return undefined;
+  if (/^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})?)?$/.test(text)) return text;
+  return text;
+}
+
+function normalizeTags(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return Array.from(new Set(value.map((item) => String(item || "").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-")).filter(Boolean)))
+    .slice(0, 12)
+    .map((item) => item.slice(0, 32));
+}
+
+function normalizeAssetPath(value: unknown) {
+  const path = String(value || "")
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/")
+    .trim();
+  if (!path || path.includes("..") || path.startsWith(".") || /[\u0000-\u001f]/.test(path)) {
+    throw new Error("插件资产路径不合法");
+  }
+  return path.slice(0, 240);
+}
+
+function normalizeOptionalLogo(value: unknown) {
+  const logo = String(value || "").trim();
+  if (!logo) return undefined;
+  if (/^data:image\/(png|jpe?g|webp|gif|svg\+xml);base64,[a-z0-9+/=]+$/i.test(logo)) return logo.slice(0, 200000);
+  if (/^https?:\/\//i.test(logo)) return logo.slice(0, 512);
+  return undefined;
+}
+
+function normalizeSettingFields(value: unknown): PluginSettingField[] {
+  if (!Array.isArray(value)) return [];
+  const allowedTypes = new Set<string>(PLUGIN_SETTING_FIELD_TYPES);
+  const seen = new Set<string>();
+  return value.slice(0, MAX_PLUGIN_FIELDS).flatMap((item: any) => {
+    const key = normalizePluginId(item?.key).slice(0, 80);
+    if (!key || key.startsWith("__forwardx") || seen.has(key)) return [];
+    const type = String(item?.type || "text").trim();
+    if (!allowedTypes.has(type)) return [];
+    seen.add(key);
+    const field: PluginSettingField = {
+      key,
+      label: String(item?.label || key).trim().slice(0, 80) || key,
+      type: type as PluginSettingField["type"],
+      description: String(item?.description || "").trim().slice(0, 240) || undefined,
+      placeholder: String(item?.placeholder || "").trim().slice(0, 160) || undefined,
+      required: item?.required === true,
+      defaultValue: type === "multi-select" && Array.isArray(item?.defaultValue)
+        ? item.defaultValue.map((option: unknown) => String(option || "").trim()).filter(Boolean).slice(0, 40)
+        : typeof item?.defaultValue === "boolean" || typeof item?.defaultValue === "number" || typeof item?.defaultValue === "string"
+          ? item.defaultValue
+          : undefined,
+      min: Number.isFinite(Number(item?.min)) ? Number(item.min) : undefined,
+      max: Number.isFinite(Number(item?.max)) ? Number(item.max) : undefined,
+      options: Array.isArray(item?.options)
+        ? item.options.slice(0, 40).flatMap((option: any) => {
+            const optionValue = String(option?.value ?? "").trim().slice(0, 120);
+            if (!optionValue) return [];
+            return [{
+              value: optionValue,
+              label: String(option?.label || optionValue).trim().slice(0, 120) || optionValue,
+            }];
+          })
+        : undefined,
+    };
+    return [field];
+  });
+}
+
+function normalizeHttpRecord(value: unknown, maxEntries: number, maxValueLength: number): Record<string, string> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const result: Record<string, string> = {};
+  for (const [key, rawValue] of Object.entries(value).slice(0, maxEntries)) {
+    const cleanKey = String(key || "").trim().slice(0, 120);
+    if (!cleanKey || /[\u0000-\u001f]/.test(cleanKey)) continue;
+    result[cleanKey] = String(rawValue ?? "").slice(0, maxValueLength);
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+
+function normalizeHttpAuth(value: unknown): PluginHttpAuthDefinition | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as any;
+  const allowedTypes = new Set<string>(PLUGIN_HTTP_AUTH_TYPES);
+  const type = allowedTypes.has(String(raw.type || "")) ? String(raw.type) as PluginHttpAuthDefinition["type"] : "none";
+  if (type === "none") return undefined;
+  const auth: PluginHttpAuthDefinition = { type };
+  if (type === "bearer") {
+    auth.token = String(raw.token ?? "").slice(0, 1000);
+  } else if (type === "header") {
+    auth.header = String(raw.header || "").trim().slice(0, 120);
+    auth.value = String(raw.value ?? "").slice(0, 1000);
+  } else if (type === "cookie") {
+    auth.cookieName = String(raw.cookieName || "").trim().slice(0, 120);
+    auth.cookieValue = String(raw.cookieValue ?? "").slice(0, 2000);
+  }
+  return auth;
+}
+
+function normalizeHttpBodyTemplate(value: unknown): unknown {
+  if (value === undefined || value === null) return undefined;
+  const encoded = JSON.stringify(value);
+  if (encoded && Buffer.byteLength(encoded, "utf8") > MAX_PLUGIN_HTTP_TEMPLATE_BYTES) return undefined;
+  if (typeof value === "string") return value.slice(0, MAX_PLUGIN_HTTP_TEMPLATE_BYTES);
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) return value.slice(0, 80).map(normalizeHttpBodyTemplate);
+  if (typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value).slice(0, 80)) {
+      const cleanKey = String(key || "").trim().slice(0, 120);
+      if (!cleanKey) continue;
+      result[cleanKey] = normalizeHttpBodyTemplate(item);
+    }
+    return result;
+  }
+  return undefined;
+}
+
+function normalizeHttpRequest(value: unknown): PluginHttpRequestDefinition | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as any;
+  const allowedMethods = new Set<string>(PLUGIN_HTTP_METHODS);
+  const method = String(raw.method || "GET").trim().toUpperCase();
+  if (!allowedMethods.has(method)) return undefined;
+  const responseTypes = new Set<string>(PLUGIN_HTTP_RESPONSE_TYPES);
+  const responseType = responseTypes.has(String(raw.responseType || "")) ? String(raw.responseType) as PluginHttpRequestDefinition["responseType"] : "auto";
+  const timeoutValue = Math.floor(Number(raw.timeoutMs || DEFAULT_PLUGIN_HTTP_TIMEOUT_MS));
+  const timeoutMs = Number.isFinite(timeoutValue)
+    ? Math.max(1000, Math.min(MAX_PLUGIN_HTTP_TIMEOUT_MS, timeoutValue))
+    : DEFAULT_PLUGIN_HTTP_TIMEOUT_MS;
+  const request: PluginHttpRequestDefinition = {
+    method: method as PluginHttpRequestDefinition["method"],
+    url: normalizeOptionalText(raw.url, 2000),
+    baseUrlSetting: normalizePluginId(raw.baseUrlSetting).slice(0, 80) || undefined,
+    path: normalizeOptionalText(raw.path, 1200),
+    headers: normalizeHttpRecord(raw.headers, 40, 2000),
+    query: normalizeHttpRecord(raw.query, 40, 2000),
+    body: normalizeHttpBodyTemplate(raw.body),
+    timeoutMs,
+    responseType,
+    auth: normalizeHttpAuth(raw.auth),
+  };
+  if (!request.url && (!request.baseUrlSetting || !request.path)) return undefined;
+  return request;
+}
+
+function normalizePluginAgentEntry(value: unknown) {
+  const entry = String(value || "").replace(/\\/g, "/").replace(/^\.\//, "").trim();
+  if (!entry || entry.startsWith("/") || entry.includes("..") || /[\u0000-\u001f]/.test(entry)) return undefined;
+  if (!/^[A-Za-z0-9._/-]{1,240}$/.test(entry)) return undefined;
+  return entry;
+}
+
+function normalizePluginAgentRequest(value: unknown): PluginAgentRequestDefinition | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as any;
+  const executors = new Set<string>(PLUGIN_AGENT_EXECUTORS);
+  const executor = String(raw.executor || "script").trim();
+  if (!executors.has(executor)) return undefined;
+  const entry = normalizePluginAgentEntry(raw.entry);
+  if (!entry) return undefined;
+  const interpreters = new Set<string>(PLUGIN_AGENT_INTERPRETERS);
+  const interpreter = interpreters.has(String(raw.interpreter || ""))
+    ? String(raw.interpreter) as PluginAgentRequestDefinition["interpreter"]
+    : "bash";
+  const outputTypes = new Set<string>(PLUGIN_AGENT_OUTPUT_TYPES);
+  const outputType = outputTypes.has(String(raw.outputType || ""))
+    ? String(raw.outputType) as PluginAgentRequestDefinition["outputType"]
+    : "json";
+  const targets = new Set<string>(PLUGIN_AGENT_TARGETS);
+  const target = targets.has(String(raw.target || ""))
+    ? String(raw.target) as PluginAgentRequestDefinition["target"]
+    : "usage-hosts";
+  const timeoutValue = Math.floor(Number(raw.timeoutMs || DEFAULT_PLUGIN_HTTP_TIMEOUT_MS));
+  const timeoutMs = Number.isFinite(timeoutValue)
+    ? Math.max(1000, Math.min(MAX_PLUGIN_HTTP_TIMEOUT_MS, timeoutValue))
+    : DEFAULT_PLUGIN_HTTP_TIMEOUT_MS;
+  const request: PluginAgentRequestDefinition = {
+    executor: executor as PluginAgentRequestDefinition["executor"],
+    interpreter,
+    target,
+    usageViewId: normalizePluginId(raw.usageViewId).slice(0, 80) || undefined,
+    entry,
+    arguments: Array.isArray(raw.arguments || raw.args)
+      ? (raw.arguments || raw.args).slice(0, 24).map((item: unknown) => String(item ?? "").slice(0, MAX_PLUGIN_AGENT_ARGUMENT_BYTES))
+      : [],
+    timeoutMs,
+    outputType,
+  };
+  return request;
+}
+
+function normalizePluginPages(value: unknown): PluginPageDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const contentTypes = new Set<string>(PLUGIN_PAGE_CONTENT_TYPES);
+  const seen = new Set<string>();
+  return value.slice(0, MAX_PLUGIN_PAGES).flatMap((item: any) => {
+    const id = normalizePluginId(item?.id).slice(0, 80);
+    if (!id || seen.has(id)) return [];
+    seen.add(id);
+    const contentType = contentTypes.has(String(item?.contentType || "")) ? String(item.contentType) as PluginPageDefinition["contentType"] : "markdown";
+    let assetPath: string | undefined;
+    if (item?.assetPath) {
+      try {
+        assetPath = normalizeAssetPath(item.assetPath);
+      } catch {
+        assetPath = undefined;
+      }
+    }
+    return [{
+      id,
+      title: String(item?.title || id).trim().slice(0, 100) || id,
+      description: String(item?.description || "").trim().slice(0, 240) || undefined,
+      contentType,
+      content: String(item?.content || "").slice(0, 30000) || undefined,
+      assetPath,
+    }];
+  });
+}
+
+function normalizePluginSidebar(value: unknown): PluginSidebarDefinition | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const target = PLUGIN_SIDEBAR_TARGETS.includes(raw.target as any)
+    ? raw.target as PluginSidebarDefinition["target"]
+    : undefined;
+  return {
+    label: normalizeOptionalText(raw.label, 64),
+    icon: normalizeOptionalLogo(raw.icon),
+    target,
+    pageId: normalizePluginId(raw.pageId).slice(0, 80) || undefined,
+  };
+}
+
+function normalizePluginResultSchema(value: unknown): PluginResultSchemaDefinition | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as any;
+  if (!PLUGIN_RESULT_SCHEMA_TYPES.includes(raw.type)) return undefined;
+  const allowedFieldTypes = new Set<string>(PLUGIN_RESULT_FIELD_TYPES);
+  const seen = new Set<string>();
+  const fields: PluginResultFieldDefinition[] = Array.isArray(raw.fields)
+    ? raw.fields.slice(0, MAX_PLUGIN_RESOURCE_COLUMNS).flatMap((item: any) => {
+        const key = normalizeResourceKey(item?.key, 80);
+        if (!key || seen.has(key)) return [];
+        seen.add(key);
+        const type = allowedFieldTypes.has(String(item?.type || ""))
+          ? String(item.type) as PluginResultFieldDefinition["type"]
+          : "text";
+        return [{
+          key,
+          label: String(item?.label || key).trim().slice(0, 100) || key,
+          path: normalizeResourceKey(item?.path, 160) || key,
+          type,
+          copyable: item?.copyable === true,
+          secret: item?.secret === true,
+          revealable: item?.revealable === true,
+          openable: item?.openable === true,
+          trueLabel: normalizeOptionalText(item?.trueLabel, 80),
+          falseLabel: normalizeOptionalText(item?.falseLabel, 80),
+        }];
+      })
+    : [];
+  if (!fields.length) return undefined;
+  return {
+    type: raw.type,
+    resultPath: normalizeResourceKey(raw.resultPath, 160),
+    itemsPath: normalizeResourceKey(raw.itemsPath, 160),
+    emptyText: normalizeOptionalText(raw.emptyText, 180),
+    fields,
+  };
+}
+
+function normalizePluginPanelRequest(value: unknown): PluginPanelRequestDefinition | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const operation = String((value as any).operation || "").trim();
+  if (!PLUGIN_PANEL_OPERATIONS.includes(operation as any)) return undefined;
+  return { operation: operation as PluginPanelRequestDefinition["operation"] };
+}
+
+function normalizePluginActions(value: unknown): PluginActionDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const allowedTypes = new Set<string>(PLUGIN_ACTION_TYPES);
+  const seen = new Set<string>();
+  return value.slice(0, MAX_PLUGIN_ACTIONS).flatMap((item: any) => {
+    const id = normalizePluginId(item?.id).slice(0, 80);
+    if (!id || seen.has(id)) return [];
+    const type = String(item?.type || "noop").trim();
+    if (!allowedTypes.has(type)) return [];
+    seen.add(id);
+    const action: PluginActionDefinition = {
+      id,
+      label: String(item?.label || id).trim().slice(0, 100) || id,
+      type: type as PluginActionDefinition["type"],
+      description: String(item?.description || "").trim().slice(0, 240) || undefined,
+      confirmRequired: item?.confirmRequired === true,
+      intent: PLUGIN_ACTION_INTENTS.includes(item?.intent) ? item.intent : undefined,
+      inputSchema: normalizeSettingFields(item?.inputSchema || item?.inputs),
+      request: normalizeHttpRequest(item?.request),
+      agent: normalizePluginAgentRequest(item?.agent),
+      panel: normalizePluginPanelRequest(item?.panel || item?.panelRequest),
+      resultSchema: normalizePluginResultSchema(item?.resultSchema),
+    };
+    if (action.type === "agent.request" && !action.agent) return [];
+    if (action.type === "panel.request" && !action.panel) return [];
+    if (!action.inputSchema?.length) delete (action as any).inputSchema;
+    if (!action.request) delete (action as any).request;
+    if (!action.agent) delete (action as any).agent;
+    if (!action.panel) delete (action as any).panel;
+    if (!action.resultSchema) delete (action as any).resultSchema;
+    return [action];
+  });
+}
+
+function pluginManifestTrustScope(manifest: Partial<ForwardxPluginManifest> | null | undefined) {
+  const permissions = new Set(Array.isArray(manifest?.permissions) ? manifest.permissions : []);
+  const permissionByOperation = new Map(
+    getPluginPanelOperationCapabilities().map((item) => [item.operation, item.permission]),
+  );
+  const operations = (Array.isArray(manifest?.actions) ? manifest.actions : [])
+    .filter((action) => action?.type === "panel.request" && !!action.panel?.operation)
+    .map((action) => String(action.panel?.operation || ""))
+    .filter((operation) => PLUGIN_PANEL_OPERATIONS.includes(operation as any))
+    .map((operation) => {
+      const permission = permissionByOperation.get(operation as any);
+      return `${operation}:${permission && permissions.has(permission) ? permission : "missing-permission"}`;
+    });
+  const agentActions = (Array.isArray(manifest?.actions) ? manifest.actions : [])
+    .filter((action) => action?.type === "agent.request" && !!action.agent)
+    .map((action) => `agent:${String(action.intent || "execute")}:${String(action.agent?.entry || "")}`);
+  return Array.from(new Set([...operations, ...agentActions])).sort();
+}
+
+export function pluginManifestRequiresTrust(manifest: Partial<ForwardxPluginManifest> | null | undefined) {
+  return pluginManifestTrustScope(manifest).length > 0;
+}
+
+export function shouldPreservePluginTrust(
+  previousManifest: Partial<ForwardxPluginManifest> | null | undefined,
+  nextManifest: Partial<ForwardxPluginManifest> | null | undefined,
+) {
+  const nextScope = pluginManifestTrustScope(nextManifest);
+  return nextScope.length > 0
+    && JSON.stringify(pluginManifestTrustScope(previousManifest)) === JSON.stringify(nextScope);
+}
+
+function normalizeResourceKey(value: unknown, maxLength = 120) {
+  const key = String(value || "").trim().slice(0, maxLength);
+  if (!key || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(key)) return undefined;
+  if (key.split(".").some((part) => ["__proto__", "prototype", "constructor"].includes(part))) return undefined;
+  return key;
+}
+
+function normalizeResourceConditions(value: unknown): PluginResourceCondition[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const operators = new Set<string>(PLUGIN_RESOURCE_CONDITION_OPERATORS);
+  const conditions = value.slice(0, 8).flatMap((item: any) => {
+    const field = normalizeResourceKey(item?.field, 80);
+    if (!field) return [];
+    const operator = operators.has(String(item?.operator || ""))
+      ? String(item.operator) as PluginResourceCondition["operator"]
+      : "eq";
+    let conditionValue: unknown = item?.value;
+    if (Array.isArray(conditionValue)) {
+      conditionValue = conditionValue.slice(0, 40).map((entry) => (
+        typeof entry === "boolean" || typeof entry === "number" ? entry : String(entry ?? "").slice(0, 240)
+      ));
+    } else if (!["string", "number", "boolean", "undefined"].includes(typeof conditionValue)) {
+      conditionValue = undefined;
+    } else if (typeof conditionValue === "string") {
+      conditionValue = conditionValue.slice(0, 1000);
+    }
+    return [{ field, operator, value: conditionValue }];
+  });
+  return conditions.length ? conditions : undefined;
+}
+
+function normalizeResourceOptionsSource(value: unknown): PluginResourceOptionsSource | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as any;
+  const sourceId = normalizePluginId(raw.sourceId).slice(0, 80);
+  if (!sourceId) return undefined;
+  return {
+    sourceId,
+    path: normalizeResourceKey(raw.path, 160),
+    valueKey: normalizeResourceKey(raw.valueKey, 80) || "value",
+    labelKey: normalizeResourceKey(raw.labelKey, 80) || "label",
+    disabledKey: normalizeResourceKey(raw.disabledKey, 80),
+  };
+}
+
+function normalizeResourceFields(value: unknown): PluginResourceFieldDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const allowedTypes = new Set<string>(PLUGIN_RESOURCE_FIELD_TYPES);
+  const seen = new Set<string>();
+  return value.slice(0, MAX_PLUGIN_FIELDS).flatMap((item: any) => {
+    const key = normalizeResourceKey(item?.key, 80);
+    const type = String(item?.type || "text").trim();
+    if (!key || seen.has(key) || !allowedTypes.has(type)) return [];
+    seen.add(key);
+    const options = Array.isArray(item?.options)
+      ? item.options.slice(0, 100).flatMap((option: any) => {
+          const optionValue = String(option?.value ?? "").trim().slice(0, 240);
+          if (!optionValue) return [];
+          return [{
+            value: optionValue,
+            label: String(option?.label || optionValue).trim().slice(0, 240) || optionValue,
+            exclusive: option?.exclusive === true,
+          }];
+        })
+      : undefined;
+    let defaultValue: PluginResourceFieldDefinition["defaultValue"];
+    if (type === "boolean") defaultValue = item?.defaultValue === true;
+    else if (type === "number" && Number.isFinite(Number(item?.defaultValue))) defaultValue = Number(item.defaultValue);
+    else if (type === "multi-select") defaultValue = Array.isArray(item?.defaultValue)
+      ? item.defaultValue.slice(0, 100).map((entry: unknown) => String(entry ?? "").slice(0, 240))
+      : [];
+    else if (typeof item?.defaultValue === "string") defaultValue = item.defaultValue.slice(0, type === "textarea" ? 10000 : 1000);
+    return [{
+      key,
+      label: String(item?.label || key).trim().slice(0, 100) || key,
+      type: type as PluginResourceFieldDefinition["type"],
+      description: normalizeOptionalText(item?.description, 300),
+      placeholder: normalizeOptionalText(item?.placeholder, 200),
+      required: item?.required === true,
+      readOnly: item?.readOnly === true,
+      secret: item?.secret === true || type === "password",
+      defaultValue,
+      min: Number.isFinite(Number(item?.min)) ? Number(item.min) : undefined,
+      max: Number.isFinite(Number(item?.max)) ? Number(item.max) : undefined,
+      options,
+      optionsSource: normalizeResourceOptionsSource(item?.optionsSource),
+      visibleWhen: normalizeResourceConditions(item?.visibleWhen),
+      disabledWhen: normalizeResourceConditions(item?.disabledWhen),
+    }];
+  });
+}
+
+function normalizeResourceColumns(value: unknown): PluginResourceColumnDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const allowedTypes = new Set<string>(PLUGIN_RESOURCE_COLUMN_TYPES);
+  const seen = new Set<string>();
+  return value.slice(0, MAX_PLUGIN_RESOURCE_COLUMNS).flatMap((item: any) => {
+    const key = normalizeResourceKey(item?.key, 80);
+    if (!key || seen.has(key)) return [];
+    seen.add(key);
+    const type = allowedTypes.has(String(item?.type || ""))
+      ? String(item.type) as PluginResourceColumnDefinition["type"]
+      : "text";
+    return [{
+      key,
+      label: String(item?.label || key).trim().slice(0, 100) || key,
+      type,
+      path: normalizeResourceKey(item?.path, 160) || key,
+      width: Number.isFinite(Number(item?.width)) ? Math.max(60, Math.min(600, Math.floor(Number(item.width)))) : undefined,
+      copyable: item?.copyable === true,
+      secret: item?.secret === true || type === "secret",
+      trueLabel: normalizeOptionalText(item?.trueLabel, 80),
+      falseLabel: normalizeOptionalText(item?.falseLabel, 80),
+    }];
+  });
+}
+
+function normalizeResourceSources(value: unknown): PluginResourceDataSourceDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const allowedTriggers = new Set<string>(PLUGIN_RESOURCE_SOURCE_TRIGGERS);
+  const seen = new Set<string>();
+  return value.slice(0, MAX_PLUGIN_RESOURCE_SOURCES).flatMap((item: any) => {
+    const id = normalizePluginId(item?.id).slice(0, 80);
+    const actionId = normalizePluginId(item?.actionId).slice(0, 80);
+    if (!id || !actionId || seen.has(id)) return [];
+    seen.add(id);
+    const triggers = Array.isArray(item?.triggers)
+      ? Array.from(new Set(item.triggers.map((trigger: unknown) => String(trigger || "")).filter((trigger: string) => allowedTriggers.has(trigger)))) as PluginResourceDataSourceDefinition["triggers"]
+      : ["onHostSelected"] as PluginResourceDataSourceDefinition["triggers"];
+    return [{
+      id,
+      actionId,
+      triggers: triggers?.length ? triggers : ["manual"],
+      resultPath: normalizeResourceKey(item?.resultPath, 160),
+      itemsPath: normalizeResourceKey(item?.itemsPath, 160),
+      selectionInputKey: normalizeResourceKey(item?.selectionInputKey, 80),
+      selectionValuePath: normalizeResourceKey(item?.selectionValuePath, 160),
+      cacheTtlMs: Number.isFinite(Number(item?.cacheTtlMs))
+        ? Math.max(0, Math.min(5 * 60 * 1000, Math.floor(Number(item.cacheTtlMs))))
+        : 0,
+    }];
+  });
+}
+
+function normalizeResourceOperation(value: unknown): PluginResourceOperationDefinition | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as any;
+  const actionId = normalizePluginId(raw.actionId).slice(0, 80);
+  if (!actionId) return undefined;
+  const refreshAfter = Array.isArray(raw.refreshAfter || raw.refreshSources)
+    ? Array.from(new Set<string>((raw.refreshAfter || raw.refreshSources).map((item: unknown) => normalizePluginId(item).slice(0, 80)).filter(Boolean))).slice(0, 16)
+    : undefined;
+  return {
+    actionId,
+    label: normalizeOptionalText(raw.label, 100),
+    description: normalizeOptionalText(raw.description, 240),
+    confirmRequired: raw.confirmRequired === true,
+    refreshSources: refreshAfter,
+    refreshAfter,
+  };
+}
+
+function normalizePluginResourceViews(value: unknown): PluginResourceViewDefinition[] {
+  const entries = Array.isArray(value) ? value : value && typeof value === "object" ? [value] : [];
+  if (!entries.length) return [];
+  const allowedTypes = new Set<string>(PLUGIN_RESOURCE_VIEW_TYPES);
+  const seen = new Set<string>();
+  return entries.slice(0, MAX_PLUGIN_RESOURCE_VIEWS).flatMap((item: any) => {
+    const id = normalizePluginId(item?.id).slice(0, 80);
+    const type = String(item?.type || "agent-resource").trim();
+    if (!id || seen.has(id) || !allowedTypes.has(type)) return [];
+    const declaredSources = Array.isArray(item?.sources) ? [...item.sources] : [];
+    const onOpenActionId = normalizePluginId(typeof item?.onOpen === "string" ? item.onOpen : item?.onOpen?.actionId).slice(0, 80);
+    if (onOpenActionId && !declaredSources.some((source: any) => source?.id === (item?.listSourceId || "list"))) {
+      declaredSources.push({
+        id: item?.listSourceId || "list",
+        actionId: onOpenActionId,
+        triggers: ["onOpen", "onHostSelected"],
+        resultPath: item?.resultPath,
+        itemsPath: item?.itemsPath,
+        cacheTtlMs: item?.cacheTtlMs,
+      });
+    }
+    const detailActionId = normalizePluginId(typeof item?.detailAction === "string" ? item.detailAction : item?.detailAction?.actionId).slice(0, 80);
+    if (detailActionId && !declaredSources.some((source: any) => source?.id === (item?.detailSourceId || "detail"))) {
+      declaredSources.push({
+        id: item?.detailSourceId || "detail",
+        actionId: detailActionId,
+        triggers: ["manual"],
+        resultPath: item?.detailAction?.resultPath,
+        selectionInputKey: item?.detailAction?.inputKey || item?.idInputKey || item?.rowKey || "id",
+        selectionValuePath: item?.rowKey || "id",
+      });
+    }
+    const sources = normalizeResourceSources(declaredSources);
+    const sourceIds = new Set(sources.map((source) => source.id));
+    const listSourceId = normalizePluginId(item?.listSourceId || (onOpenActionId ? "list" : sources[0]?.id)).slice(0, 80);
+    if (!listSourceId || !sourceIds.has(listSourceId)) return [];
+    const detailSourceId = normalizePluginId(item?.detailSourceId || (detailActionId ? "detail" : "")).slice(0, 80);
+    seen.add(id);
+    const execute = Array.isArray(item?.operations?.execute)
+      ? item.operations.execute.slice(0, 12).map(normalizeResourceOperation).filter(Boolean) as PluginResourceOperationDefinition[]
+      : undefined;
+    return [{
+      id,
+      type: type as PluginResourceViewDefinition["type"],
+      title: String(item?.title || id).trim().slice(0, 120) || id,
+      description: normalizeOptionalText(item?.description, 300),
+      usageViewId: normalizePluginId(item?.usageViewId).slice(0, 80) || undefined,
+      rowKey: normalizeResourceKey(item?.rowKey, 80) || "id",
+      idInputKey: normalizeResourceKey(item?.idInputKey, 80) || normalizeResourceKey(item?.rowKey, 80) || "id",
+      listSourceId,
+      detailSourceId: detailSourceId && sourceIds.has(detailSourceId) ? detailSourceId : undefined,
+      emptyText: normalizeOptionalText(item?.emptyText, 180),
+      sources,
+      columns: normalizeResourceColumns(item?.columns),
+      fields: normalizeResourceFields(item?.fields),
+      operations: {
+        create: normalizeResourceOperation(item?.operations?.create),
+        update: normalizeResourceOperation(item?.operations?.update),
+        delete: normalizeResourceOperation(item?.operations?.delete),
+        execute,
+      },
+    }];
+  });
+}
+
+function normalizeUsageSelectorCopy(value: unknown): PluginUsageSelectorCopy | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as any;
+  const copy: PluginUsageSelectorCopy = {
+    title: normalizeOptionalText(raw.title, 100),
+    description: normalizeOptionalText(raw.description, 240),
+    selectedLabel: normalizeOptionalText(raw.selectedLabel, 80),
+    emptyText: normalizeOptionalText(raw.emptyText, 160),
+    selectAllLabel: normalizeOptionalText(raw.selectAllLabel, 40),
+    clearLabel: normalizeOptionalText(raw.clearLabel, 40),
+    hidden: raw.hidden === true,
+  };
+  return Object.values(copy).some(Boolean) ? copy : undefined;
+}
+
+function normalizeUsageNoteField(value: unknown) {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as any;
+  const field = {
+    label: normalizeOptionalText(raw.label, 80),
+    placeholder: normalizeOptionalText(raw.placeholder, 180),
+  };
+  return Object.values(field).some(Boolean) ? field : undefined;
+}
+
+function normalizeUsageFooter(value: unknown) {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as any;
+  const footer = {
+    title: normalizeOptionalText(raw.title, 120),
+    description: normalizeOptionalText(raw.description, 240),
+    submitLabel: normalizeOptionalText(raw.submitLabel, 80),
+  };
+  return Object.values(footer).some(Boolean) ? footer : undefined;
+}
+
+function normalizeUsageOperationSelector(value: unknown): PluginUsageOperationSelector | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as any;
+  const seen = new Set<string>();
+  const options: PluginUsageOperationOption[] | undefined = Array.isArray(raw.options)
+    ? raw.options.slice(0, 12).flatMap((option: any) => {
+        const optionValue = normalizePluginId(option?.value).slice(0, 40);
+        if (!optionValue || seen.has(optionValue)) return [];
+        seen.add(optionValue);
+        return [{
+          value: optionValue,
+          label: String(option?.label || optionValue).trim().slice(0, 80) || optionValue,
+          description: normalizeOptionalText(option?.description, 180),
+        }];
+      })
+    : undefined;
+  const defaultValue = normalizePluginId(raw.defaultValue).slice(0, 40) || undefined;
+  const selector: PluginUsageOperationSelector = {
+    label: normalizeOptionalText(raw.label, 80),
+    description: normalizeOptionalText(raw.description, 240),
+    defaultValue: defaultValue && (!options?.length || options.some((option: PluginUsageOperationOption) => option.value === defaultValue)) ? defaultValue : undefined,
+    options,
+  };
+  return Object.values(selector).some((item) => Array.isArray(item) ? item.length > 0 : Boolean(item)) ? selector : undefined;
+}
+
+function normalizeUsageFields(value: unknown): PluginUsageFieldDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const allowedTypes = new Set<string>(PLUGIN_USAGE_FIELD_TYPES);
+  const seen = new Set<string>();
+  return value.slice(0, MAX_PLUGIN_FIELDS).flatMap((item: any) => {
+    const key = normalizePluginId(item?.key).slice(0, 80);
+    if (!key || seen.has(key)) return [];
+    const type = String(item?.type || "text").trim();
+    if (!allowedTypes.has(type)) return [];
+    seen.add(key);
+    const options: Array<{ value: string; label: string }> | undefined = Array.isArray(item?.options)
+      ? item.options.slice(0, 80).flatMap((option: any) => {
+          const optionValue = String(option?.value ?? "").trim().slice(0, 120);
+          if (!optionValue) return [];
+          return [{
+            value: optionValue,
+            label: String(option?.label || optionValue).trim().slice(0, 120) || optionValue,
+          }];
+        })
+      : undefined;
+    let defaultValue: PluginUsageFieldDefinition["defaultValue"];
+    if (type === "boolean") {
+      defaultValue = item?.defaultValue === true;
+    } else if (type === "multi-select") {
+      const allowed = new Set((options || []).map((option: { value: string }) => option.value));
+      defaultValue = Array.isArray(item?.defaultValue)
+        ? item.defaultValue.map((option: unknown) => String(option || "").trim()).filter((option: string) => !allowed.size || allowed.has(option)).slice(0, 80)
+        : [];
+    } else if (typeof item?.defaultValue === "string" || typeof item?.defaultValue === "number") {
+      defaultValue = String(item.defaultValue).slice(0, type === "textarea" ? 10000 : 1000);
+    }
+    return [{
+      key,
+      label: String(item?.label || key).trim().slice(0, 80) || key,
+      type: type as PluginUsageFieldDefinition["type"],
+      description: normalizeOptionalText(item?.description, 240),
+      placeholder: normalizeOptionalText(item?.placeholder, 180),
+      defaultValue,
+      options,
+      required: item?.required === true,
+    }];
+  });
+}
+
+function normalizePluginUsageViews(value: unknown): PluginUsageViewDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const allowedTypes = new Set<string>(PLUGIN_USAGE_VIEW_TYPES);
+  const seen = new Set<string>();
+  return value.slice(0, MAX_PLUGIN_USAGE_VIEWS).flatMap((item: any) => {
+    const id = normalizePluginId(item?.id).slice(0, 80);
+    if (!id || seen.has(id)) return [];
+    const type = String(item?.type || "").trim();
+    if (!allowedTypes.has(type)) return [];
+    seen.add(id);
+    return [{
+      id,
+      type: type as PluginUsageViewDefinition["type"],
+      title: String(item?.title || id).trim().slice(0, 120) || id,
+      description: normalizeOptionalText(item?.description, 300),
+      storageKey: normalizeUsageStorageKey(item?.storageKey),
+      hostScope: item?.hostScope === "all" ? "all" : "selected",
+      enableLabel: normalizeOptionalText(item?.enableLabel, 80),
+      targetDirectory: undefined,
+      assetMode: item?.assetMode === "all-plugin-assets" ? "all-plugin-assets" : "selected-assets",
+      preserveAssetPaths: item?.preserveAssetPaths === true,
+      disabledTitle: normalizeOptionalText(item?.disabledTitle, 100),
+      disabledDescription: normalizeOptionalText(item?.disabledDescription, 240),
+      hostSelector: normalizeUsageSelectorCopy(item?.hostSelector),
+      assetSelector: normalizeUsageSelectorCopy(item?.assetSelector),
+      operationSelector: normalizeUsageOperationSelector(item?.operationSelector),
+      fields: normalizeUsageFields(item?.fields),
+      noteField: normalizeUsageNoteField(item?.noteField),
+      footer: normalizeUsageFooter(item?.footer),
+    }];
+  });
+}
+
+function normalizePluginAssets(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  return value.slice(0, MAX_PLUGIN_ASSETS).flatMap((item: any) => {
+    let path = "";
+    try {
+      path = normalizeAssetPath(item?.path);
+    } catch {
+      return [];
+    }
+    if (!path || seen.has(path)) return [];
+    seen.add(path);
+    const maxBytes = Math.max(1, Math.min(MAX_PLUGIN_ASSET_BYTES, Math.floor(Number(item?.maxBytes || MAX_PLUGIN_ASSET_BYTES))));
+    return [{
+      path,
+      label: String(item?.label || path).trim().slice(0, 120) || path,
+      description: String(item?.description || "").trim().slice(0, 240) || undefined,
+      contentType: String(item?.contentType || "text/plain;charset=utf-8").trim().slice(0, 128) || "text/plain;charset=utf-8",
+      maxBytes,
+    }];
+  });
+}
+
+function normalizePluginData(value: unknown): ForwardxPluginManifest["data"] {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as any;
+  const type = raw.type === "generic" ? "generic" : undefined;
+  const repository = /^https:\/\/github\.com\/[^/\s]+\/[^/\s#?]+/i.test(String(raw.repository || "").trim())
+    ? String(raw.repository).trim().slice(0, 512)
+    : undefined;
+  const branch = String(raw.branch || "").trim().slice(0, 128) || undefined;
+  const autoDiscover = raw.autoDiscover === true;
+  const files = Array.isArray(raw.files)
+    ? raw.files.slice(0, MAX_PLUGIN_ASSETS).flatMap((item: unknown) => {
+        try {
+          return [normalizeAssetPath(item)];
+        } catch {
+          return [];
+        }
+      })
+    : undefined;
+  if (!type && !autoDiscover && (!files || files.length === 0)) return undefined;
+  return { type, repository, branch, autoDiscover, files };
+}
+
+function normalizePluginFeatures(value: unknown): PluginFeatureDescription[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, MAX_PLUGIN_FEATURES).flatMap((item: any) => {
+    const title = String(typeof item === "string" ? item : item?.title || "").trim().slice(0, 80);
+    if (!title) return [];
+    return [{
+      title,
+      description: typeof item === "string" ? undefined : String(item?.description || "").trim().slice(0, 180) || undefined,
+    }];
+  });
+}
+
+function normalizeStoreItem(input: any, options: {
+  official?: boolean;
+  defaultRepository?: string;
+  defaultPackageRepository?: string;
+  storeSourceId?: number;
+  storeSourceName?: string;
+} = {}): PluginStoreItem | null {
+  try {
+    const id = assertPluginId(input?.id);
+    const repository = String(input?.repository || options.defaultRepository || "").trim();
+    githubRepoParts(repository);
+    const packageRepository = String(input?.packageRepository || options.defaultPackageRepository || "").trim().slice(0, 512) || undefined;
+    if (packageRepository) githubRepoParts(packageRepository);
+    return {
+      id,
+      name: String(input?.name || id).trim().slice(0, 120) || id,
+      description: String(input?.description || "").trim().slice(0, 500) || "ForwardX 插件",
+      detailsMarkdown: normalizeOptionalText(input?.detailsMarkdown || input?.detailMarkdown || input?.longDescription, 5000),
+      features: normalizePluginFeatures(input?.features),
+      version: normalizeOptionalText(input?.version, 64),
+      releaseDate: normalizeDateText(input?.releaseDate),
+      updatedAt: normalizeDateText(input?.updatedAt),
+      changelog: normalizeOptionalText(input?.changelog, 1000),
+      tags: normalizeTags(input?.tags),
+      license: normalizeOptionalText(input?.license, 64),
+      repository,
+      branch: String(input?.branch || "main").trim().slice(0, 128) || "main",
+      manifestPath: String(input?.manifestPath || "forwardx-plugin.json").trim().slice(0, 256) || "forwardx-plugin.json",
+      homepage: String(input?.homepage || repository).trim().slice(0, 512) || repository,
+      author: String(input?.author || "ForwardX").trim().slice(0, 120) || "ForwardX",
+      logo: normalizeOptionalLogo(input?.logo),
+      packageRepository,
+      packageBranch: String(input?.packageBranch || "").trim().slice(0, 128) || undefined,
+      packageUrl: /^https?:\/\//i.test(String(input?.packageUrl || "").trim()) ? String(input.packageUrl).trim().slice(0, 512) : undefined,
+      packagePath: String(input?.packagePath || "").trim().replace(/\\/g, "/").replace(/^\/+/, "").slice(0, 256) || undefined,
+      bundledPath: input?.builtIn === true ? normalizeBundledPath(input?.bundledPath) : undefined,
+      category: (["data", "integration", "ui", "automation"].includes(String(input?.category))
+        ? String(input.category)
+        : "integration") as PluginStoreItem["category"],
+      permissions: uniqueValidPermissions(input?.permissions),
+      extensionPoints: uniqueValidExtensionPoints(input?.extensionPoints),
+      official: options.official ?? input?.official !== false,
+      builtIn: input?.builtIn === true,
+      storeSourceId: options.storeSourceId,
+      storeSourceName: options.storeSourceName,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeManifest(input: any, fallback?: Partial<ForwardxPluginManifest>): ForwardxPluginManifest {
+  const merged = { ...(fallback || {}), ...(input || {}) };
+  const id = assertPluginId(merged.id);
+  const name = String(merged.name || id).trim().slice(0, 120) || id;
+  const permissions = uniqueValidPermissions(merged.permissions);
+  const resourceSchemas = permissions.includes("ui:interactive") && permissions.includes("read:hosts")
+    ? normalizePluginResourceViews(merged.resourceSchemas ?? merged.resourceSchema ?? merged.resourceViews)
+    : [];
+  const manifest: ForwardxPluginManifest = {
+    ...DEFAULT_PLUGIN_MANIFEST,
+    schemaVersion: PLUGIN_MANIFEST_VERSION,
+    id,
+    name,
+    version: normalizeVersion(merged.version),
+    description: String(merged.description || "").trim().slice(0, 1000) || undefined,
+    detailsMarkdown: normalizeOptionalText(merged.detailsMarkdown || merged.detailMarkdown || merged.longDescription, 5000),
+    features: normalizePluginFeatures(merged.features),
+    author: String(merged.author || "").trim().slice(0, 120) || undefined,
+    logo: normalizeOptionalLogo(merged.logo),
+    releaseDate: normalizeDateText(merged.releaseDate),
+    updatedAt: normalizeDateText(merged.updatedAt),
+    changelog: normalizeOptionalText(merged.changelog, 2000),
+    tags: normalizeTags(merged.tags),
+    license: normalizeOptionalText(merged.license, 64),
+    homepage: String(merged.homepage || "").trim().slice(0, 512) || undefined,
+    repository: String(merged.repository || "").trim().slice(0, 512) || undefined,
+    minPanelVersion: String(merged.minPanelVersion || "").trim().slice(0, 64) || undefined,
+    permissions,
+    extensionPoints: uniqueValidExtensionPoints(merged.extensionPoints),
+    settingsSchema: normalizeSettingFields(merged.settingsSchema),
+    pages: normalizePluginPages(merged.pages),
+    sidebar: normalizePluginSidebar(merged.sidebar),
+    actions: normalizePluginActions(merged.actions),
+    usageViews: normalizePluginUsageViews(merged.usageViews),
+    resourceSchemas,
+    resourceViews: resourceSchemas,
+    assets: normalizePluginAssets(merged.assets),
+    data: normalizePluginData(merged.data),
+  };
+  return manifest;
+}
+
+export function normalizePluginManifest(input: unknown, fallback?: Partial<ForwardxPluginManifest>) {
+  return normalizeManifest(input, fallback);
+}
+
+function githubRepoParts(repository: string) {
+  const match = String(repository || "").trim().match(GITHUB_RE);
+  if (!match) throw new Error("当前仅支持 GitHub 仓库地址，例如 https://github.com/owner/repo");
+  return { owner: match[1], repo: match[2].replace(/\.git$/i, "") };
+}
+
+function githubRawUrl(repository: string, branch: string, filePath: string) {
+  const { owner, repo } = githubRepoParts(repository);
+  const cleanPath = String(filePath || "").replace(/^\/+/, "");
+  return `https://raw.githubusercontent.com/${owner}/${repo}/${encodeURIComponent(branch).replace(/%2F/g, "/")}/${cleanPath}`;
+}
+
+function githubArchiveUrl(repository: string, branch: string) {
+  const { owner, repo } = githubRepoParts(repository);
+  return `https://codeload.github.com/${owner}/${repo}/tar.gz/${encodeURIComponent(branch).replace(/%2F/g, "/")}`;
+}
+
+function githubTreeApiUrl(repository: string, branch: string) {
+  const { owner, repo } = githubRepoParts(repository);
+  return `https://api.github.com/repos/${owner}/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`;
+}
+
+async function fetchText(url: string, maxBytes = MAX_PLUGIN_ASSET_BYTES) {
+  await assertSafePluginHttpUrl(url);
+  const response = await fetch(url, withGithubAuth(url, {
+    headers: {
+      "User-Agent": "ForwardX-Plugin-Installer",
+      Accept: "application/json,text/plain,*/*",
+    },
+  }));
+  if (!response.ok) {
+    throw new Error(`请求失败 ${response.status}`);
+  }
+  if (response.url) await assertSafePluginHttpUrl(response.url);
+  const length = Number(response.headers.get("content-length") || 0);
+  if (length > maxBytes) throw new Error(`响应内容不能超过 ${Math.floor(maxBytes / 1024)}KB`);
+  const text = await response.text();
+  if (Buffer.byteLength(text, "utf8") > maxBytes) throw new Error(`响应内容不能超过 ${Math.floor(maxBytes / 1024)}KB`);
+  return text;
+}
+
+async function fetchBuffer(url: string) {
+  await assertSafePluginHttpUrl(url);
+  const response = await fetch(url, withGithubAuth(url, {
+    headers: {
+      "User-Agent": "ForwardX-Plugin-Installer",
+      Accept: "application/gzip,application/zip,application/octet-stream,*/*",
+    },
+  }));
+  if (!response.ok) {
+    throw new Error(`请求失败 ${response.status}`);
+  }
+  if (response.url) await assertSafePluginHttpUrl(response.url);
+  const length = Number(response.headers.get("content-length") || 0);
+  if (length > MAX_PLUGIN_PACKAGE_BYTES) {
+    throw new Error(`插件包不能超过 ${Math.floor(MAX_PLUGIN_PACKAGE_BYTES / 1024 / 1024)}MB`);
+  }
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (buffer.byteLength > MAX_PLUGIN_PACKAGE_BYTES) {
+    throw new Error(`插件包不能超过 ${Math.floor(MAX_PLUGIN_PACKAGE_BYTES / 1024 / 1024)}MB`);
+  }
+  return buffer;
+}
+
+function contentTypeForPath(assetPath: string) {
+  const lower = assetPath.toLowerCase();
+  if (lower.endsWith(".json")) return "application/json;charset=utf-8";
+  if (lower.endsWith(".md")) return "text/markdown;charset=utf-8";
+  if (lower.endsWith(".tsv")) return "text/tab-separated-values;charset=utf-8";
+  if (lower.endsWith(".csv")) return "text/csv;charset=utf-8";
+  if (lower.endsWith(".yaml") || lower.endsWith(".yml")) return "application/yaml;charset=utf-8";
+  return "text/plain;charset=utf-8";
+}
+
+function extensionOfPath(assetPath: string) {
+  const name = assetPath.split("/").pop() || "";
+  const index = name.lastIndexOf(".");
+  return index >= 0 ? name.slice(index).toLowerCase() : "";
+}
+
+function isDataAssetCandidate(assetPath: string, size = 0) {
+  const cleanPath = assetPath.replace(/\\/g, "/").replace(/^\/+/, "");
+  const lower = cleanPath.toLowerCase();
+  if (!lower || lower.includes("..") || lower.startsWith(".")) return false;
+  if (SKIPPED_DATA_PATH_PREFIXES.some((prefix) => lower.startsWith(prefix))) return false;
+  if (!AUTO_DISCOVER_DATA_ROOTS.some((root) => lower.startsWith(root))) return false;
+  if (!DATA_ASSET_EXTENSIONS.has(extensionOfPath(lower))) return false;
+  if (size > MAX_PLUGIN_ASSET_BYTES) return false;
+  return true;
+}
+
+function isPackageAssetCandidate(assetPath: string, size = 0) {
+  const cleanPath = assetPath.replace(/\\/g, "/").replace(/^\/+/, "");
+  const lower = cleanPath.toLowerCase();
+  if (!lower || lower.includes("..") || lower.startsWith(".")) return false;
+  if (SKIPPED_DATA_PATH_PREFIXES.some((prefix) => lower.startsWith(prefix))) return false;
+  if (PACKAGE_MANIFEST_CANDIDATES.includes(lower)) return false;
+  if (!PACKAGE_ASSET_EXTENSIONS.has(extensionOfPath(lower))) return false;
+  if (size > MAX_PLUGIN_ASSET_BYTES) return false;
+  return true;
+}
+
+function isHostSyncAssetCandidate(assetPath: string, size = 0) {
+  const lower = assetPath.replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
+  if (lower === "source.json" || lower === "package.json") return false;
+  return isPackageAssetCandidate(assetPath, size) || isDataAssetCandidate(assetPath, size);
+}
+
+function normalizePackageEntryPath(rawPath: string) {
+  const normalized = rawPath
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/")
+    .trim();
+  const lower = normalized.toLowerCase();
+  if (!normalized || normalized.includes("..") || /[\u0000-\u001f]/.test(normalized)) return "";
+  if (normalized.startsWith(".") && !PACKAGE_MANIFEST_CANDIDATES.includes(lower)) return "";
+  const parts = normalized.split("/").filter(Boolean);
+  return parts.join("/");
+}
+
+function normalizeBundledPath(value: unknown) {
+  const clean = String(value || "")
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/")
+    .trim();
+  if (!clean || clean.includes("..") || clean.startsWith(".") || /[\u0000-\u001f]/.test(clean)) return undefined;
+  const pathValue = clean.startsWith("plugins/") ? clean : `plugins/${clean}`;
+  return pathValue.slice(0, 256);
+}
+
+function resolveBundledPluginDir(bundledPath: string) {
+  const clean = normalizeBundledPath(bundledPath);
+  if (!clean) throw new Error("内置插件路径不合法");
+  const resolved = path.resolve(process.cwd(), clean);
+  const root = BUNDLED_PLUGIN_ROOT;
+  if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) {
+    throw new Error("内置插件路径不在 plugins 目录内");
+  }
+  return { dir: resolved, path: clean };
+}
+
+async function availableBundledPath(bundledPath: string | undefined | null) {
+  if (!bundledPath) return undefined;
+  try {
+    const bundled = resolveBundledPluginDir(bundledPath);
+    await fs.access(path.join(bundled.dir, "forwardx-plugin.json"));
+    return bundled.path;
+  } catch {
+    return undefined;
+  }
+}
+
+function readZipPackage(buffer: Buffer): PluginPackageFile[] {
+  const files: PluginPackageFile[] = [];
+  let offset = 0;
+  while (offset + 30 <= buffer.length && files.length < MAX_PLUGIN_PACKAGE_FILES) {
+    const signature = buffer.readUInt32LE(offset);
+    if (signature !== 0x04034b50) break;
+    const flags = buffer.readUInt16LE(offset + 6);
+    const method = buffer.readUInt16LE(offset + 8);
+    const compressedSize = buffer.readUInt32LE(offset + 18);
+    const uncompressedSize = buffer.readUInt32LE(offset + 22);
+    const fileNameLength = buffer.readUInt16LE(offset + 26);
+    const extraLength = buffer.readUInt16LE(offset + 28);
+    if (flags & 0x08) throw new Error("插件 ZIP 暂不支持 data descriptor 格式");
+    const nameStart = offset + 30;
+    const nameEnd = nameStart + fileNameLength;
+    const dataStart = nameEnd + extraLength;
+    const dataEnd = dataStart + compressedSize;
+    if (nameEnd > buffer.length || dataEnd > buffer.length) throw new Error("插件 ZIP 内容不完整");
+    const entryPath = normalizePackageEntryPath(buffer.slice(nameStart, nameEnd).toString("utf8"));
+    offset = dataEnd;
+    if (!entryPath || entryPath.endsWith("/")) continue;
+    if (uncompressedSize > MAX_PLUGIN_ASSET_BYTES && !PACKAGE_MANIFEST_CANDIDATES.includes(entryPath.toLowerCase())) continue;
+    const compressed = buffer.slice(dataStart, dataEnd);
+    let content: Buffer;
+    if (method === 0) {
+      content = compressed;
+    } else if (method === 8) {
+      content = zlib.inflateRawSync(compressed);
+    } else {
+      continue;
+    }
+    if (content.byteLength !== uncompressedSize) throw new Error(`插件 ZIP 文件大小校验失败: ${entryPath}`);
+    files.push({ path: entryPath, content });
+  }
+  return files;
+}
+
+function readTarGzPackage(buffer: Buffer): PluginPackageFile[] {
+  const tar = zlib.gunzipSync(buffer, { maxOutputLength: MAX_PLUGIN_PACKAGE_BYTES * 8 });
+  const files: PluginPackageFile[] = [];
+  let offset = 0;
+  while (offset + 512 <= tar.length && files.length < MAX_PLUGIN_PACKAGE_FILES) {
+    const header = tar.slice(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+    const rawName = header.slice(0, 100).toString("utf8").replace(/\0.*$/, "");
+    const rawPrefix = header.slice(345, 500).toString("utf8").replace(/\0.*$/, "");
+    const typeFlag = header.slice(156, 157).toString("utf8") || "0";
+    const sizeText = header.slice(124, 136).toString("utf8").replace(/\0.*$/, "").trim();
+    const size = Number.parseInt(sizeText || "0", 8) || 0;
+    const dataStart = offset + 512;
+    const dataEnd = dataStart + size;
+    if (dataEnd > tar.length) throw new Error("插件 tar.gz 内容不完整");
+    const entryPath = normalizePackageEntryPath(rawPrefix ? `${rawPrefix}/${rawName}` : rawName);
+    if ((typeFlag === "0" || typeFlag === "\0") && entryPath) {
+      files.push({ path: entryPath, content: tar.slice(dataStart, dataEnd) });
+    }
+    offset = dataStart + Math.ceil(size / 512) * 512;
+  }
+  return files;
+}
+
+function readPluginPackage(buffer: Buffer, fileName = "") {
+  if (buffer.byteLength <= 0) throw new Error("插件包为空");
+  if (buffer.byteLength > MAX_PLUGIN_PACKAGE_BYTES) {
+    throw new Error(`插件包不能超过 ${Math.floor(MAX_PLUGIN_PACKAGE_BYTES / 1024 / 1024)}MB`);
+  }
+  const lowerName = fileName.toLowerCase();
+  if (buffer.slice(0, 2).toString("hex") === "504b" || lowerName.endsWith(".zip")) {
+    return readZipPackage(buffer);
+  }
+  if (buffer.slice(0, 2).toString("hex") === "1f8b" || lowerName.endsWith(".tar.gz") || lowerName.endsWith(".tgz")) {
+    return readTarGzPackage(buffer);
+  }
+  throw new Error("插件包仅支持 .zip、.tar.gz 或 .tgz");
+}
+
+function stripPackageRoot(files: PluginPackageFile[]) {
+  if (!files.length) return files;
+  if (files.some((file) => PACKAGE_MANIFEST_CANDIDATES.includes(file.path.toLowerCase()))) return files;
+  const firstSegments = Array.from(new Set(files.map((file) => file.path.split("/")[0]).filter(Boolean)));
+  if (firstSegments.length !== 1) return files;
+  const root = `${firstSegments[0]}/`;
+  const stripped = files.flatMap((file) => {
+    if (!file.path.startsWith(root)) return [];
+    const path = file.path.slice(root.length);
+    return path ? [{ ...file, path }] : [];
+  });
+  return stripped.some((file) => PACKAGE_MANIFEST_CANDIDATES.includes(file.path.toLowerCase())) ? stripped : files;
+}
+
+function pluginPackageManifest(files: PluginPackageFile[]) {
+  for (const candidate of PACKAGE_MANIFEST_CANDIDATES) {
+    const file = files.find((item) => item.path.toLowerCase() === candidate);
+    if (file) {
+      try {
+        return { manifest: JSON.parse(file.content.toString("utf8")), path: file.path };
+      } catch {
+        throw new Error(`${file.path} 不是有效 JSON`);
+      }
+    }
+  }
+  throw new Error("插件包内未找到 forwardx-plugin.json");
+}
+
+async function collectLocalPluginFiles(rootDir: string, relativeDir = ""): Promise<PluginPackageFile[]> {
+  let entries: any[];
+  try {
+    entries = await fs.readdir(path.join(rootDir, relativeDir), { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const files: PluginPackageFile[] = [];
+  for (const entry of entries) {
+    if (files.length >= MAX_PLUGIN_PACKAGE_FILES) break;
+    const relativePath = normalizeAssetPath(path.posix.join(relativeDir.replace(/\\/g, "/"), String(entry.name)));
+    if (entry.isDirectory()) {
+      files.push(...await collectLocalPluginFiles(rootDir, relativePath));
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    const lower = relativePath.toLowerCase();
+    if (!PACKAGE_MANIFEST_CANDIDATES.includes(lower) && !isPackageAssetCandidate(relativePath) && !isDataAssetCandidate(relativePath)) continue;
+    const fullPath = path.join(rootDir, relativePath);
+    const stat = await fs.stat(fullPath);
+    if (!PACKAGE_MANIFEST_CANDIDATES.includes(lower) && stat.size > MAX_PLUGIN_ASSET_BYTES) continue;
+    files.push({ path: relativePath, content: await fs.readFile(fullPath) });
+  }
+  return files;
+}
+
+async function localBundledPluginFiles(bundledPath: string) {
+  const bundled = resolveBundledPluginDir(bundledPath);
+  const files = await collectLocalPluginFiles(bundled.dir);
+  if (!files.some((file) => file.path === "forwardx-plugin.json")) {
+    throw new Error(`内置插件文件缺失: ${bundled.path}`);
+  }
+  return files;
+}
+
+async function syncBundledPluginAssets(pluginId: string, bundledPath: string): Promise<AssetSyncResult> {
+  const files = await localBundledPluginFiles(bundledPath);
+  const dataFiles = files
+    .filter((file) => isDataAssetCandidate(file.path, file.content.byteLength))
+    .sort((a, b) => a.path.localeCompare(b.path, "zh-Hans-CN"))
+    .slice(0, MAX_PLUGIN_ASSETS);
+  const result: AssetSyncResult = {
+    total: dataFiles.length,
+    synced: 0,
+    skipped: 0,
+    paths: [],
+    errors: [],
+  };
+  for (const file of dataFiles) {
+    try {
+      await upsertPluginAsset(pluginId, file.path, file.content.toString("utf8"), contentTypeForPath(file.path));
+      result.synced += 1;
+      result.paths.push(file.path);
+    } catch (error) {
+      result.skipped += 1;
+      const message = error instanceof Error ? error.message : String(error);
+      result.errors.push(`${file.path}: ${message}`);
+      warnPluginThrottled(`local-sync:${pluginId}:${file.path}`, `[Plugin] local asset sync skipped plugin=${pluginId} path=${file.path}: ${message}`);
+    }
+  }
+  await prunePluginDataAssets(pluginId, result.paths);
+  return result;
+}
+
+async function fetchGithubTree(repository: string, branch: string): Promise<GithubTreeItem[]> {
+  const text = await fetchText(githubTreeApiUrl(repository, branch));
+  const parsed = JSON.parse(text);
+  if (!Array.isArray(parsed?.tree)) return [];
+  return parsed.tree;
+}
+
+async function discoverGithubDataAssets(repository: string, branch: string) {
+  try {
+    const tree = await fetchGithubTree(repository, branch);
+    return tree
+      .filter((item) => item?.type === "blob" && isDataAssetCandidate(String(item.path || ""), Number(item.size || 0)))
+      .map((item) => normalizeAssetPath(item.path))
+      .sort((a, b) => a.localeCompare(b, "zh-Hans-CN"))
+      .slice(0, MAX_PLUGIN_ASSETS);
+  } catch (error) {
+    console.warn(`[Plugin] data asset discovery skipped repository=${repository}: ${error instanceof Error ? error.message : String(error)}`);
+    return [];
+  }
+}
+
+async function tryFetchGithubManifest(repository: string, branch: string, preferredPath?: string | null) {
+  const candidates = Array.from(new Set([preferredPath, ...MANIFEST_CANDIDATES].filter(Boolean).map(String)));
+  const errors: string[] = [];
+  for (const filePath of candidates) {
+    try {
+      const text = await fetchText(githubRawUrl(repository, branch, filePath));
+      return { manifest: JSON.parse(text), path: filePath };
+    } catch (error) {
+      errors.push(`${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  throw new Error(`未找到插件 manifest (${errors.join("; ")})`);
+}
+
+async function fetchOfficialStoreItems(force = false): Promise<PluginStoreItem[]> {
+  if (force) officialStoreCache = null;
+  if (officialStoreCache && Date.now() - officialStoreCache.checkedAt < OFFICIAL_STORE_CACHE_TTL_MS) {
+    return officialStoreCache.items;
+  }
+  if (officialStoreFetchInFlight) return officialStoreFetchInFlight;
+  officialStoreFetchInFlight = (async () => {
+  try {
+    const text = await fetchText(githubRawUrl(FORWARDX_REPO_URL, "main", OFFICIAL_STORE_PATH));
+    const parsed = JSON.parse(text);
+    const items = Array.isArray(parsed?.items) ? parsed.items : [];
+    const normalized = items.flatMap((item: any) => {
+      const next = normalizeStoreItem(item, { official: true });
+      return next ? [next] : [];
+    });
+    const result = normalized.length ? normalized : BUILTIN_PLUGIN_STORE_ITEMS;
+    officialStoreCache = { items: result, checkedAt: Date.now() };
+    return result;
+  } catch (error) {
+    warnPluginThrottled("official-store", `[Plugin] official store fallback: ${error instanceof Error ? error.message : String(error)}`);
+    officialStoreCache = { items: BUILTIN_PLUGIN_STORE_ITEMS, checkedAt: Date.now() };
+    return BUILTIN_PLUGIN_STORE_ITEMS;
+  } finally {
+    officialStoreFetchInFlight = null;
+  }
+  })();
+  return officialStoreFetchInFlight;
+}
+
+function canonicalGithubRepository(value: unknown) {
+  const { owner, repo } = githubRepoParts(String(value || "").trim());
+  return `https://github.com/${owner}/${repo}`;
+}
+
+function normalizePluginStoreSourceRow(row: any) {
+  const items = parseJson<PluginStoreItem[]>(row?.itemsJson, []);
+  return {
+    ...row,
+    branch: String(row?.branch || "main"),
+    catalogPath: String(row?.catalogPath || DEFAULT_THIRD_PARTY_STORE_PATH),
+    pluginCount: Array.isArray(items) ? items.length : 0,
+  };
+}
+
+function pluginStoreSourceSummary(source: any) {
+  const { itemsJson: _itemsJson, ...summary } = source || {};
+  return summary;
+}
+
+async function pluginStoreSourceById(id: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const rows = await db.select().from(pluginStoreSources).where(eq(pluginStoreSources.id, id)).limit(1);
+  return rows[0] ? normalizePluginStoreSourceRow(rows[0]) : undefined;
+}
+
+export function normalizePluginStoreCatalog(parsed: any, source: any) {
+  const repository = canonicalGithubRepository(source.repository);
+  const branch = String(source.branch || "main").trim().slice(0, 128) || "main";
+  const catalogPath = normalizeAssetPath(source.catalogPath || DEFAULT_THIRD_PARTY_STORE_PATH);
+  const rawItems = Array.isArray(parsed?.items) ? parsed.items : Array.isArray(parsed?.plugins) ? parsed.plugins : null;
+  if (!rawItems) throw new Error("第三方商店配置必须包含 items 或 plugins 数组");
+  const parts = githubRepoParts(repository);
+  const fallbackName = `${parts.owner}/${parts.repo}`;
+  const name = String(parsed?.name || fallbackName).trim().slice(0, 120) || fallbackName;
+  const items = rawItems.slice(0, MAX_PLUGIN_STORE_ITEMS_PER_SOURCE).flatMap((item: any) => {
+    const normalized = normalizeStoreItem(item, {
+      official: false,
+      defaultRepository: repository,
+      defaultPackageRepository: repository,
+      storeSourceId: Number(source.id),
+      storeSourceName: name,
+    });
+    return normalized ? [normalized] : [];
+  });
+  if (rawItems.length > 0 && items.length === 0) throw new Error("第三方商店配置中没有合法的插件条目");
+  return { name, repository, branch, catalogPath, items };
+}
+
+async function fetchPluginStoreSourceCatalog(source: any) {
+  const repository = canonicalGithubRepository(source.repository);
+  const branch = String(source.branch || "main").trim().slice(0, 128) || "main";
+  const catalogPath = normalizeAssetPath(source.catalogPath || DEFAULT_THIRD_PARTY_STORE_PATH);
+  const text = await fetchText(githubRawUrl(repository, branch, catalogPath));
+  try {
+    return normalizePluginStoreCatalog(JSON.parse(text), { ...source, repository, branch, catalogPath });
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new Error(`${catalogPath} 不是有效 JSON`);
+    throw error;
+  }
+}
+
+export async function listPluginStoreSources() {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db.select().from(pluginStoreSources);
+  return rows.map(normalizePluginStoreSourceRow).map(pluginStoreSourceSummary).sort((a: any, b: any) => Number(a.id) - Number(b.id));
+}
+
+export async function refreshPluginStoreSource(sourceId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const source = await pluginStoreSourceById(sourceId);
+  if (!source) throw new Error("第三方商店来源不存在");
+  try {
+    const catalog = await fetchPluginStoreSourceCatalog(source);
+    await db.update(pluginStoreSources).set({
+      name: catalog.name,
+      repository: catalog.repository,
+      branch: catalog.branch,
+      catalogPath: catalog.catalogPath,
+      itemsJson: JSON.stringify(catalog.items),
+      lastSyncedAt: nowDate(),
+      lastError: null,
+      updatedAt: nowDate(),
+    } as any).where(eq(pluginStoreSources.id, sourceId));
+    return pluginStoreSourceSummary(await pluginStoreSourceById(sourceId));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await db.update(pluginStoreSources).set({ lastError: message.slice(0, 1000), updatedAt: nowDate() } as any).where(eq(pluginStoreSources.id, sourceId));
+    throw error;
+  }
+}
+
+export async function addPluginStoreSources(repositories: string[]) {
+  const invalidResults: Array<{ repository: string; status: "failed"; error: string }> = [];
+  const canonicalRepositories: string[] = [];
+  for (const value of Array.from(new Set(repositories.map((item) => String(item || "").trim()).filter(Boolean))).slice(0, MAX_PLUGIN_STORE_SOURCES)) {
+    try {
+      canonicalRepositories.push(canonicalGithubRepository(value));
+    } catch (error) {
+      invalidResults.push({ repository: value, status: "failed", error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  const uniqueRepositories = Array.from(new Set(canonicalRepositories));
+  if (!uniqueRepositories.length) return invalidResults;
+  const existing = await listPluginStoreSources();
+  const newCount = uniqueRepositories.filter((repository) => !existing.some((source: any) => source.repository === repository)).length;
+  if (existing.length + newCount > MAX_PLUGIN_STORE_SOURCES) throw new Error(`第三方商店来源不能超过 ${MAX_PLUGIN_STORE_SOURCES} 个`);
+  const syncedResults = await mapWithConcurrency(uniqueRepositories, PLUGIN_STORE_SYNC_CONCURRENCY, async (repository) => {
+    let source = existing.find((item: any) => item.repository === repository && item.branch === "main" && item.catalogPath === DEFAULT_THIRD_PARTY_STORE_PATH);
+    let status: "added" | "existing" = "existing";
+    try {
+      if (!source) {
+        const parts = githubRepoParts(repository);
+        const id = await insertAndGetId("plugin_store_sources", {
+          name: `${parts.owner}/${parts.repo}`,
+          repository,
+          branch: "main",
+          catalogPath: DEFAULT_THIRD_PARTY_STORE_PATH,
+          itemsJson: "[]",
+          createdAt: nowDate(),
+          updatedAt: nowDate(),
+        });
+        source = await pluginStoreSourceById(id);
+        status = "added";
+      }
+      const synced = await refreshPluginStoreSource(Number(source.id));
+      return { repository, status, source: synced };
+    } catch (error) {
+      return { repository, status: "failed" as const, source: pluginStoreSourceSummary(source), error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+  return [...syncedResults, ...invalidResults];
+}
+
+export async function deletePluginStoreSource(sourceId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const source = await pluginStoreSourceById(sourceId);
+  if (!source) throw new Error("第三方商店来源不存在");
+  await db.delete(pluginStoreSources).where(eq(pluginStoreSources.id, sourceId));
+  return { success: true };
+}
+
+function cachedThirdPartyStoreItems(sources: any[]) {
+  return sources.flatMap((source) => {
+    const items = parseJson<PluginStoreItem[]>(source?.itemsJson, []);
+    if (!Array.isArray(items)) return [];
+    return items.map((item) => ({
+      ...item,
+      official: false,
+      builtIn: false,
+      storeSourceId: Number(source.id),
+      storeSourceName: String(source.name || source.repository),
+    }));
+  });
+}
+
+export async function refreshPluginStoreItems() {
+  const sources = await listPluginStoreSources();
+  const [official, sourceResults] = await Promise.all([
+    fetchOfficialStoreItems(true)
+      .then((items) => ({ ok: true as const, count: items.length }))
+      .catch((error) => ({ ok: false as const, count: 0, error: error instanceof Error ? error.message : String(error) })),
+    mapWithConcurrency(sources, PLUGIN_STORE_SYNC_CONCURRENCY, async (source: any) => {
+      try {
+        const synced = await refreshPluginStoreSource(Number(source.id));
+        return { id: Number(source.id), name: String(source.name), ok: true as const, count: Number(synced?.pluginCount || 0) };
+      } catch (error) {
+        return { id: Number(source.id), name: String(source.name), ok: false as const, count: Number(source.pluginCount || 0), error: error instanceof Error ? error.message : String(error) };
+      }
+    }),
+  ]);
+  return { official, sources: sourceResults, items: await getPluginStoreItems() };
+}
+
+async function findStoreFallbackItem(input: { id?: string | null; repository?: string | null }) {
+  const repository = String(input.repository || "").trim();
+  const id = String(input.id || "").trim();
+  const candidates = await getPluginStoreItems();
+  return candidates.find((item) => (id && item.id === id) || (repository && item.repository === repository));
+}
+
+async function bundledPathForPlugin(plugin: any) {
+  const sourcePath = normalizeBundledPath(plugin?.sourceUrl);
+  if (plugin?.sourceType === "local" && sourcePath) return await availableBundledPath(sourcePath);
+  const storeItem = await findStoreFallbackItem({
+    id: plugin?.pluginId,
+    repository: plugin?.manifest?.data?.repository || plugin?.repository || plugin?.sourceUrl,
+  });
+  if (storeItem?.packageUrl || storeItem?.packagePath) return undefined;
+  return await availableBundledPath(storeItem?.bundledPath);
+}
+
+function builtinFallbackManifest(storeItem: PluginStoreItem): ForwardxPluginManifest {
+  if (storeItem.id === LIVE2D_WIDGET_PLUGIN_ID) {
+    return normalizeManifest({
+      id: LIVE2D_WIDGET_PLUGIN_ID,
+      name: storeItem.name,
+      version: storeItem.version || "1.0.0",
+      description: storeItem.description,
+      detailsMarkdown: storeItem.detailsMarkdown,
+      features: storeItem.features,
+      author: storeItem.author,
+      releaseDate: storeItem.releaseDate,
+      updatedAt: storeItem.updatedAt,
+      changelog: storeItem.changelog,
+      tags: storeItem.tags,
+      license: storeItem.license,
+      homepage: storeItem.homepage,
+      repository: storeItem.packageRepository || storeItem.repository,
+      permissions: ["ui:widget", "ui:settings"],
+      extensionPoints: ["ui.widget", "settings.panel"],
+      settingsSchema: LIVE2D_WIDGET_SETTINGS_SCHEMA,
+      pages: [{
+        id: "overview",
+        title: "许可证与资源说明",
+        contentType: "markdown",
+        content: "本插件适配 stevenjoezhang/live2d-widget；运行时代码按 GPL-3.0-or-later 发布。ForwardX 不内置模型，模型资源请按所选仓库的许可使用。",
+      }],
+    });
+  }
+  return normalizeManifest({
+    id: storeItem.id,
+    name: storeItem.name,
+    version: storeItem.version || "0.0.0",
+    description: storeItem.description,
+    detailsMarkdown: storeItem.detailsMarkdown,
+    features: storeItem.features,
+    author: storeItem.author || "poouo",
+    logo: storeItem.logo,
+    releaseDate: storeItem.releaseDate,
+    updatedAt: storeItem.updatedAt,
+    changelog: storeItem.changelog,
+    tags: storeItem.tags,
+    license: storeItem.license,
+    homepage: storeItem.homepage,
+    repository: storeItem.packageRepository || storeItem.repository,
+    permissions: storeItem.permissions,
+    extensionPoints: storeItem.extensionPoints,
+    sidebar: storeItem.permissions.includes("ui:page") && storeItem.extensionPoints.includes("sidebar.page")
+      ? { label: storeItem.name, target: "usage" }
+      : undefined,
+    pages: [
+      {
+        id: "overview",
+        title: "插件说明",
+        contentType: "markdown",
+        content: "该插件由 ForwardX 内置适配，用于按主机管理中国区域白名单规则和实时状态。",
+      },
+    ],
+    actions: [
+      {
+        id: "read-agent-status",
+        label: "读取主机状态",
+        type: "agent.request",
+        description: "从已选主机读取实际白名单配置、防火墙后端、规则数量和持久化状态。",
+        agent: {
+          executor: "script",
+          interpreter: "bash",
+          target: "usage-hosts",
+          usageViewId: "sync-to-hosts",
+          entry: "forwardx-agent-run.sh",
+          arguments: ["status-json"],
+          timeoutMs: 15000,
+          outputType: "json",
+        },
+      },
+      {
+        id: "refresh-whitelist-source",
+        label: "刷新插件数据",
+        type: "data.asset.refresh",
+        description: "从插件源重新同步 data 目录中的数据文件。",
+        confirmRequired: true,
+      },
+    ],
+    usageViews: [
+      {
+        id: "sync-to-hosts",
+        type: "host-asset-sync",
+        storageKey: "chinaRegionWhitelistUsage",
+        title: "中国区域白名单",
+        description: "插件资源自动同步到所有 Agent；选择左侧主机后，可独立管理该主机的白名单规则。",
+        hostScope: "all",
+        enableLabel: "启用",
+        targetDirectory: "/var/lib/forwardx-agent/plugins/china-region-whitelist",
+        assetMode: "all-plugin-assets",
+        preserveAssetPaths: true,
+        assetSelector: { hidden: true },
+      },
+    ],
+    data: {
+      type: "generic",
+      repository: storeItem.packageRepository || FORWARDX_REPO_URL,
+      branch: storeItem.packageBranch || storeItem.branch || "main",
+      autoDiscover: true,
+    },
+  });
+}
+
+function serializeManifest(manifest: ForwardxPluginManifest) {
+  return JSON.stringify(manifest, null, 2);
+}
+
+function sha256(value: string | Buffer) {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+async function upsertPlugin(manifest: ForwardxPluginManifest, source: {
+  sourceType: "github" | "upload" | "local";
+  sourceUrl?: string | null;
+  branch?: string | null;
+  manifestPath?: string | null;
+}) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const builtin = BUILTIN_PLUGIN_STORE_ITEMS.find((item) => item.id === manifest.id);
+  if (builtin) {
+    const trustedRepository = String(builtin.packageRepository || builtin.repository || "").trim();
+    const trustedSource = source.sourceType === "local"
+      || (source.sourceType === "github" && !!trustedRepository && source.sourceUrl === trustedRepository);
+    if (!trustedSource) {
+      throw new Error(`插件 ID ${manifest.id} 是内置插件保留标识，不能由第三方包覆盖`);
+    }
+  }
+  const now = nowDate();
+  const existing = await db.select().from(plugins).where(eq(plugins.pluginId, manifest.id)).limit(1);
+  let existingManifest: ForwardxPluginManifest | null = null;
+  if (existing[0]) {
+    existingManifest = parseJson<ForwardxPluginManifest>(existing[0].manifestJson, {} as ForwardxPluginManifest);
+    if (existingManifest?.settingsValues && typeof existingManifest.settingsValues === "object" && !(manifest as any).settingsValues) {
+      (manifest as any).settingsValues = existingManifest.settingsValues;
+    }
+  }
+  const preserveExistingTrust = shouldPreservePluginTrust(existingManifest, manifest);
+  const payload = {
+    pluginId: manifest.id,
+    name: manifest.name,
+    version: manifest.version,
+    description: manifest.description || null,
+    author: manifest.author || null,
+    homepage: manifest.homepage || null,
+    repository: manifest.repository || source.sourceUrl || null,
+    sourceType: source.sourceType,
+    sourceUrl: source.sourceUrl || null,
+    branch: source.branch || null,
+    manifestPath: source.manifestPath || null,
+    manifestJson: serializeManifest(manifest),
+    permissionsJson: JSON.stringify(manifest.permissions || []),
+    extensionPointsJson: JSON.stringify(manifest.extensionPoints || []),
+    status: existing[0]?.status || "disabled",
+    trusted: preserveExistingTrust && (existing[0]?.trusted === true || Number(existing[0]?.trusted || 0) === 1),
+    installedAt: existing[0]?.installedAt || now,
+    updatedAt: now,
+    lastError: null,
+  } as any;
+  if (existing[0]) {
+    await db.update(plugins).set(payload).where(eq(plugins.pluginId, manifest.id));
+    return existing[0].id;
+  }
+  return await insertAndGetId("plugins", payload);
+}
+
+async function upsertPluginAsset(pluginId: string, assetPath: string, content: string, contentType = "text/plain;charset=utf-8") {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const cleanPath = normalizeAssetPath(assetPath);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const size = Buffer.byteLength(content, "utf8");
+  if (size > MAX_PLUGIN_ASSET_BYTES) {
+    throw new Error(`插件资产 ${cleanPath} 不能超过 ${Math.floor(MAX_PLUGIN_ASSET_BYTES / 1024)}KB`);
+  }
+  const hash = sha256(content);
+  if (getDatabaseKind() === "sqlite") {
+    await executeRaw(
+      "INSERT INTO plugin_assets (pluginId, path, contentType, size, sha256, content, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(pluginId, path) DO UPDATE SET contentType=excluded.contentType, size=excluded.size, sha256=excluded.sha256, content=excluded.content, updatedAt=excluded.updatedAt",
+      [pluginId, cleanPath, contentType, size, hash, content, nowSec, nowSec],
+    );
+  } else if (getDatabaseKind() === "postgresql") {
+    await executeRaw(
+      'INSERT INTO plugin_assets ("pluginId", path, "contentType", size, sha256, content, "createdAt", "updatedAt") VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT ("pluginId", path) DO UPDATE SET "contentType"=excluded."contentType", size=excluded.size, sha256=excluded.sha256, content=excluded.content, "updatedAt"=excluded."updatedAt"',
+      [pluginId, cleanPath, contentType, size, hash, content, nowSec, nowSec],
+    );
+  } else {
+    await executeRaw(
+      "INSERT INTO plugin_assets (pluginId, path, contentType, size, sha256, content, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE contentType=VALUES(contentType), size=VALUES(size), sha256=VALUES(sha256), content=VALUES(content), updatedAt=VALUES(updatedAt)",
+      [pluginId, cleanPath, contentType, size, hash, content, nowSec, nowSec],
+    );
+  }
+}
+
+function pluginAgentStateEpoch(value: unknown, fallback = Math.floor(Date.now() / 1000)) {
+  const time = value ? new Date(value as any).getTime() : NaN;
+  return Number.isFinite(time) ? Math.floor(time / 1000) : fallback;
+}
+
+function pluginAgentStateData(value: unknown) {
+  if (value === undefined) return null;
+  try {
+    const encoded = JSON.stringify(value);
+    return Buffer.byteLength(encoded, "utf8") <= 256 * 1024 ? encoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function pluginAgentResultEffective(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (record.applied === true || record.effective === true) return true;
+  const status = String(record.status || "").trim().toLowerCase();
+  if (["applied", "effective", "active"].includes(status)) return true;
+  const items = Array.isArray(record.items) ? record.items : [];
+  return items.length > 0 && items.every((item) => pluginAgentResultEffective(item));
+}
+
+async function upsertQueuedPluginAgentState(input: {
+  pluginId: string;
+  resourceViewId: string;
+  pluginVersion: string;
+  actionId: string;
+  groupId: string;
+  taskId: string;
+  hostId: number;
+  status: string;
+  createdAt: string;
+}) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const createdAt = pluginAgentStateEpoch(input.createdAt, nowSec);
+  const values = [
+    input.pluginId,
+    input.resourceViewId,
+    input.hostId,
+    input.pluginVersion || null,
+    input.actionId,
+    input.groupId,
+    input.taskId,
+    input.status,
+    null,
+    null,
+    null,
+    null,
+    null,
+    createdAt,
+    nowSec,
+  ];
+  if (getDatabaseKind() === "sqlite") {
+    await executeRaw(
+      "INSERT INTO plugin_agent_states (pluginId, resourceViewId, hostId, pluginVersion, actionId, groupId, taskId, status, dataJson, output, error, startedAt, finishedAt, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(pluginId, resourceViewId, hostId) DO UPDATE SET pluginVersion=excluded.pluginVersion, actionId=excluded.actionId, groupId=excluded.groupId, taskId=excluded.taskId, status=excluded.status, output=NULL, error=NULL, startedAt=NULL, finishedAt=NULL, createdAt=excluded.createdAt, updatedAt=excluded.updatedAt",
+      values,
+    );
+  } else if (getDatabaseKind() === "postgresql") {
+    await executeRaw(
+      'INSERT INTO plugin_agent_states ("pluginId", "resourceViewId", "hostId", "pluginVersion", "actionId", "groupId", "taskId", status, "dataJson", output, error, "startedAt", "finishedAt", "createdAt", "updatedAt") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT ("pluginId", "resourceViewId", "hostId") DO UPDATE SET "pluginVersion"=excluded."pluginVersion", "actionId"=excluded."actionId", "groupId"=excluded."groupId", "taskId"=excluded."taskId", status=excluded.status, output=NULL, error=NULL, "startedAt"=NULL, "finishedAt"=NULL, "createdAt"=excluded."createdAt", "updatedAt"=excluded."updatedAt"',
+      values,
+    );
+  } else {
+    await executeRaw(
+      "INSERT INTO plugin_agent_states (pluginId, resourceViewId, hostId, pluginVersion, actionId, groupId, taskId, status, dataJson, output, error, startedAt, finishedAt, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE pluginVersion=VALUES(pluginVersion), actionId=VALUES(actionId), groupId=VALUES(groupId), taskId=VALUES(taskId), status=VALUES(status), output=NULL, error=NULL, startedAt=NULL, finishedAt=NULL, createdAt=VALUES(createdAt), updatedAt=VALUES(updatedAt)",
+      values,
+    );
+  }
+}
+
+async function rememberPluginAgentTaskGroup(group: PluginAgentTaskGroup) {
+  if (!group.contextId) return;
+  await Promise.all(group.results.map((result) => upsertQueuedPluginAgentState({
+    pluginId: group.pluginId,
+    resourceViewId: group.contextId,
+    pluginVersion: group.pluginVersion,
+    actionId: group.actionId,
+    groupId: group.groupId,
+    taskId: result.taskId,
+    hostId: result.hostId,
+    status: result.status,
+    createdAt: group.createdAt,
+  })));
+}
+
+export async function syncPluginAgentActionState(pluginId: string, groupId: string) {
+  const group = getPluginAgentTaskGroup(groupId);
+  if (!group || group.pluginId !== normalizePluginId(pluginId) || !group.contextId) return group;
+  const db = await getDb();
+  if (!db) return group;
+  await Promise.all(group.results.map(async (result) => {
+    const stateUpdate: Record<string, unknown> = {
+      pluginVersion: group.pluginVersion || null,
+      actionId: group.actionId,
+      status: result.status === "success" && pluginAgentResultEffective(result.data) ? "effective" : result.status,
+      output: String(result.output || "").slice(0, 64 * 1024) || null,
+      error: [
+        result.error || result.errorDetail || result.processError || result.stderr || "",
+        result.advice ? `处理建议: ${result.advice}` : "",
+      ].filter(Boolean).join("\n").slice(0, 8 * 1024) || null,
+      startedAt: result.startedAt ? new Date(result.startedAt) : null,
+      finishedAt: result.finishedAt ? new Date(result.finishedAt) : null,
+      updatedAt: nowDate(),
+    };
+    if (result.status === "success" && result.data !== undefined) {
+      stateUpdate.dataJson = pluginAgentStateData(result.data);
+    }
+    await db.update(pluginAgentStates).set(stateUpdate as any).where(and(
+      eq(pluginAgentStates.pluginId, group.pluginId),
+      eq(pluginAgentStates.resourceViewId, group.contextId),
+      eq(pluginAgentStates.hostId, result.hostId),
+      eq(pluginAgentStates.groupId, group.groupId),
+      eq(pluginAgentStates.taskId, result.taskId),
+    ));
+  }));
+  return group;
+}
+
+export async function getPluginAgentResourceStates(pluginId: string, resourceViewId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  const id = assertPluginId(pluginId);
+  const viewId = normalizePluginId(resourceViewId).slice(0, 80);
+  if (!viewId) throw new Error("插件资源视图 ID 无效");
+  const plugin = await getPlugin(id);
+  if (!plugin || !pluginHasPermission(plugin, "ui:interactive") || !pluginHasPermission(plugin, "read:hosts")) {
+    throw new Error("插件没有声明 Agent 交互资源权限");
+  }
+  if (!(plugin.manifest.resourceSchemas || plugin.manifest.resourceViews || []).some((view: PluginResourceViewDefinition) => view.id === viewId)) {
+    throw new Error("插件资源视图不存在");
+  }
+  const rows = await db.select().from(pluginAgentStates).where(and(
+    eq(pluginAgentStates.pluginId, id),
+    eq(pluginAgentStates.resourceViewId, viewId),
+  ));
+  const staleBefore = Date.now() - 2 * 60 * 1000;
+  return rows.map((row: any) => {
+    let data: unknown;
+    try {
+      data = row.dataJson ? JSON.parse(row.dataJson) : undefined;
+    } catch {
+      data = undefined;
+    }
+    const updatedAt = row.updatedAt ? new Date(row.updatedAt).getTime() : 0;
+    const stale = (row.status === "queued" || row.status === "running") && updatedAt > 0 && updatedAt < staleBefore;
+    return {
+      pluginId: row.pluginId,
+      resourceViewId: row.resourceViewId,
+      hostId: Number(row.hostId),
+      pluginVersion: row.pluginVersion || null,
+      actionId: row.actionId || null,
+      groupId: row.groupId || null,
+      taskId: row.taskId || null,
+      status: stale ? "timeout" : row.status,
+      data,
+      output: row.output || "",
+      error: stale ? (row.error || "Agent 操作长时间未返回结果") : (row.error || ""),
+      startedAt: row.startedAt || null,
+      finishedAt: row.finishedAt || null,
+      updatedAt: row.updatedAt || null,
+    };
+  });
+}
+
+async function prunePluginDataAssets(pluginId: string, keepPaths: string[]) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const keep = new Set(keepPaths.map((item) => normalizeAssetPath(item)));
+  const rows = await db.select().from(pluginAssets).where(eq(pluginAssets.pluginId, pluginId));
+  for (const row of rows as any[]) {
+    const assetPath = String(row?.path || "");
+    if (!assetPath.startsWith("data/") || keep.has(assetPath)) continue;
+    await db.delete(pluginAssets).where(eq(pluginAssets.id, row.id));
+  }
+}
+
+function resolvePluginDataSource(manifest: ForwardxPluginManifest, repository: string, branch: string) {
+  const dataRepository = String(manifest.data?.repository || "").trim();
+  const dataBranch = String(manifest.data?.branch || "").trim();
+  return {
+    repository: dataRepository || repository,
+    branch: dataBranch || branch,
+  };
+}
+
+function remotePathFromManifest(manifestPath: string | null | undefined, assetPath: string) {
+  const cleanAssetPath = normalizeAssetPath(assetPath);
+  const cleanManifestPath = String(manifestPath || "").replace(/\\/g, "/").replace(/^\/+/, "");
+  const baseDir = cleanManifestPath.includes("/") ? cleanManifestPath.slice(0, cleanManifestPath.lastIndexOf("/") + 1) : "";
+  return normalizeAssetPath(`${baseDir}${cleanAssetPath}`);
+}
+
+async function syncGithubDeclaredAssets(manifest: ForwardxPluginManifest, repository: string, branch: string, manifestPath?: string | null): Promise<AssetSyncResult> {
+  const declarations = new Map<string, AssetDeclaration>();
+  for (const asset of manifest.assets || []) {
+    declarations.set(asset.path, {
+      contentType: asset.contentType || "text/plain;charset=utf-8",
+      remotePath: remotePathFromManifest(manifestPath, asset.path),
+      isData: false,
+    });
+  }
+  for (const page of manifest.pages || []) {
+    if (page.assetPath && !declarations.has(page.assetPath)) {
+      declarations.set(page.assetPath, {
+        contentType: page.contentType === "markdown" ? "text/markdown;charset=utf-8" : "text/plain;charset=utf-8",
+        remotePath: remotePathFromManifest(manifestPath, page.assetPath),
+        isData: false,
+      });
+    }
+  }
+  for (const filePath of manifest.data?.files || []) {
+    const path = normalizeAssetPath(filePath);
+    if (!declarations.has(path)) {
+      declarations.set(path, {
+        contentType: contentTypeForPath(path),
+        remotePath: remotePathFromManifest(manifestPath, path),
+        isData: true,
+      });
+    }
+  }
+  if (manifest.data?.autoDiscover) {
+    const dataSource = resolvePluginDataSource(manifest, repository, branch);
+    for (const assetPath of await discoverGithubDataAssets(dataSource.repository, dataSource.branch)) {
+      if (!declarations.has(assetPath)) {
+        declarations.set(assetPath, {
+          contentType: contentTypeForPath(assetPath),
+          remotePath: assetPath,
+          isData: true,
+        });
+      }
+    }
+  }
+  const entries = Array.from(declarations.entries()).slice(0, MAX_PLUGIN_ASSETS);
+  const result: AssetSyncResult = {
+    total: entries.length,
+    synced: 0,
+    skipped: 0,
+    paths: [],
+    errors: [],
+  };
+  for (const [assetPath, declaration] of entries) {
+    try {
+      const dataSource = declaration.isData
+        ? resolvePluginDataSource(manifest, repository, branch)
+        : { repository, branch };
+      const content = await fetchText(githubRawUrl(dataSource.repository, dataSource.branch, declaration.remotePath));
+      await upsertPluginAsset(manifest.id, assetPath, content, declaration.contentType);
+      result.synced += 1;
+      result.paths.push(assetPath);
+    } catch (error) {
+      result.skipped += 1;
+      const message = error instanceof Error ? error.message : String(error);
+      result.errors.push(`${assetPath}: ${message}`);
+      console.warn(`[Plugin] asset sync skipped plugin=${manifest.id} path=${assetPath}: ${message}`);
+    }
+  }
+  return result;
+}
+
+function normalizePluginRow(row: any) {
+  const manifest = parseJson<ForwardxPluginManifest>(row?.manifestJson, {
+    id: row?.pluginId,
+    name: row?.name,
+    version: row?.version,
+    permissions: [],
+    extensionPoints: [],
+  } as any);
+  const trustRequired = pluginManifestRequiresTrust(manifest);
+  const normalized = {
+    ...row,
+    hasUpdate: pluginVersionHasUpdate(row?.version, row?.latestVersion),
+    trusted: trustRequired && (row?.trusted === true || Number(row?.trusted || 0) === 1),
+    trustRequired,
+    manifest,
+    permissions: parseJson<PluginPermissionKey[]>(row?.permissionsJson, []),
+    extensionPoints: parseJson<PluginExtensionPoint[]>(row?.extensionPointsJson, []),
+  };
+  const sidebarEnabled = pluginSettingsValues(manifest)[PLUGIN_SIDEBAR_ENABLED_SETTING_KEY] === true;
+  return {
+    ...normalized,
+    sidebarEnabled,
+    sidebarSupported: !!resolvePluginSidebarCapability(normalized),
+  };
+}
+
+export function resolvePluginSidebarCapability(plugin: any) {
+  if (!plugin) return null;
+  const permissions = Array.isArray(plugin.permissions) ? plugin.permissions : [];
+  const extensionPoints = Array.isArray(plugin.extensionPoints) ? plugin.extensionPoints : [];
+  if (!permissions.includes("ui:page") || !extensionPoints.includes("sidebar.page")) return null;
+
+  const manifest = plugin.manifest && typeof plugin.manifest === "object" ? plugin.manifest as ForwardxPluginManifest : undefined;
+  const sidebar = normalizePluginSidebar(manifest?.sidebar);
+  if (!manifest || !sidebar) return null;
+
+  const hasUsage = Array.isArray(manifest.usageViews) && manifest.usageViews.length > 0;
+  const hasSettings = Array.isArray(manifest.settingsSchema) && manifest.settingsSchema.length > 0;
+  const pages = Array.isArray(manifest.pages) ? manifest.pages : [];
+  const target = sidebar.target || (hasUsage ? "usage" : hasSettings ? "settings" : pages.length ? "page" : undefined);
+  if (!target) return null;
+  if (target === "usage" && !hasUsage) return null;
+  if (target === "settings" && !hasSettings) return null;
+  const page = target === "page"
+    ? pages.find((item) => item.id === sidebar.pageId) || (!sidebar.pageId ? pages[0] : undefined)
+    : undefined;
+  if (target === "page" && !page) return null;
+
+  return {
+    pluginId: String(plugin.pluginId || manifest.id),
+    label: sidebar.label || plugin.name || manifest.name,
+    icon: sidebar.icon || manifest.logo || "",
+    target,
+    pageId: page?.id || undefined,
+  };
+}
+
+export function resolvePluginSidebarEntry(plugin: any) {
+  if (!plugin || plugin.sidebarEnabled !== true) return null;
+  return resolvePluginSidebarCapability(plugin);
+}
+
+export async function getPluginStoreItems() {
+  const db = await getDb();
+  const [onlineItems, sourceRows] = await Promise.all([
+    fetchOfficialStoreItems(),
+    db ? db.select().from(pluginStoreSources) : Promise.resolve([]),
+  ]);
+  const sources = sourceRows.map(normalizePluginStoreSourceRow);
+  const merged = new Map<string, PluginStoreItem>();
+  for (const item of BUILTIN_PLUGIN_STORE_ITEMS) merged.set(item.id, { ...item, official: true });
+  for (const item of onlineItems) merged.set(item.id, { ...item, official: true });
+  for (const item of cachedThirdPartyStoreItems(sources)) {
+    if (!merged.has(item.id)) merged.set(item.id, item);
+  }
+  return Array.from(merged.values());
+}
+
+export function getPluginDeveloperCapabilities() {
+  return {
+    manifestVersion: PLUGIN_MANIFEST_VERSION,
+    securityModel: PLUGIN_SECURITY_MODEL,
+    permissions: PLUGIN_PERMISSION_KEYS,
+    extensionPoints: PLUGIN_EXTENSION_POINTS,
+    settingFieldTypes: PLUGIN_SETTING_FIELD_TYPES,
+    pageContentTypes: PLUGIN_PAGE_CONTENT_TYPES,
+    sidebarTargets: PLUGIN_SIDEBAR_TARGETS,
+    actionTypes: PLUGIN_ACTION_TYPES,
+    actionIntents: PLUGIN_ACTION_INTENTS,
+    actionInputFieldTypes: PLUGIN_SETTING_FIELD_TYPES,
+    httpMethods: PLUGIN_HTTP_METHODS,
+    httpResponseTypes: PLUGIN_HTTP_RESPONSE_TYPES,
+    httpAuthTypes: PLUGIN_HTTP_AUTH_TYPES,
+    agentExecutors: PLUGIN_AGENT_EXECUTORS,
+    agentInterpreters: PLUGIN_AGENT_INTERPRETERS,
+    agentOutputTypes: PLUGIN_AGENT_OUTPUT_TYPES,
+    agentTargets: PLUGIN_AGENT_TARGETS,
+    panelOperations: getPluginPanelOperationCapabilities(),
+    resourceViewTypes: PLUGIN_RESOURCE_VIEW_TYPES,
+    resourceSourceTriggers: PLUGIN_RESOURCE_SOURCE_TRIGGERS,
+    resourceColumnTypes: PLUGIN_RESOURCE_COLUMN_TYPES,
+    resourceFieldTypes: PLUGIN_RESOURCE_FIELD_TYPES,
+    resourceConditionOperators: PLUGIN_RESOURCE_CONDITION_OPERATORS,
+    resultSchemaTypes: PLUGIN_RESULT_SCHEMA_TYPES,
+    resultFieldTypes: PLUGIN_RESULT_FIELD_TYPES,
+    agentMinimumVersion: AGENT_PLUGIN_TASK_VERSION,
+  };
+}
+
+export async function listPlugins() {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db.select().from(plugins);
+  return rows.map(normalizePluginRow);
+}
+
+export async function getEnabledPluginSidebarPages() {
+  return (await listPlugins()).flatMap((plugin: any) => {
+    const entry = resolvePluginSidebarEntry(plugin);
+    return entry ? [entry] : [];
+  });
+}
+
+export async function setPluginSidebarEnabled(pluginId: string, enabled: boolean) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const id = assertPluginId(pluginId);
+  const plugin = await getPlugin(id);
+  if (!plugin) throw new Error("插件不存在");
+  if (enabled && !plugin.sidebarSupported) throw new Error("该插件没有声明可用的菜单入口页面");
+  const settings = pluginSettingsValues(plugin.manifest);
+  const manifest = {
+    ...plugin.manifest,
+    settingsValues: {
+      ...settings,
+      [PLUGIN_SIDEBAR_ENABLED_SETTING_KEY]: enabled,
+    },
+  } as ForwardxPluginManifest;
+  await db.update(plugins).set({
+    manifestJson: serializeManifest(manifest),
+    updatedAt: nowDate(),
+    lastError: null,
+  } as any).where(eq(plugins.pluginId, id));
+  return getPlugin(id);
+}
+
+export async function getPlugin(pluginId: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const id = assertPluginId(pluginId);
+  const rows = await db.select().from(plugins).where(eq(plugins.pluginId, id)).limit(1);
+  return rows[0] ? normalizePluginRow(rows[0]) : undefined;
+}
+
+export type Live2dWidgetRuntimeConfig = {
+  enabled: boolean;
+  pluginId?: string;
+  scriptUrl?: string;
+  styleUrl?: string;
+  cubism2Path?: string;
+  cubism5Path?: string;
+  waifuPath?: string;
+  cdnPath?: string;
+  modelId?: number;
+  tools?: string[];
+  drag?: boolean;
+  showToggleAfterQuit?: boolean;
+  logLevel?: "error" | "warn" | "info" | "trace";
+  showOnMobile?: boolean;
+  dock?: "left" | "right";
+  size?: number;
+};
+
+function live2dSettingValue(manifest: ForwardxPluginManifest, key: string) {
+  const normalizedKey = key.toLowerCase();
+  const values = pluginSettingsValues(manifest);
+  if (Object.prototype.hasOwnProperty.call(values, normalizedKey)) return values[normalizedKey];
+  return manifest.settingsSchema?.find((field) => field.key === normalizedKey)?.defaultValue;
+}
+
+function live2dPathValue(value: unknown, fallback: string) {
+  const text = String(value ?? "").trim();
+  if (/^\/(?!\/)/.test(text)) return text.slice(0, 1000);
+  if (/^https?:\/\//i.test(text)) return text.slice(0, 1000);
+  return fallback;
+}
+
+export function resolveLive2dWidgetRuntimeConfig(plugin: any, userRole?: string | null): Live2dWidgetRuntimeConfig {
+  if (!plugin || plugin.pluginId !== LIVE2D_WIDGET_PLUGIN_ID || plugin.status !== "enabled") return { enabled: false };
+  const manifest = plugin.manifest as ForwardxPluginManifest | undefined;
+  if (!manifest) return { enabled: false };
+  const permissions = Array.isArray(plugin.permissions) ? plugin.permissions : manifest.permissions || [];
+  const extensionPoints = Array.isArray(plugin.extensionPoints) ? plugin.extensionPoints : manifest.extensionPoints || [];
+  if (!permissions.includes("ui:widget") || !extensionPoints.includes("ui.widget")) return { enabled: false };
+
+  const displayScope = String(live2dSettingValue(manifest, "displayScope") || "authenticated");
+  if (displayScope === "admin" && userRole !== "admin") return { enabled: false };
+  if (displayScope === "authenticated" && !userRole) return { enabled: false };
+
+  const toolsValue = live2dSettingValue(manifest, "tools");
+  const tools = Array.isArray(toolsValue)
+    ? Array.from(new Set(toolsValue.map((item) => String(item || "").trim()).filter((item) => (LIVE2D_WIDGET_TOOL_IDS as readonly string[]).includes(item))))
+    : [...LIVE2D_WIDGET_DEFAULT_TOOLS];
+  const logLevelValue = String(live2dSettingValue(manifest, "logLevel") || "warn");
+  const logLevel = (["error", "warn", "info", "trace"] as const).includes(logLevelValue as any)
+    ? logLevelValue as Live2dWidgetRuntimeConfig["logLevel"]
+    : "warn";
+  const modelId = Number(live2dSettingValue(manifest, "modelId"));
+  const size = Number(live2dSettingValue(manifest, "size"));
+  const dockValue = String(live2dSettingValue(manifest, "dock") || "right");
+
+  return {
+    enabled: true,
+    pluginId: LIVE2D_WIDGET_PLUGIN_ID,
+    ...LIVE2D_WIDGET_RUNTIME,
+    waifuPath: live2dPathValue(live2dSettingValue(manifest, "waifuPath"), "/plugins/live2d-widget/waifu-tips.json"),
+    cdnPath: live2dPathValue(live2dSettingValue(manifest, "cdnPath"), "https://fastly.jsdelivr.net/gh/fghrsh/live2d_api/"),
+    modelId: Number.isFinite(modelId) ? Math.max(0, Math.min(999, Math.floor(modelId))) : 0,
+    tools,
+    drag: live2dSettingValue(manifest, "drag") === true,
+    showToggleAfterQuit: live2dSettingValue(manifest, "showToggleAfterQuit") !== false,
+    logLevel,
+    showOnMobile: live2dSettingValue(manifest, "showOnMobile") === true,
+    dock: dockValue === "left" ? "left" : "right",
+    size: Number.isFinite(size) ? Math.max(200, Math.min(420, Math.floor(size))) : 280,
+  };
+}
+
+export async function getLive2dWidgetRuntimeConfig(userRole?: string | null) {
+  if ((await getSetting("pluginsEnabled").catch(() => null)) !== "true") return { enabled: false } as Live2dWidgetRuntimeConfig;
+  const plugin = await getPlugin(LIVE2D_WIDGET_PLUGIN_ID);
+  return resolveLive2dWidgetRuntimeConfig(plugin, userRole);
+}
+
+export async function listPluginAssets(pluginId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  const id = assertPluginId(pluginId);
+  return await db.select().from(pluginAssets).where(eq(pluginAssets.pluginId, id));
+}
+
+export async function getPluginUsage(pluginId: string, usageViewId?: string | null) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const id = assertPluginId(pluginId);
+  const plugin = await getPlugin(id);
+  if (!plugin) throw new Error("插件不存在");
+  const usageView = (plugin.manifest.usageViews || []).find((item: PluginUsageViewDefinition) => item.id === usageViewId)
+    || firstHostAssetSyncView(plugin.manifest);
+  if (!usageView || usageView.type !== "host-asset-sync") throw new Error("插件没有声明可用的主机同步使用页");
+  const settings = pluginSettingsValues(plugin.manifest);
+  const usage = normalizeHostAssetSyncUsage(settings[usageStorageKey(plugin, usageView.id)], usageView);
+  const declaredAssets = new Map<string, any>((plugin.manifest.assets || []).map((asset: any) => [String(asset.path || ""), asset]));
+  const [hostRows, assetRows] = await Promise.all([
+    db.select({
+      id: hosts.id,
+      name: hosts.name,
+      ip: hosts.ip,
+      isOnline: hosts.isOnline,
+      lastHeartbeat: hosts.lastHeartbeat,
+      agentVersion: hosts.agentVersion,
+    }).from(hosts),
+    db.select({
+      path: pluginAssets.path,
+      contentType: pluginAssets.contentType,
+      size: pluginAssets.size,
+      sha256: pluginAssets.sha256,
+      createdAt: pluginAssets.createdAt,
+      updatedAt: pluginAssets.updatedAt,
+    }).from(pluginAssets).where(eq(pluginAssets.pluginId, id)),
+  ]);
+  const allAssetsMode = usageViewAssetMode(usageView) === "all-plugin-assets";
+  const assets = assetRows
+    .filter((asset: any) => {
+      const assetPath = String(asset?.path || "");
+      return allAssetsMode
+        ? isHostSyncAssetCandidate(assetPath, Number(asset?.size || 0))
+        : assetPath.startsWith("data/");
+    })
+    .map((asset: any) => ({
+      path: asset.path,
+      label: declaredAssets.get(String(asset.path || ""))?.label || asset.path,
+      description: declaredAssets.get(String(asset.path || ""))?.description || "",
+      size: asset.size,
+      sha256: asset.sha256,
+      updatedAt: asset.updatedAt,
+      contentType: asset.contentType,
+    }))
+    .sort((a: any, b: any) => String(a.path).localeCompare(String(b.path), "zh-Hans-CN"));
+  const effectiveHostIds = resolvePluginUsageHostIds(
+    usageView,
+    usage,
+    hostRows.map((host: any) => Number(host.id)),
+  );
+  const selectedHostIds = new Set(effectiveHostIds);
+  const desiredSyncFiles = pluginHostSyncFiles(usageView, usage, assetRows).files;
+  const desiredSyncSignature = usage.enabled && desiredSyncFiles.length > 0
+    ? pluginHostSyncSignature(plugin.pluginId, usageView, usage, hostAssetSyncDir(plugin.pluginId, usageView), desiredSyncFiles)
+    : "";
+  return {
+    plugin,
+    usageView,
+    usage: { ...usage, hostIds: effectiveHostIds },
+    hosts: hostRows.map((host: any) => {
+      const selected = selectedHostIds.has(Number(host.id));
+      const agentPluginInventory = getAgentPluginInventory(host.id);
+      const agentPluginVersion = agentPluginInventory?.versions.get(plugin.pluginId) || null;
+      const pluginSyncPending = !agentPluginInventory
+        || agentPluginVersion !== plugin.version
+        || agentPluginInventory.syncSignatures.get(plugin.pluginId) !== desiredSyncSignature;
+      return {
+        ...host,
+        isOnline: !!host.isOnline && isFreshHostHeartbeat(host.lastHeartbeat),
+        pluginSelected: selected,
+        pluginSyncPending: selected && pluginSyncPending,
+        pluginVersion: plugin.version,
+        agentPluginVersion,
+        agentPluginSupported: isAgentVersionAtLeast(host.agentVersion, AGENT_PLUGIN_TASK_VERSION),
+      };
+    }),
+    assets,
+  };
+}
+
+export async function savePluginUsage(pluginId: string, usageViewId: string | null | undefined, input: Partial<HostAssetSyncUsageConfig>) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const id = assertPluginId(pluginId);
+  const plugin = await getPlugin(id);
+  if (!plugin) throw new Error("插件不存在");
+  const usageView = (plugin.manifest.usageViews || []).find((item: PluginUsageViewDefinition) => item.id === usageViewId)
+    || firstHostAssetSyncView(plugin.manifest);
+  if (!usageView || usageView.type !== "host-asset-sync") throw new Error("插件没有声明可保存的主机同步使用页");
+  const key = usageStorageKey(plugin, usageView.id);
+  const previousUsage = normalizeHostAssetSyncUsage(pluginSettingsValues(plugin.manifest)[key], usageView);
+  const knownHosts = await db.select({ id: hosts.id }).from(hosts);
+  const knownHostIdList = knownHosts.map((host: any) => Number(host.id));
+  const knownHostIds = new Set(knownHostIdList);
+  const knownAssetRows = await db.select({ path: pluginAssets.path, size: pluginAssets.size }).from(pluginAssets).where(eq(pluginAssets.pluginId, id));
+  const knownAssetSizeByPath = new Map<string, number>(knownAssetRows.map((asset: any) => [String(asset.path || ""), Number(asset.size || 0)]));
+  const allAssetsMode = usageViewAssetMode(usageView) === "all-plugin-assets";
+  const allHostsMode = usageViewHostScope(usageView) === "all";
+  const knownAssetPaths = new Set<string>(knownAssetRows.map((asset: any) => String(asset.path || "")).filter((path: string) => (
+    allAssetsMode
+      ? isHostSyncAssetCandidate(path, knownAssetSizeByPath.get(path) || 0)
+      : path.startsWith("data/")
+  )));
+  const nextUsage = normalizeHostAssetSyncUsage({
+    enabled: input.enabled === true,
+    hostIds: allHostsMode ? [] : normalizePositiveIds(input.hostIds).filter((hostId) => knownHostIds.has(hostId)),
+    assetPaths: allAssetsMode ? [] : normalizeUsageAssetPaths(input.assetPaths).filter((path) => knownAssetPaths.has(path)),
+    mode: "sync-files",
+    operation: input.operation,
+    fieldValues: input.fieldValues,
+    note: input.note,
+    updatedAt: new Date().toISOString(),
+  }, usageView);
+  if (id === "china-region-whitelist" && nextUsage.fieldValues) {
+    nextUsage.fieldValues["region-codes"] = chinaRegionWhitelistCodes(nextUsage);
+  }
+  if (nextUsage.enabled && !allHostsMode && nextUsage.hostIds.length === 0) throw new Error("请选择至少一台生效主机");
+  if (nextUsage.enabled && !allAssetsMode && nextUsage.assetPaths.length === 0) throw new Error("请选择至少一个白名单文件");
+  if (nextUsage.enabled) {
+    for (const field of usageView.fields || []) {
+      if (!field.required) continue;
+      const value = nextUsage.fieldValues?.[field.key];
+      const empty = Array.isArray(value) ? value.length === 0 : String(value ?? "").trim() === "";
+      if (empty) throw new Error(`请填写 ${field.label}`);
+    }
+  }
+  const assetSizeByPath = knownAssetSizeByPath;
+  const allSyncAssetPaths = allAssetsMode
+    ? knownAssetRows
+      .map((asset: any) => String(asset.path || ""))
+      .filter((assetPath: string) => isHostSyncAssetCandidate(assetPath, assetSizeByPath.get(assetPath) || 0))
+    : nextUsage.assetPaths;
+  const totalSelectedBytes = allSyncAssetPaths.reduce((sum: number, assetPath: string) => sum + (assetSizeByPath.get(assetPath) || 0), 0);
+  if (nextUsage.enabled && totalSelectedBytes > MAX_WHITELIST_USAGE_SYNC_BYTES) {
+    throw new Error(`选中的白名单文件总大小不能超过 ${formatByteLimit(MAX_WHITELIST_USAGE_SYNC_BYTES)}，请减少同步文件数量`);
+  }
+  const previousActiveHostIds = resolvePluginUsageHostIds(usageView, previousUsage, knownHostIdList);
+  const nextActiveHostIdList = resolvePluginUsageHostIds(usageView, nextUsage, knownHostIdList);
+  const nextActiveHostIds = new Set(nextActiveHostIdList);
+  nextUsage.cleanupHostIds = Array.from(new Set([
+    ...(previousUsage.cleanupHostIds || []),
+    ...previousActiveHostIds,
+  ]))
+    .filter((hostId) => knownHostIds.has(hostId) && !nextActiveHostIds.has(hostId))
+    .slice(0, MAX_WHITELIST_USAGE_HOSTS);
+  const manifest = { ...(plugin.manifest as any) } as ForwardxPluginManifest;
+  const settings = pluginSettingsValues(manifest);
+  settings[key] = nextUsage;
+  (manifest as any).settingsValues = settings;
+  await db.update(plugins).set({ manifestJson: JSON.stringify(manifest, null, 2), updatedAt: nowDate(), lastError: null } as any)
+    .where(eq(plugins.pluginId, id));
+  const refreshHostIds = new Set([
+    ...previousActiveHostIds,
+    ...nextActiveHostIdList,
+    ...(nextUsage.cleanupHostIds || []),
+  ]);
+  for (const hostId of refreshHostIds) {
+    pushAgentRefresh(hostId, `plugin-${id}-usage-saved`, { urgent: true });
+  }
+  return getPluginUsage(id, usageView.id);
+}
+
+function shellQuote(value: string) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function bashConfigValue(value: string) {
+  return shellQuote(String(value || ""));
+}
+
+function safeAgentRelativePath(assetPath: string) {
+  const clean = normalizeAssetPath(assetPath);
+  if (clean.startsWith(".") || clean.includes("../")) throw new Error("插件资产路径不合法");
+  return clean;
+}
+
+export function buildPluginTextFileCommands(targetPath: string, content: string) {
+  const encoded = zlib.gzipSync(Buffer.from(content, "utf8"), {
+    level: zlib.constants.Z_BEST_SPEED,
+  }).toString("base64");
+  const targetDir = path.posix.dirname(targetPath);
+  const encodedPath = `${targetPath}.gz.b64.tmp`;
+  const decodedPath = `${targetPath}.tmp`;
+  const chunks: string[] = [];
+  for (let offset = 0; offset < encoded.length; offset += PLUGIN_SYNC_ENCODED_CHUNK_BYTES) {
+    chunks.push(encoded.slice(offset, offset + PLUGIN_SYNC_ENCODED_CHUNK_BYTES));
+  }
+  return [
+    `mkdir -p ${shellQuote(targetDir)}`,
+    `: > ${shellQuote(encodedPath)}`,
+    ...chunks.map((chunk) => `printf '%s' ${shellQuote(chunk)} >> ${shellQuote(encodedPath)}`),
+    `base64 -d < ${shellQuote(encodedPath)} | gzip -dc > ${shellQuote(decodedPath)} && mv -f ${shellQuote(decodedPath)} ${shellQuote(targetPath)} && rm -f ${shellQuote(encodedPath)}`,
+  ];
+}
+
+export function buildPluginDirectorySwapCommand(input: {
+  targetDir: string;
+  stagingDir: string;
+  backupDir: string;
+  expectedFiles: Array<{ path: string; sha256: string }>;
+}) {
+  const checks = input.expectedFiles.flatMap((file) => [
+    `test -f ${shellQuote(file.path)}`,
+    `test "$(sha256sum ${shellQuote(file.path)} | cut -c 1-64)" = ${shellQuote(file.sha256)}`,
+  ]);
+  return [
+    "set -e",
+    ...checks,
+    `rm -rf ${shellQuote(input.backupDir)}`,
+    `if [ -e ${shellQuote(input.targetDir)} ]; then mv ${shellQuote(input.targetDir)} ${shellQuote(input.backupDir)}; fi`,
+    `if mv ${shellQuote(input.stagingDir)} ${shellQuote(input.targetDir)}; then rm -rf ${shellQuote(input.backupDir)} || true; else status=$?; rm -rf ${shellQuote(input.targetDir)}; if [ -e ${shellQuote(input.backupDir)} ]; then mv ${shellQuote(input.backupDir)} ${shellQuote(input.targetDir)}; fi; exit "$status"; fi`,
+  ].join("\n");
+}
+
+function normalizeWhitespaceList(value: unknown) {
+  return String(value || "")
+    .replace(/[，,、;\n\r\t]+/g, " ")
+    .split(" ")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeWhitelistAsns(value: unknown) {
+  return normalizeWhitespaceList(value)
+    .map((item) => item.replace(/^as/i, ""))
+    .filter((item) => /^[0-9]{1,10}$/.test(item))
+    .map((item) => `AS${item}`)
+    .slice(0, 40)
+    .join(" ");
+}
+
+function normalizeWhitelistPortPolicies(value: unknown) {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split(/\n|；/g)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(";")
+    .slice(0, 5000);
+}
+
+function normalizeWhitelistForwardIfaces(value: unknown) {
+  return normalizeWhitespaceList(value)
+    .filter((item) => /^[A-Za-z0-9_.:-]{1,64}\+?$/.test(item))
+    .slice(0, 32)
+    .join(" ");
+}
+
+function usageStringField(usage: HostAssetSyncUsageConfig, key: string) {
+  return String(usage.fieldValues?.[key] ?? "");
+}
+
+function usageArrayField(usage: HostAssetSyncUsageConfig, key: string) {
+  const value = usage.fieldValues?.[key];
+  return Array.isArray(value) ? value.map((item) => String(item || "").trim()).filter(Boolean) : [];
+}
+
+function chinaRegionWhitelistCodes(usage: HostAssetSyncUsageConfig) {
+  const selected = Array.from(new Set(usageArrayField(usage, "region-codes")
+    .filter((code) => code === "CN" || /^[0-9]{6}$/.test(code))))
+    .slice(0, 40);
+  // CN is the default option in historical configurations. Province mode must
+  // take precedence when both were persisted, otherwise CN opens the whitelist
+  // for every domestic address and hides the intended province restriction.
+  const provinces = selected.filter((code) => code !== "CN");
+  return provinces.length > 0 ? provinces : ["CN"];
+}
+
+function buildChinaRegionWhitelistConfig(usage: HostAssetSyncUsageConfig, targetDir: string) {
+  const codes = chinaRegionWhitelistCodes(usage);
+  const backend = ["auto", "nft", "iptables"].includes(usageStringField(usage, "firewall-backend"))
+    ? usageStringField(usage, "firewall-backend")
+    : "auto";
+  const forwardMode = ["all", "none", "selected"].includes(usageStringField(usage, "forward-mode"))
+    ? usageStringField(usage, "forward-mode")
+    : "all";
+  const forwardIfaces = forwardMode === "selected" ? normalizeWhitelistForwardIfaces(usage.fieldValues?.["forward-ifaces"]) : "";
+  const asns = normalizeWhitelistAsns(usage.fieldValues?.asns);
+  const portPolicies = normalizeWhitelistPortPolicies(usage.fieldValues?.["port-policies"]);
+  return [
+    "# Generated by ForwardX china-region-whitelist plugin.",
+    `CN_CODES=${bashConfigValue(codes.join(" "))}`,
+    `CN_ASNS=${bashConfigValue(asns)}`,
+    `CN_PORT_POLICIES=${bashConfigValue(portPolicies)}`,
+    `CN_FORWARD_MODE=${bashConfigValue(forwardMode)}`,
+    `CN_FORWARD_IFACES=${bashConfigValue(forwardIfaces)}`,
+    `CN_FIREWALL_BACKEND=${bashConfigValue(backend)}`,
+    `CN_ROOT=${bashConfigValue(targetDir)}`,
+    `CN_RUNTIME_DIR=${bashConfigValue("/var/lib/china-region-whitelist")}`,
+    `CN_ASN_CACHE_DIR=${bashConfigValue("/var/lib/china-region-whitelist/asn")}`,
+    "",
+  ].join("\n");
+}
+
+function buildChinaRegionWhitelistOperationCommands(usage: HostAssetSyncUsageConfig, targetDir: string, signature: string) {
+  const operation = usage.operation || "sync";
+  if (operation === "sync") {
+    return [`echo ${shellQuote("[ForwardX Plugin] china-region-whitelist synced files and config")}`];
+  }
+  const commandByOperation: Record<string, string> = {
+    status: "status",
+    "dry-run": "dry-run-config",
+    apply: "apply-config",
+    clear: "clear",
+    "update-asn": "update-asn",
+  };
+  const runnerCommand = commandByOperation[operation];
+  if (!runnerCommand) return [];
+  const markerDir = "/var/lib/forwardx-agent/plugin-actions";
+  const markerFile = `${markerDir}/china-region-whitelist-${operation}.sha256`;
+  const run = [
+    `mkdir -p ${shellQuote(markerDir)}`,
+    `cd ${shellQuote(targetDir)}`,
+    `chmod +x ./forwardx-agent-run.sh 2>/dev/null || true`,
+    `CN_CONFIG_FILE=/etc/china-region-whitelist.conf bash ./forwardx-agent-run.sh ${runnerCommand}`,
+  ].join(" && ");
+  if (operation === "status") return [run];
+  return [
+    `mkdir -p ${shellQuote(markerDir)}; if [ "$(cat ${shellQuote(markerFile)} 2>/dev/null || true)" = ${shellQuote(signature)} ]; then echo ${shellQuote(`[ForwardX Plugin] china-region-whitelist ${operation} already applied`)}; else ${run} && printf '%s' ${shellQuote(signature)} > ${shellQuote(markerFile)}; fi`,
+  ];
+}
+
+export async function buildPluginHostAssetSyncActions(hostId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const currentHostId = Number(hostId);
+  if (!Number.isInteger(currentHostId) || currentHostId <= 0) return [];
+  const reportedPluginInventory = getAgentPluginInventory(currentHostId);
+  const pluginRows = await db.select().from(plugins);
+  const tasks: Array<{
+    pluginId: string;
+    pluginVersion: string;
+    usageViewId: string;
+    forwardType: string;
+    syncSignature: string;
+    expectAbsent: boolean;
+    commands: string[];
+  }> = [];
+  for (const row of pluginRows) {
+    const plugin = normalizePluginRow(row);
+    const usageView = firstHostAssetSyncView(plugin.manifest);
+    if (!usageView) continue;
+    const settings = pluginSettingsValues(plugin.manifest);
+    const usage = normalizeHostAssetSyncUsage(settings[usageStorageKey(plugin, usageView.id)], usageView);
+    const allAssetsMode = usageViewAssetMode(usageView) === "all-plugin-assets";
+    const hasUsageConfig = usage.enabled || usage.hostIds.length > 0 || usage.assetPaths.length > 0 || !!usage.note || !!usage.cleanupHostIds?.length;
+    if (!hasUsageConfig) continue;
+    const targetDir = hostAssetSyncDir(plugin.pluginId, usageView);
+    const pluginRootDir = path.posix.dirname(targetDir);
+    const backupDir = `${pluginRootDir}/.previous-${plugin.pluginId}`;
+    const hasSyncTargets = allAssetsMode || usage.assetPaths.length > 0;
+    const hostInScope = usageViewHostScope(usageView) === "all" || usage.hostIds.includes(currentHostId);
+    const isChinaRegionWhitelist = plugin.pluginId === "china-region-whitelist";
+    const shouldCleanup = usage.cleanupHostIds?.includes(currentHostId)
+      || ((plugin.status !== "enabled" || !usage.enabled || !hasSyncTargets) && hostInScope);
+    if (shouldCleanup) {
+      const commands = isChinaRegionWhitelist
+        ? [
+            `if [ -x ${shellQuote(`${targetDir}/forwardx-agent-run.sh`)} ]; then CN_CONFIG_FILE=/etc/china-region-whitelist.conf bash ${shellQuote(`${targetDir}/forwardx-agent-run.sh`)} clear 2>/dev/null || true; fi`,
+            `rm -rf ${shellQuote(targetDir)} ${shellQuote(backupDir)} 2>/dev/null || true`,
+            `find ${shellQuote(pluginRootDir)} -mindepth 1 -maxdepth 1 -type d -name ${shellQuote(`.sync-${plugin.pluginId}-*`)} -exec rm -rf {} + 2>/dev/null || true`,
+          ]
+        : [
+            `rm -rf ${shellQuote(targetDir)} ${shellQuote(backupDir)} 2>/dev/null || true`,
+            `find ${shellQuote(pluginRootDir)} -mindepth 1 -maxdepth 1 -type d -name ${shellQuote(`.sync-${plugin.pluginId}-*`)} -exec rm -rf {} + 2>/dev/null || true`,
+          ];
+      tasks.push({
+        pluginId: plugin.pluginId,
+        pluginVersion: plugin.version,
+        usageViewId: usageView.id,
+        forwardType: `plugin-${plugin.pluginId}-${usageView.id}-sync`,
+        syncSignature: "",
+        expectAbsent: true,
+        commands,
+      });
+      continue;
+    }
+    if (plugin.status !== "enabled" || !usage.enabled || !hostInScope || !hasSyncTargets) continue;
+    const rows = await db.select().from(pluginAssets).where(eq(pluginAssets.pluginId, plugin.pluginId));
+    const preservePaths = allAssetsMode || usageView.preserveAssetPaths === true;
+    const syncFiles = pluginHostSyncFiles(usageView, usage, rows);
+    const skippedPaths = syncFiles.skippedPaths;
+    const files = syncFiles.files.map((file) => ({
+      ...file,
+      fileName: preservePaths ? safeAgentRelativePath(file.source) : safeAgentPluginAssetName(file.source),
+    }));
+    if (files.length === 0) continue;
+    const operationSignature = pluginHostSyncSignature(plugin.pluginId, usageView, usage, targetDir, files);
+    if (reportedPluginInventory
+      && reportedPluginInventory.versions.get(plugin.pluginId) === plugin.version
+      && reportedPluginInventory.syncSignatures.get(plugin.pluginId) === operationSignature) {
+      continue;
+    }
+    const manifest = {
+      id: plugin.pluginId,
+      version: plugin.version,
+      pluginId: plugin.pluginId,
+      usageViewId: usageView.id,
+      mode: usage.mode,
+      operation: usage.operation || defaultUsageOperation(usageView),
+      fieldValues: usage.fieldValues || {},
+      note: usage.note || "",
+      updatedAt: usage.updatedAt || "",
+      files: files.map(({ content: _content, ...file }: { source: string; fileName: string; sha256: string; size: number; content: string }) => file),
+      skipped: skippedPaths,
+      syncSignature: operationSignature,
+    };
+    const stagingDir = `${pluginRootDir}/.sync-${plugin.pluginId}-${operationSignature.slice(0, 20)}`;
+    const commands = [
+      `mkdir -p ${shellQuote(pluginRootDir)}`,
+      `rm -rf ${shellQuote(stagingDir)}`,
+      `mkdir -p ${shellQuote(stagingDir)}`,
+    ];
+    const expectedFiles: Array<{ path: string; sha256: string }> = [];
+    for (const file of files) {
+      const target = `${stagingDir}/${file.fileName}`;
+      commands.push(...buildPluginTextFileCommands(target, file.content));
+      expectedFiles.push({ path: target, sha256: file.sha256 });
+    }
+    let generatedConfig = "";
+    if (isChinaRegionWhitelist) {
+      generatedConfig = buildChinaRegionWhitelistConfig(usage, targetDir);
+      const generatedConfigPath = `${stagingDir}/forwardx-generated.conf`;
+      commands.push(...buildPluginTextFileCommands(generatedConfigPath, generatedConfig));
+      expectedFiles.push({ path: generatedConfigPath, sha256: sha256(generatedConfig) });
+    }
+    const manifestContent = JSON.stringify(manifest, null, 2);
+    const manifestSha256 = sha256(manifestContent);
+    const manifestPath = `${stagingDir}/manifest.json`;
+    commands.push(...buildPluginTextFileCommands(manifestPath, manifestContent));
+    expectedFiles.push({ path: manifestPath, sha256: manifestSha256 });
+    commands.push(buildPluginDirectorySwapCommand({
+      targetDir,
+      stagingDir,
+      backupDir,
+      expectedFiles,
+    }));
+    if (isChinaRegionWhitelist) {
+      const postSyncCommands = [
+        "set -e",
+        `test "$(sha256sum ${shellQuote(`${targetDir}/manifest.json`)} | cut -c 1-64)" = ${shellQuote(manifestSha256)}`,
+      ];
+      const hasInteractiveResources = (plugin.manifest.resourceViews || []).some((view: PluginResourceViewDefinition) => view.usageViewId === usageView.id);
+      if (hasInteractiveResources) {
+        postSyncCommands.push(`if [ ! -s /etc/china-region-whitelist.conf ]; then cp ${shellQuote(`${targetDir}/forwardx-generated.conf`)} /etc/china-region-whitelist.conf; fi`);
+        postSyncCommands.push(`echo ${shellQuote("[ForwardX Plugin] china-region-whitelist assets synced; per-host config preserved")}`);
+      } else {
+        postSyncCommands.push(...buildPluginTextFileCommands("/etc/china-region-whitelist.conf", generatedConfig));
+        postSyncCommands.push(...buildChinaRegionWhitelistOperationCommands(usage, targetDir, operationSignature));
+      }
+      commands.push(postSyncCommands.join("\n"));
+    }
+    tasks.push({
+      pluginId: plugin.pluginId,
+      pluginVersion: plugin.version,
+      usageViewId: usageView.id,
+      forwardType: `plugin-${plugin.pluginId}-${usageView.id}-sync`,
+      syncSignature: operationSignature,
+      expectAbsent: false,
+      commands,
+    });
+  }
+  return tasks;
+}
+
+export async function installPluginFromGithub(input: {
+  repository: string;
+  branch?: string | null;
+  manifestPath?: string | null;
+  fallbackStoreId?: string | null;
+}) {
+  const repository = String(input.repository || "").trim();
+  const branch = String(input.branch || "").trim() || "main";
+  githubRepoParts(repository);
+  let manifest: ForwardxPluginManifest;
+  let manifestPath = input.manifestPath || null;
+  try {
+    const fetched = await tryFetchGithubManifest(repository, branch, input.manifestPath);
+    manifest = normalizeManifest(fetched.manifest, { repository });
+    manifestPath = fetched.path;
+  } catch (error) {
+    const fallback = await findStoreFallbackItem({ id: input.fallbackStoreId, repository });
+    if (!fallback) throw error;
+    manifest = builtinFallbackManifest(fallback);
+    manifestPath = fallback.manifestPath || null;
+  }
+  manifest.repository = manifest.repository || repository;
+  await upsertPlugin(manifest, { sourceType: "github", sourceUrl: repository, branch, manifestPath });
+  await upsertPluginAsset(manifest.id, "source.json", JSON.stringify({
+    repository,
+    branch,
+    archiveUrl: githubArchiveUrl(repository, branch),
+    installedAt: new Date().toISOString(),
+    manifestPath,
+  }, null, 2), "application/json");
+  await syncGithubDeclaredAssets(manifest, repository, branch, manifestPath);
+  return await getPlugin(manifest.id);
+}
+
+export async function installPluginFromPackage(input: {
+  content: Buffer;
+  fileName?: string | null;
+  sourceType?: "github" | "upload" | "local";
+  sourceUrl?: string | null;
+  branch?: string | null;
+  manifestPath?: string | null;
+}) {
+  const files = stripPackageRoot(readPluginPackage(input.content, input.fileName || ""));
+  if (files.length > MAX_PLUGIN_PACKAGE_FILES) throw new Error(`插件包文件不能超过 ${MAX_PLUGIN_PACKAGE_FILES} 个`);
+  const manifestFile = pluginPackageManifest(files);
+  const manifest = normalizeManifest(manifestFile.manifest, {
+    repository: input.sourceUrl || undefined,
+  });
+  const sourceManifestPath = input.manifestPath || manifestFile.path;
+  await upsertPlugin(manifest, {
+    sourceType: input.sourceType || "upload",
+    sourceUrl: input.sourceUrl || null,
+    branch: input.branch || null,
+    manifestPath: sourceManifestPath,
+  });
+  await upsertPluginAsset(manifest.id, "package.json", JSON.stringify({
+    fileName: input.fileName || "plugin-package",
+    sourceUrl: input.sourceUrl || null,
+    branch: input.branch || null,
+    installedAt: new Date().toISOString(),
+    manifestPath: sourceManifestPath,
+    packageManifestPath: manifestFile.path,
+    files: files.map((file) => ({ path: file.path, size: file.content.byteLength })),
+  }, null, 2), "application/json");
+  for (const file of files.slice(0, MAX_PLUGIN_PACKAGE_FILES)) {
+    const lower = file.path.toLowerCase();
+    if (PACKAGE_MANIFEST_CANDIDATES.includes(lower)) continue;
+    if (!isPackageAssetCandidate(file.path, file.content.byteLength) && !isDataAssetCandidate(file.path, file.content.byteLength)) continue;
+    await upsertPluginAsset(manifest.id, file.path, file.content.toString("utf8"), contentTypeForPath(file.path));
+  }
+  const sourceRepository = input.sourceUrl || manifest.repository;
+  if (input.sourceType !== "local" && sourceRepository && manifest.data?.type) {
+    await syncGithubDeclaredAssets(manifest, sourceRepository, input.branch || "main", sourceManifestPath);
+  }
+  return await getPlugin(manifest.id);
+}
+
+export async function installBundledPluginFromLocal(input: { bundledPath: string; storeItem?: PluginStoreItem | null }) {
+  const bundled = resolveBundledPluginDir(input.bundledPath);
+  const files = await localBundledPluginFiles(bundled.path);
+  const manifestFile = pluginPackageManifest(files);
+  const manifest = normalizeManifest(manifestFile.manifest, { repository: FORWARDX_REPO_URL });
+  await upsertPlugin(manifest, {
+    sourceType: "local",
+    sourceUrl: bundled.path,
+    branch: null,
+    manifestPath: manifestFile.path,
+  });
+  await upsertPluginAsset(manifest.id, "source.json", JSON.stringify({
+    source: "forwardx-bundled",
+    bundledPath: bundled.path,
+    storeItemId: input.storeItem?.id || null,
+    installedAt: new Date().toISOString(),
+    manifestPath: manifestFile.path,
+    files: files.map((file) => ({ path: file.path, size: file.content.byteLength })),
+  }, null, 2), "application/json");
+  for (const file of files.slice(0, MAX_PLUGIN_PACKAGE_FILES)) {
+    const lower = file.path.toLowerCase();
+    if (PACKAGE_MANIFEST_CANDIDATES.includes(lower)) continue;
+    if (!isPackageAssetCandidate(file.path, file.content.byteLength)) continue;
+    await upsertPluginAsset(manifest.id, file.path, file.content.toString("utf8"), contentTypeForPath(file.path));
+  }
+  await syncBundledPluginAssets(manifest.id, bundled.path);
+  return await getPlugin(manifest.id);
+}
+
+export async function installPluginFromPackageUrl(input: {
+  url: string;
+  fileName?: string | null;
+  sourceUrl?: string | null;
+  branch?: string | null;
+  manifestPath?: string | null;
+}) {
+  const content = await fetchBuffer(input.url);
+  return installPluginFromPackage({
+    content,
+    fileName: input.fileName || input.url.split("/").pop() || "plugin-package",
+    sourceType: "github",
+    sourceUrl: input.sourceUrl || input.url,
+    branch: input.branch || null,
+    manifestPath: input.manifestPath || null,
+  });
+}
+
+export async function installPluginFromStoreItem(item: PluginStoreItem) {
+  const packageRepository = String(item.packageRepository || "").trim();
+  const packageBranch = String(item.packageBranch || item.branch || "main").trim() || "main";
+  const packageErrors: string[] = [];
+  if (item.packageUrl) {
+    try {
+      return await installPluginFromPackageUrl({
+        url: item.packageUrl,
+        fileName: item.packageUrl.split("/").pop() || `${item.id}.tar.gz`,
+        sourceUrl: packageRepository || item.repository,
+        branch: packageBranch,
+        manifestPath: item.manifestPath,
+      });
+    } catch (error) {
+      packageErrors.push(`packageUrl: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (item.packagePath) {
+    const sourceRepository = packageRepository || FORWARDX_REPO_URL;
+    try {
+      return await installPluginFromPackageUrl({
+        url: githubRawUrl(sourceRepository, packageBranch, item.packagePath),
+        fileName: item.packagePath.split("/").pop() || `${item.id}.tar.gz`,
+        sourceUrl: sourceRepository,
+        branch: packageBranch,
+        manifestPath: item.manifestPath,
+      });
+    } catch (error) {
+      packageErrors.push(`packagePath: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (item.bundledPath) {
+    try {
+      return await installBundledPluginFromLocal({ bundledPath: item.bundledPath, storeItem: item });
+    } catch (error) {
+      packageErrors.push(`bundledPath: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (packageRepository) {
+    return installPluginFromGithub({
+      repository: packageRepository,
+      branch: packageBranch,
+      manifestPath: item.manifestPath,
+      fallbackStoreId: item.id,
+    });
+  }
+  if (packageErrors.length) {
+    throw new Error(`插件下载安装失败: ${packageErrors.join("; ")}`);
+  }
+  return installPluginFromGithub({
+    repository: item.repository,
+    branch: item.branch || "main",
+    manifestPath: item.manifestPath,
+    fallbackStoreId: item.id,
+  });
+}
+
+export async function installPluginFromUpload(content: string) {
+  const size = Buffer.byteLength(content || "", "utf8");
+  if (size <= 0) throw new Error("上传内容为空");
+  if (size > MAX_PLUGIN_UPLOAD_BYTES) throw new Error("插件上传内容不能超过 1MB");
+  let parsed: any;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    throw new Error("插件上传内容必须是 JSON");
+  }
+  const manifestSource = parsed?.manifest && typeof parsed.manifest === "object" ? parsed.manifest : parsed;
+  const manifest = normalizeManifest(manifestSource);
+  await upsertPlugin(manifest, { sourceType: "upload", sourceUrl: null, branch: null, manifestPath: null });
+  await upsertPluginAsset(manifest.id, "uploaded.json", content, "application/json");
+  if (parsed?.assets && typeof parsed.assets === "object") {
+    const entries = Object.entries(parsed.assets).slice(0, MAX_PLUGIN_ASSETS);
+    for (const [assetPath, value] of entries) {
+      if (typeof value === "string") {
+        await upsertPluginAsset(manifest.id, assetPath, value, "text/plain;charset=utf-8");
+      }
+    }
+  }
+  return await getPlugin(manifest.id);
+}
+
+export async function setPluginEnabled(pluginId: string, enabled: boolean) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const id = assertPluginId(pluginId);
+  const plugin = await getPlugin(id);
+  if (!plugin) throw new Error("插件不存在");
+  await db.update(plugins).set({ status: enabled ? "enabled" : "disabled", updatedAt: nowDate(), lastError: null } as any).where(eq(plugins.pluginId, id));
+  const usageView = firstHostAssetSyncView(plugin.manifest);
+  if (usageView) {
+    const usage = normalizeHostAssetSyncUsage(
+      pluginSettingsValues(plugin.manifest)[usageStorageKey(plugin, usageView.id)],
+      usageView,
+    );
+    const hostRows = await db.select({ id: hosts.id }).from(hosts);
+    const refreshHostIds = resolvePluginUsageHostIds(
+      usageView,
+      usage,
+      hostRows.map((host: any) => Number(host.id)),
+    );
+    for (const hostId of refreshHostIds) {
+      pushAgentRefresh(hostId, `plugin-${id}-${enabled ? "enabled" : "disabled"}`, { urgent: true });
+    }
+  }
+  return await getPlugin(id);
+}
+
+export async function setPluginTrusted(pluginId: string, trusted: boolean, actorUserId?: number | null) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const id = assertPluginId(pluginId);
+  const plugin = await getPlugin(id);
+  if (!plugin) throw new Error("插件不存在");
+  if (trusted && !plugin.trustRequired) throw new Error("该插件没有声明需要信任授权的高权限面板操作");
+  await db.update(plugins).set({ trusted, updatedAt: nowDate() } as any).where(eq(plugins.pluginId, id));
+  appendPanelLog("info", `[PluginAudit] plugin=${id} operation=trust.change actor=${Number(actorUserId || 0) || "-"} trusted=${trusted}`);
+  return await getPlugin(id);
+}
+
+export async function uninstallPlugin(pluginId: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const id = assertPluginId(pluginId);
+  await db.delete(pluginAgentStates).where(eq(pluginAgentStates.pluginId, id));
+  await db.delete(pluginAssets).where(eq(pluginAssets.pluginId, id));
+  await db.delete(plugins).where(eq(plugins.pluginId, id));
+}
+
+export async function checkPluginUpdate(pluginId: string, options: { refreshStores?: boolean } = {}) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const plugin = await getPlugin(pluginId);
+  if (!plugin) throw new Error("插件不存在");
+  if (options.refreshStores) await refreshPluginStoreItems();
+  const storeItem = await findStoreFallbackItem({
+    id: plugin.pluginId,
+    repository: plugin.manifest?.data?.repository || plugin.repository || plugin.sourceUrl,
+  });
+  let latestVersion = String(storeItem?.version || "").trim();
+  let manifestPath = storeItem?.manifestPath || plugin.manifestPath || null;
+  let source = storeItem?.official ? "official" : storeItem?.storeSourceId ? "third-party" : "github";
+  let sourceName = storeItem?.official ? "官方插件商店" : storeItem?.storeSourceName || "GitHub";
+  const bundledPath = await bundledPathForPlugin(plugin);
+  if (bundledPath) {
+    const files = await localBundledPluginFiles(bundledPath);
+    const manifestFile = pluginPackageManifest(files);
+    const manifest = normalizeManifest(manifestFile.manifest, { repository: FORWARDX_REPO_URL });
+    if (!latestVersion || compareVersions(manifest.version, latestVersion) > 0) {
+      latestVersion = manifest.version;
+      manifestPath = manifestFile.path;
+      source = "local";
+      sourceName = "面板内置插件";
+    }
+  }
+  if (!latestVersion && plugin.sourceType !== "github") {
+    throw new Error("只有 GitHub 来源插件支持在线检查更新");
+  }
+  if (!latestVersion) {
+    const sourceUrl = String(plugin.sourceUrl || "").trim();
+    if (!sourceUrl) throw new Error("插件缺少可检查更新的 GitHub 来源");
+    const fetched = await tryFetchGithubManifest(sourceUrl, String(plugin.branch || "main"), plugin.manifestPath);
+    const manifest = normalizeManifest(fetched.manifest, { repository: sourceUrl });
+    latestVersion = manifest.version;
+    manifestPath = fetched.path;
+    source = "github";
+    sourceName = "GitHub";
+  }
+  await db.update(plugins).set({
+    latestVersion,
+    manifestPath,
+    lastCheckedAt: nowDate(),
+    lastError: null,
+  } as any).where(eq(plugins.pluginId, plugin.pluginId));
+  return {
+    pluginId: plugin.pluginId,
+    name: plugin.name,
+    currentVersion: plugin.version,
+    latestVersion,
+    hasUpdate: pluginVersionHasUpdate(plugin.version, latestVersion),
+    source,
+    sourceName,
+  };
+}
+
+export async function checkAllPluginUpdates() {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const store = await refreshPluginStoreItems();
+  const installed = await listPlugins();
+  const candidates = installed.filter((plugin: any) => plugin.sourceType === "github" || plugin.sourceType === "local");
+  const results = await mapWithConcurrency(candidates, PLUGIN_UPDATE_CHECK_CONCURRENCY, async (plugin: any) => {
+    try {
+      return { ok: true as const, ...(await checkPluginUpdate(plugin.pluginId)) };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await db.update(plugins).set({
+        lastCheckedAt: nowDate(),
+        lastError: message.slice(0, 1000),
+      } as any).where(eq(plugins.pluginId, plugin.pluginId));
+      return {
+        ok: false as const,
+        pluginId: plugin.pluginId,
+        name: plugin.name,
+        currentVersion: plugin.version,
+        latestVersion: String(plugin.latestVersion || ""),
+        hasUpdate: pluginVersionHasUpdate(plugin.version, plugin.latestVersion),
+        error: message,
+      };
+    }
+  });
+  return {
+    checkedAt: new Date().toISOString(),
+    checked: results.length,
+    unsupported: installed.length - candidates.length,
+    updates: results.filter((result: any) => result.hasUpdate).length,
+    failed: results.filter((result: any) => !result.ok).length,
+    results,
+    store: {
+      official: store.official,
+      sources: store.sources,
+    },
+  };
+}
+
+export async function refreshPluginAssets(pluginId: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const plugin = await getPlugin(pluginId);
+  if (!plugin) throw new Error("插件不存在");
+  const bundledPath = await bundledPathForPlugin(plugin);
+  if (bundledPath) {
+    const syncResult = await syncBundledPluginAssets(plugin.pluginId, bundledPath);
+    await db.update(plugins).set({ lastCheckedAt: nowDate(), lastError: null, updatedAt: nowDate() } as any).where(eq(plugins.pluginId, plugin.pluginId));
+    return syncResult;
+  }
+  if (plugin.sourceType !== "github" || !plugin.sourceUrl) {
+    throw new Error("只有 GitHub 来源插件支持刷新数据");
+  }
+  const branch = String(plugin.branch || "main");
+  const syncResult = await syncGithubDeclaredAssets(plugin.manifest, plugin.sourceUrl, branch, plugin.manifestPath);
+  await db.update(plugins).set({ lastCheckedAt: nowDate(), lastError: null, updatedAt: nowDate() } as any).where(eq(plugins.pluginId, plugin.pluginId));
+  return syncResult;
+}
+
+async function finalizePluginUpdate(pluginId: string, expectedVersion?: string | null) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const installed = await getPlugin(pluginId);
+  if (!installed) throw new Error("插件更新后未找到安装记录");
+  const expected = String(expectedVersion || "").trim();
+  if (expected && compareVersions(installed.version, expected) < 0) {
+    const message = `插件包版本 v${installed.version} 低于商店声明版本 v${expected}`;
+    await db.update(plugins).set({
+      latestVersion: expected,
+      lastCheckedAt: nowDate(),
+      lastError: message,
+    } as any).where(eq(plugins.pluginId, installed.pluginId));
+    throw new Error(message);
+  }
+  await db.update(plugins).set({
+    latestVersion: installed.version,
+    lastCheckedAt: nowDate(),
+    lastError: null,
+  } as any).where(eq(plugins.pluginId, installed.pluginId));
+  const refreshed = await getPlugin(installed.pluginId);
+  const usageView = firstHostAssetSyncView(refreshed?.manifest);
+  if (refreshed && usageView) {
+    const usage = normalizeHostAssetSyncUsage(
+      pluginSettingsValues(refreshed.manifest)[usageStorageKey(refreshed, usageView.id)],
+      usageView,
+    );
+    const hostRows = await db.select({ id: hosts.id }).from(hosts);
+    for (const hostId of resolvePluginUsageHostIds(usageView, usage, hostRows.map((host: any) => Number(host.id)))) {
+      pushAgentRefresh(hostId, `plugin-${installed.pluginId}-updated`, { urgent: true });
+    }
+  }
+  return refreshed;
+}
+
+export async function updatePluginFromGithub(pluginId: string) {
+  const plugin = await getPlugin(pluginId);
+  if (!plugin) throw new Error("插件不存在");
+  await refreshPluginStoreItems();
+  const storeItem = await findStoreFallbackItem({
+    id: plugin.pluginId,
+    repository: plugin.manifest?.data?.repository || plugin.repository || plugin.sourceUrl,
+  });
+  const bundledPath = await bundledPathForPlugin(plugin);
+  const expectedVersion = pluginVersionHasUpdate(plugin.version, storeItem?.version)
+    ? String(storeItem?.version || "")
+    : pluginVersionHasUpdate(plugin.version, plugin.latestVersion)
+      ? String(plugin.latestVersion || "")
+      : "";
+  if (storeItem && pluginVersionHasUpdate(plugin.version, storeItem.version)) {
+    const updated = await installPluginFromStoreItem(storeItem);
+    return finalizePluginUpdate(updated?.pluginId || plugin.pluginId, expectedVersion);
+  }
+  if (bundledPath) {
+    const updated = await installBundledPluginFromLocal({ bundledPath });
+    return finalizePluginUpdate(updated?.pluginId || plugin.pluginId, expectedVersion);
+  }
+  if (plugin.sourceType !== "github" || !plugin.sourceUrl) {
+    throw new Error("只有 GitHub 来源插件支持在线更新");
+  }
+  if (storeItem?.packagePath || storeItem?.packageUrl) {
+    const updated = await installPluginFromStoreItem(storeItem);
+    return finalizePluginUpdate(updated?.pluginId || plugin.pluginId, expectedVersion);
+  }
+  const updated = await installPluginFromGithub({
+    repository: plugin.sourceUrl,
+    branch: plugin.branch || "main",
+    manifestPath: plugin.manifestPath || undefined,
+    fallbackStoreId: plugin.pluginId,
+  });
+  return finalizePluginUpdate(updated?.pluginId || plugin.pluginId, expectedVersion);
+}
+
+export function isPluginSettingUrl(value: string) {
+  return /^https?:\/\//i.test(value) || /^\/(?!\/)/.test(value);
+}
+
+export function normalizePluginSettingValue(field: PluginSettingField, value: unknown) {
+  if (field.type === "boolean") return value === true;
+  if (field.type === "number") {
+    const numberValue = Number(value);
+    if (!Number.isFinite(numberValue)) throw new Error(`${field.label}需要填写数字`);
+    if (field.min !== undefined && numberValue < field.min) throw new Error(`${field.label}不能小于 ${field.min}`);
+    if (field.max !== undefined && numberValue > field.max) throw new Error(`${field.label}不能大于 ${field.max}`);
+    return numberValue;
+  }
+  if (field.type === "multi-select") {
+    if (!Array.isArray(value)) throw new Error(`${field.label}的选项格式不合法`);
+    const allowed = new Set((field.options || []).map((option) => option.value));
+    const selected = Array.from(new Set(value
+      .map((item) => String(item || "").trim())
+      .filter((item) => item && (!allowed.size || allowed.has(item)))))
+      .slice(0, 40);
+    if (field.required && selected.length === 0) throw new Error(`${field.label}至少需要选择一项`);
+    return selected;
+  }
+  const nextValue = String(value ?? "").slice(0, field.type === "textarea" ? 10000 : 1000);
+  if (field.required && !nextValue.trim()) throw new Error(`${field.label}不能为空`);
+  if (field.type === "url" && nextValue.trim() && !isPluginSettingUrl(nextValue.trim())) {
+    throw new Error(`${field.label}必须填写 http://、https:// 或以 / 开头的面板内路径`);
+  }
+  if (field.type === "select" && field.options?.length) {
+    const allowed = new Set(field.options.map((option) => option.value));
+    if (!allowed.has(nextValue)) throw new Error(`${field.label}的选项不合法`);
+  }
+  return nextValue;
+}
+
+export async function savePluginSettings(pluginId: string, values: Record<string, unknown>) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const id = assertPluginId(pluginId);
+  const plugin = await getPlugin(id);
+  if (!plugin) throw new Error("插件不存在");
+  const entries = Object.entries(values || {});
+  if (entries.length === 0) throw new Error("没有需要保存的插件设置");
+  if (entries.length > MAX_PLUGIN_FIELDS) throw new Error(`插件设置项不能超过 ${MAX_PLUGIN_FIELDS} 个`);
+  const fields = new Map<string, PluginSettingField>((plugin.manifest.settingsSchema || [])
+    .map((field: PluginSettingField) => [field.key, field] as const));
+  const settings = (plugin.manifest as any)?.settingsValues && typeof (plugin.manifest as any).settingsValues === "object"
+    ? { ...(plugin.manifest as any).settingsValues }
+    : {};
+  for (const [rawKey, value] of entries) {
+    const settingKey = String(rawKey || "").trim();
+    const field = fields.get(settingKey);
+    if (!field) throw new Error(`插件没有声明设置项 ${settingKey || "<empty>"}`);
+    settings[settingKey] = normalizePluginSettingValue(field, value);
+  }
+  const manifest = { ...(plugin.manifest as any), settingsValues: settings } as ForwardxPluginManifest;
+  await db.update(plugins).set({ manifestJson: JSON.stringify(manifest, null, 2), updatedAt: nowDate() } as any).where(eq(plugins.pluginId, id));
+  return await getPlugin(id);
+}
+
+export async function savePluginSetting(pluginId: string, key: string, value: unknown) {
+  return savePluginSettings(pluginId, { [String(key || "").trim()]: value });
+}
+
+function defaultActionInputValue(field: PluginSettingField) {
+  if (field.defaultValue !== undefined) return field.defaultValue;
+  if (field.type === "boolean") return false;
+  return "";
+}
+
+function normalizeActionInputValues(fields: PluginSettingField[] | undefined, value: unknown) {
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const result: Record<string, unknown> = {};
+  for (const field of fields || []) {
+    const incoming = raw[field.key] !== undefined ? raw[field.key] : defaultActionInputValue(field);
+    if (field.type === "boolean") {
+      result[field.key] = incoming === true;
+      continue;
+    }
+    if (field.type === "number") {
+      const numberText = String(incoming ?? "").trim();
+      if (!numberText && !field.required) {
+        result[field.key] = "";
+        continue;
+      }
+      const numberValue = Number(numberText);
+      if (!Number.isFinite(numberValue)) throw new Error(`请填写有效的${field.label}`);
+      if (field.min !== undefined && numberValue < field.min) throw new Error(`${field.label}不能小于 ${field.min}`);
+      if (field.max !== undefined && numberValue > field.max) throw new Error(`${field.label}不能大于 ${field.max}`);
+      result[field.key] = numberValue;
+      continue;
+    }
+    if (field.type === "multi-select") {
+      const allowed = new Set((field.options || []).map((option) => option.value));
+      const selected = Array.isArray(incoming)
+        ? Array.from(new Set(incoming.map((item) => String(item || "").trim())
+          .filter((item) => item && (!allowed.size || allowed.has(item))))).slice(0, 40)
+        : [];
+      if (field.required && selected.length === 0) throw new Error(`请至少选择一项${field.label}`);
+      result[field.key] = selected;
+      continue;
+    }
+    const textLimit = field.type === "textarea" ? 10000 : 1000;
+    const text = String(incoming ?? "").slice(0, textLimit);
+    if (field.required && !text.trim()) throw new Error(`请填写${field.label}`);
+    if (field.type === "url" && text.trim() && !isPluginSettingUrl(text.trim())) {
+      throw new Error(`${field.label}必须填写 http://、https:// 或以 / 开头的面板内路径`);
+    }
+    if (field.type === "select" && field.options?.length) {
+      const allowed = new Set(field.options.map((option: { value: string }) => option.value));
+      result[field.key] = allowed.has(text) ? text : String(field.defaultValue || field.options[0]?.value || "");
+      continue;
+    }
+    result[field.key] = text;
+  }
+  return result;
+}
+
+function normalizeAgentResourceInputValue(value: unknown, depth = 0): unknown {
+  if (depth > 5 || value === undefined || value === null) return value === null ? null : undefined;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string") return value.replace(/\u0000/g, "").slice(0, 16_000);
+  if (Array.isArray(value)) {
+    return value.slice(0, 200)
+      .map((item) => normalizeAgentResourceInputValue(item, depth + 1))
+      .filter((item) => item !== undefined);
+  }
+  if (typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value).slice(0, 100)) {
+      const safeKey = normalizeResourceKey(key, 80);
+      if (!safeKey) continue;
+      const normalized = normalizeAgentResourceInputValue(item, depth + 1);
+      if (normalized !== undefined) result[safeKey] = normalized;
+    }
+    return result;
+  }
+  return undefined;
+}
+
+function normalizeAgentResourceInput(value: unknown) {
+  const normalized = normalizeAgentResourceInputValue(value);
+  const result = normalized && typeof normalized === "object" && !Array.isArray(normalized)
+    ? normalized as Record<string, unknown>
+    : {};
+  const encoded = JSON.stringify(result);
+  if (Buffer.byteLength(encoded, "utf8") > MAX_PLUGIN_AGENT_INPUT_BYTES) {
+    throw new Error("插件资源操作参数过大");
+  }
+  return result;
+}
+
+function pluginHasPermission(plugin: any, permission: PluginPermissionKey) {
+  const manifestPermissions = Array.isArray(plugin?.manifest?.permissions) ? plugin.manifest.permissions : [];
+  const rowPermissions = Array.isArray(plugin?.permissions) ? plugin.permissions : [];
+  return manifestPermissions.includes(permission) || rowPermissions.includes(permission);
+}
+
+function collectPluginSecretValues(plugin: any) {
+  const settings = pluginSettingsValues(plugin?.manifest || {});
+  const secrets: string[] = [];
+  for (const field of plugin?.manifest?.settingsSchema || []) {
+    const key = String(field?.key || "");
+    const value = String(settings[key] ?? "");
+    const lowerKey = key.toLowerCase();
+    if (value && (field?.type === "password" || /token|secret|password|passwd|cookie|key/.test(lowerKey))) {
+      secrets.push(value);
+    }
+  }
+  return Array.from(new Set(secrets)).filter((item) => item.length >= 4).slice(0, 40);
+}
+
+function redactText(value: string, secrets: string[]) {
+  let text = String(value || "");
+  for (const secret of secrets) {
+    text = text.split(secret).join("***");
+  }
+  return text;
+}
+
+function redactJsonValue(value: unknown, secrets: string[]): unknown {
+  if (typeof value === "string") return redactText(value, secrets);
+  if (Array.isArray(value)) return value.slice(0, 1000).map((item) => redactJsonValue(item, secrets));
+  if (value && typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value).slice(0, 1000)) {
+      result[key] = redactJsonValue(item, secrets);
+    }
+    return result;
+  }
+  return value;
+}
+
+function templateLookup(path: string, context: { settings: Record<string, unknown>; input: Record<string, unknown>; plugin: any }) {
+  const match = String(path || "").match(/^(settings|input|plugin)\.([A-Za-z0-9._-]{1,120})$/);
+  if (!match) return "";
+  const [, scope, key] = match;
+  const normalizedKey = normalizePluginId(key).slice(0, 80);
+  const nestedValue = (root: Record<string, unknown>) => {
+    if (Object.prototype.hasOwnProperty.call(root, key)) return root[key];
+    if (Object.prototype.hasOwnProperty.call(root, normalizedKey)) return root[normalizedKey];
+    let current: unknown = root;
+    for (const segment of key.split(".")) {
+      if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
+      if (["__proto__", "prototype", "constructor"].includes(segment)) return undefined;
+      current = (current as Record<string, unknown>)[segment];
+    }
+    return current;
+  };
+  if (scope === "settings") return nestedValue(context.settings) ?? "";
+  if (scope === "input") return nestedValue(context.input) ?? "";
+  if (scope === "plugin") {
+    if (key === "id") return context.plugin?.pluginId || context.plugin?.manifest?.id || "";
+    if (key === "name") return context.plugin?.name || context.plugin?.manifest?.name || "";
+    if (key === "version") return context.plugin?.version || context.plugin?.manifest?.version || "";
+  }
+  return "";
+}
+
+function renderTemplateString(template: string, context: { settings: Record<string, unknown>; input: Record<string, unknown>; plugin: any }) {
+  return String(template || "").replace(/\{\{\s*([A-Za-z]+(?:\.[A-Za-z0-9._-]{1,120})?)\s*\}\}/g, (_all, key) => {
+    const value = templateLookup(key, context);
+    if (value === undefined || value === null) return "";
+    if (typeof value === "object") return JSON.stringify(value);
+    return String(value);
+  });
+}
+
+function renderTemplateValue(value: unknown, context: { settings: Record<string, unknown>; input: Record<string, unknown>; plugin: any }): unknown {
+  if (typeof value === "string") return renderTemplateString(value, context);
+  if (Array.isArray(value)) return value.map((item) => renderTemplateValue(item, context));
+  if (value && typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      result[key] = renderTemplateValue(item, context);
+    }
+    return result;
+  }
+  return value;
+}
+
+function buildPluginHttpUrl(request: PluginHttpRequestDefinition, context: { settings: Record<string, unknown>; input: Record<string, unknown>; plugin: any }) {
+  let urlText = "";
+  if (request.url) {
+    urlText = renderTemplateString(request.url, context).trim();
+  } else if (request.baseUrlSetting && request.path) {
+    const base = String(context.settings[request.baseUrlSetting] ?? "").trim();
+    if (!base) throw new Error(`请先配置 ${request.baseUrlSetting}`);
+    const renderedPath = renderTemplateString(request.path, context).trim();
+    urlText = new URL(renderedPath || "/", base.endsWith("/") ? base : `${base}/`).toString();
+  }
+  let url: URL;
+  try {
+    url = new URL(urlText);
+  } catch {
+    throw new Error("插件 HTTP 请求地址无效");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("插件 HTTP 请求仅支持 http/https");
+  for (const [key, value] of Object.entries(request.query || {})) {
+    url.searchParams.set(key, renderTemplateString(value, context));
+  }
+  return url;
+}
+
+function buildPluginHttpHeaders(request: PluginHttpRequestDefinition, context: { settings: Record<string, unknown>; input: Record<string, unknown>; plugin: any }) {
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(request.headers || {})) {
+    headers[key] = renderTemplateString(value, context);
+  }
+  const auth = request.auth;
+  if (auth?.type === "bearer") {
+    const token = renderTemplateString(auth.token || "", context).trim();
+    if (token) headers.Authorization = `Bearer ${token}`;
+  } else if (auth?.type === "header") {
+    const header = renderTemplateString(auth.header || "", context).trim();
+    const value = renderTemplateString(auth.value || "", context);
+    if (header && value) headers[header] = value;
+  } else if (auth?.type === "cookie") {
+    const cookieName = renderTemplateString(auth.cookieName || "", context).trim();
+    const cookieValue = renderTemplateString(auth.cookieValue || "", context);
+    if (cookieName && cookieValue) headers.Cookie = `${cookieName}=${cookieValue}`;
+  }
+  return headers;
+}
+
+function buildPluginHttpBody(request: PluginHttpRequestDefinition, headers: Record<string, string>, context: { settings: Record<string, unknown>; input: Record<string, unknown>; plugin: any }) {
+  if (request.method === "GET" || request.body === undefined) return undefined;
+  const rendered = renderTemplateValue(request.body, context);
+  if (typeof rendered === "string") {
+    if (!Object.keys(headers).some((key) => key.toLowerCase() === "content-type")) {
+      headers["Content-Type"] = "text/plain;charset=utf-8";
+    }
+    return rendered;
+  }
+  if (!Object.keys(headers).some((key) => key.toLowerCase() === "content-type")) {
+    headers["Content-Type"] = "application/json;charset=utf-8";
+  }
+  return JSON.stringify(rendered ?? {});
+}
+
+async function readResponseTextLimited(response: Response, maxBytes: number) {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let totalBytes = 0;
+  let text = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    totalBytes += value.byteLength;
+    if (totalBytes > maxBytes) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Ignore cancellation errors after the limit has already been enforced.
+      }
+      throw new Error(`插件 HTTP 响应过大，不能超过 ${formatByteLimit(maxBytes)}`);
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  return text + decoder.decode();
+}
+
+async function executePluginHttpAction(plugin: any, action: PluginActionDefinition, input: unknown) {
+  if (!pluginHasPermission(plugin, "net:http")) throw new Error("插件未声明 net:http 权限，不能发起外部 API 请求");
+  if (!action.request) throw new Error("插件动作缺少 HTTP 请求定义");
+  const settings = pluginSettingsValues(plugin.manifest);
+  const actionInput = normalizeActionInputValues(action.inputSchema, input);
+  const context = { settings, input: actionInput, plugin };
+  const secrets = collectPluginSecretValues(plugin);
+  const url = buildPluginHttpUrl(action.request, context);
+  const safeUrl = await assertSafePluginHttpUrl(url.toString());
+  const headers = buildPluginHttpHeaders(action.request, context);
+  const body = buildPluginHttpBody(action.request, headers, context);
+  const timeoutMs = Math.max(1000, Math.min(MAX_PLUGIN_HTTP_TIMEOUT_MS, Number(action.request.timeoutMs || DEFAULT_PLUGIN_HTTP_TIMEOUT_MS)));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = Date.now();
+  let response: Response;
+  try {
+    response = await fetch(safeUrl, {
+      method: action.request.method,
+      headers,
+      body,
+      redirect: "manual",
+      signal: controller.signal,
+    });
+  } catch (error) {
+    const message = error instanceof Error && error.name === "AbortError"
+      ? `插件 HTTP 请求超时（${timeoutMs}ms）`
+      : `插件 HTTP 请求失败：${error instanceof Error ? error.message : String(error)}`;
+    throw new Error(redactText(message, secrets));
+  } finally {
+    clearTimeout(timeout);
+  }
+  const durationMs = Date.now() - startedAt;
+  const contentLength = Number(response.headers.get("content-length") || 0);
+  if (contentLength > MAX_PLUGIN_HTTP_RESPONSE_BYTES) {
+    throw new Error(`插件 HTTP 响应过大，不能超过 ${formatByteLimit(MAX_PLUGIN_HTTP_RESPONSE_BYTES)}`);
+  }
+  const responseText = await readResponseTextLimited(response, MAX_PLUGIN_HTTP_RESPONSE_BYTES);
+  const responseHeaders: Record<string, string> = {};
+  response.headers.forEach((value, key) => {
+    if (key.toLowerCase() === "set-cookie") return;
+    responseHeaders[key] = redactText(value, secrets).slice(0, 1000);
+  });
+  const contentType = response.headers.get("content-type") || "";
+  const shouldParseJson = action.request.responseType === "json" || (action.request.responseType !== "text" && /\bjson\b/i.test(contentType));
+  let parsedBody: unknown;
+  let parseError: string | undefined;
+  if (shouldParseJson && responseText.trim()) {
+    try {
+      parsedBody = redactJsonValue(JSON.parse(responseText), secrets);
+    } catch (error) {
+      parseError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  return {
+    ok: response.ok,
+    message: response.ok
+      ? `HTTP ${response.status} 请求完成`
+      : `HTTP ${response.status} ${response.statusText || "请求未成功"}`,
+    result: {
+      type: "http.request",
+      actionId: action.id,
+      url: redactText(url.toString(), secrets),
+      method: action.request.method,
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+      durationMs,
+      headers: responseHeaders,
+      body: parsedBody,
+      bodyText: redactText(responseText, secrets),
+      parseError,
+    },
+  };
+}
+
+async function executePluginAgentAction(
+  plugin: any,
+  action: PluginActionDefinition,
+  input: unknown,
+  options: { hostIds?: number[]; resourceViewId?: string } = {},
+) {
+  if (plugin?.trusted !== true) {
+    throw new Error("插件尚未设为信任，不能在 Agent 上执行系统脚本");
+  }
+  const resourceViewId = normalizePluginId(options.resourceViewId).slice(0, 80);
+  const resourceView: PluginResourceViewDefinition | undefined = resourceViewId
+    ? (plugin.manifest.resourceViews || []).find((view: PluginResourceViewDefinition) => view.id === resourceViewId)
+    : undefined;
+  if (resourceViewId && !resourceView) throw new Error("插件没有声明该动态资源视图");
+  if (resourceView) {
+    const linkedActionIds = new Set<string>([
+      ...resourceView.sources.map((source: PluginResourceDataSourceDefinition) => source.actionId),
+      resourceView.operations?.create?.actionId,
+      resourceView.operations?.update?.actionId,
+      resourceView.operations?.delete?.actionId,
+      ...(resourceView.operations?.execute || []).map((operation: PluginResourceOperationDefinition) => operation.actionId),
+    ].filter(Boolean) as string[]);
+    if (!linkedActionIds.has(action.id)) throw new Error("该动作不属于当前插件资源视图");
+  }
+  const requiredPermission: PluginPermissionKey = action.intent === "read"
+    ? "agent:read"
+    : action.intent === "write"
+      ? "agent:write"
+      : "agent:execute";
+  if (!pluginHasPermission(plugin, requiredPermission)) {
+    throw new Error(`插件未声明 ${requiredPermission} 权限，不能向 Agent 下发该操作`);
+  }
+  if (!action.agent) throw new Error("插件动作缺少 Agent 请求定义");
+  const usageView = (plugin.manifest.usageViews || []).find((item: PluginUsageViewDefinition) => item.id === action.agent?.usageViewId)
+    || firstHostAssetSyncView(plugin.manifest);
+  if (!usageView || usageView.type !== "host-asset-sync") throw new Error("Agent 动作需要关联主机使用页");
+  const usage = normalizeHostAssetSyncUsage(pluginSettingsValues(plugin.manifest)[usageStorageKey(plugin, usageView.id)], usageView);
+  if (!usage.enabled || (usageViewHostScope(usageView) !== "all" && usage.hostIds.length === 0)) {
+    throw new Error(usageViewHostScope(usageView) === "all"
+      ? "请先在插件使用页启用配置"
+      : "请先在插件使用页启用配置并选择生效主机");
+  }
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const [hostRows, syncAssetRows] = await Promise.all([
+    db.select({
+      id: hosts.id,
+      name: hosts.name,
+      agentVersion: hosts.agentVersion,
+      isOnline: hosts.isOnline,
+      lastHeartbeat: hosts.lastHeartbeat,
+    }).from(hosts),
+    db.select({
+      path: pluginAssets.path,
+      size: pluginAssets.size,
+      sha256: pluginAssets.sha256,
+    }).from(pluginAssets).where(eq(pluginAssets.pluginId, plugin.pluginId)),
+  ]);
+  const expectedSyncSignature = pluginHostSyncSignature(
+    plugin.pluginId,
+    usageView,
+    usage,
+    hostAssetSyncDir(plugin.pluginId, usageView),
+    pluginHostSyncFiles(usageView, usage, syncAssetRows).files,
+  );
+  const selectedHostIds = new Set(resolvePluginUsageHostIds(
+    usageView,
+    usage,
+    hostRows.map((host: any) => Number(host.id)),
+  ));
+  const requestedHostIds = normalizePositiveIds(options.hostIds);
+  if (action.agent.target === "selected-hosts" && requestedHostIds.length === 0) {
+    throw new Error("该插件操作需要先选择目标 Agent");
+  }
+  const requestedHostIdSet = new Set(requestedHostIds);
+  const targetHosts = hostRows.filter((host: any) => (
+    selectedHostIds.has(Number(host.id))
+    && (requestedHostIds.length === 0 || requestedHostIdSet.has(Number(host.id)))
+  ));
+  if (requestedHostIds.some((hostId) => !selectedHostIds.has(hostId))) {
+    throw new Error(usageViewHostScope(usageView) === "all"
+      ? "目标 Agent 不存在"
+      : "目标 Agent 不在该插件已保存的生效主机范围内");
+  }
+  if (targetHosts.length === 0) throw new Error("插件配置中的目标主机已不存在");
+  if (requestedHostIds.length > 0) {
+    const offlineHosts = targetHosts.filter((host: any) => !host.isOnline || !isFreshHostHeartbeat(host.lastHeartbeat));
+    if (offlineHosts.length > 0) {
+      const names = offlineHosts.slice(0, 5).map((host: any) => String(host.name || `主机 ${host.id}`)).join("、");
+      throw new Error(`${names} 当前离线，无法执行实时插件操作`);
+    }
+  }
+  const unsupportedHosts = targetHosts.filter((host: any) => !isAgentVersionAtLeast(host.agentVersion, AGENT_PLUGIN_TASK_VERSION));
+  if (unsupportedHosts.length > 0) {
+    const names = unsupportedHosts.slice(0, 5).map((host: any) => String(host.name || `主机 ${host.id}`)).join("、");
+    const suffix = unsupportedHosts.length > 5 ? ` 等 ${unsupportedHosts.length} 台主机` : "";
+    throw new Error(`${names}${suffix} 需要先升级到 Agent v${AGENT_PLUGIN_TASK_VERSION} 才能执行插件操作`);
+  }
+  const unsyncedHosts = targetHosts.flatMap((host: any) => {
+    const inventory = getAgentPluginInventory(host.id);
+    if (!inventory) return [{ ...host, actualVersion: "未回报" }];
+    const actualVersion = inventory.versions.get(plugin.pluginId) || "未同步";
+    const signatureMatches = inventory.syncSignatures.get(plugin.pluginId) === expectedSyncSignature;
+    return actualVersion === plugin.version && signatureMatches ? [] : [{ ...host, actualVersion }];
+  });
+  if (unsyncedHosts.length > 0) {
+    const names = unsyncedHosts.slice(0, 5)
+      .map((host: any) => `${String(host.name || `主机 ${host.id}`)}（Agent=${host.actualVersion}，面板=${plugin.version}）`)
+      .join("、");
+    throw new Error(`${names} 的插件资源尚未同步完成，请等待 Agent 回报实际版本后重试`);
+  }
+  const actionInput = resourceView
+    ? normalizeAgentResourceInput(input)
+    : normalizeActionInputValues(action.inputSchema, input);
+  const context = { settings: pluginSettingsValues(plugin.manifest), input: actionInput, plugin };
+  const renderedArguments = (action.agent.arguments || []).map((argument) => renderTemplateString(argument, context).slice(0, MAX_PLUGIN_AGENT_ARGUMENT_BYTES));
+  const workingDirectory = hostAssetSyncDir(plugin.pluginId, usageView);
+  const expectedRoot = `${PLUGIN_HOST_ASSET_ROOT}/${plugin.pluginId}`;
+  if (workingDirectory !== expectedRoot && !workingDirectory.startsWith(`${expectedRoot}/`)) {
+    throw new Error(`Agent 动作目录必须位于 ${expectedRoot}`);
+  }
+  const group = enqueuePluginAgentTaskGroup({
+    pluginId: plugin.pluginId,
+    pluginVersion: plugin.version,
+    actionId: action.id,
+    intent: action.intent || "execute",
+    contextId: resourceViewId,
+    executor: action.agent.executor,
+    interpreter: action.agent.interpreter || "bash",
+    workingDirectory,
+    entry: action.agent.entry,
+    arguments: renderedArguments,
+    timeoutMs: action.agent.timeoutMs || DEFAULT_PLUGIN_HTTP_TIMEOUT_MS,
+    outputType: action.agent.outputType || "json",
+    hosts: targetHosts,
+  });
+  await rememberPluginAgentTaskGroup(group);
+  for (const host of targetHosts) {
+    pushAgentRefresh(Number(host.id), `plugin-${plugin.pluginId}-action-${action.id}`, { urgent: true });
+  }
+  return {
+    ok: true,
+    message: `已向 ${targetHosts.length} 台主机下发插件操作`,
+    result: {
+      type: "agent.request",
+      actionId: action.id,
+      groupId: group?.groupId,
+      body: group,
+    },
+  };
+}
+
+export async function runPluginAction(
+  pluginId: string,
+  actionId: string,
+  input?: unknown,
+  options: { hostIds?: number[]; resourceViewId?: string; context?: TrpcContext } = {},
+) {
+  const plugin = await getPlugin(pluginId);
+  if (!plugin) throw new Error("插件不存在");
+  if (plugin.status !== "enabled") throw new Error("插件未启用");
+  const action = (plugin.manifest.actions || []).find((item: PluginActionDefinition) => item.id === actionId);
+  if (!action) throw new Error("插件没有声明该动作");
+  if (action.type === "http.request") {
+    return executePluginHttpAction(plugin, action, input);
+  }
+  if (action.type === "agent.request") {
+    return executePluginAgentAction(plugin, action, input, options);
+  }
+  if (action.type === "panel.request" && action.panel) {
+    return executePluginPanelRequest({
+      plugin,
+      actionId: action.id,
+      operation: action.panel.operation,
+      actionInput: input,
+      context: options.context,
+    });
+  }
+  if (action.type === "noop") {
+    return { ok: true, message: "动作已执行（noop）" };
+  }
+  if (action.type === "data.asset.refresh" || action.type === "data.whitelist.refresh") {
+    const bundledPath = await bundledPathForPlugin(plugin);
+    if (!bundledPath && (plugin.sourceType !== "github" || !plugin.sourceUrl)) {
+      throw new Error("该动作仅支持 GitHub 来源或面板内置插件");
+    }
+    const [updateResult, syncResult] = await Promise.all([
+      checkPluginUpdate(plugin.pluginId),
+      refreshPluginAssets(plugin.pluginId),
+    ]);
+    return {
+      ok: true,
+      message: syncResult.synced > 0
+        ? `已同步 ${syncResult.synced} 个数据文件`
+        : "没有同步到新的数据文件",
+      result: {
+        update: updateResult,
+        assets: syncResult,
+      },
+    };
+  }
+  throw new Error("该插件动作暂未支持");
+}
+
+export async function getPluginAgentActionStatus(pluginId: string, groupId: string) {
+  const plugin = await getPlugin(pluginId);
+  if (!plugin) throw new Error("插件不存在");
+  const group = await syncPluginAgentActionState(plugin.pluginId, groupId);
+  if (!group || group.pluginId !== plugin.pluginId) return null;
+  return group;
+}
+
+export async function getEnabledPluginExtensionPoints() {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db.select().from(plugins).where(eq(plugins.status, "enabled"));
+  return rows.map(normalizePluginRow).flatMap((plugin: any) => plugin.extensionPoints.map((point: PluginExtensionPoint) => ({
+    pluginId: plugin.pluginId,
+    name: plugin.name,
+    point,
+  })));
+}

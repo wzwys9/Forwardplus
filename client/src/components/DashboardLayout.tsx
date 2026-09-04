@@ -1,0 +1,2245 @@
+import { useAuth } from "@/_core/hooks/useAuth";
+import { Progress } from "@/components/ui/progress";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarHeader,
+  SidebarInset,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarProvider,
+  SidebarTrigger,
+  useSidebar,
+  SidebarGroup,
+  SidebarGroupLabel,
+} from "@/components/ui/sidebar";
+import { useTheme } from "@/contexts/ThemeContext";
+import {
+  LayoutDashboard,
+  LogOut,
+  PanelLeft,
+  Server,
+  ArrowRightLeft,
+  Users,
+  Settings,
+  Shield,
+  Network,
+  KeyRound,
+  UserRound,
+  Sun,
+  Moon,
+  Rocket,
+  Route,
+  Zap,
+  CreditCard,
+  WalletCards,
+  ReceiptText,
+  Package,
+  ShoppingBag,
+  Megaphone,
+  Send,
+  Copy,
+  Link2Off,
+  CheckCircle2,
+  AlertTriangle,
+  Loader2,
+  Download,
+  RefreshCw,
+  ExternalLink,
+  Image,
+  Globe2,
+  BellOff,
+  Puzzle,
+  type LucideIcon,
+} from "lucide-react";
+import { App as CapacitorApp } from "@capacitor/app";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import QRCode from "qrcode";
+import { useLocation } from "wouter";
+import { Button } from "./ui/button";
+import { Badge } from "./ui/badge";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogTitle } from "./ui/dialog";
+import { Input } from "./ui/input";
+import { Label } from "./ui/label";
+import { trpc } from "@/lib/trpc";
+import { toast } from "sonner";
+import { renderMixedHtml } from "@/lib/htmlContent";
+import { mobileAuth } from "@/lib/mobileAuth";
+import { checkMobileAppUpdate, openMobileReleasePage, type MobileAppUpdateResult } from "@/lib/mobileNotifications";
+import { cn } from "@/lib/utils";
+import { getPanelChangelogUrl, PANEL_UPGRADE_REFRESH_DELAY_MS, PANEL_UPGRADE_REFRESH_DELAY_SECONDS } from "@/lib/panelUpgrade";
+import { copyTextToClipboard } from "@/lib/clipboard";
+import { AvatarPicker } from "@/components/AvatarPicker";
+import { UserAvatar } from "@/components/UserAvatar";
+import { normalizeSidebarMenuSettings, type SidebarMenuKey } from "@shared/sidebarMenu";
+import { buildPanelInstallerCommand } from "@shared/githubAccelerator";
+import { shouldShowXraySidebar } from "@/lib/xrayNavigation";
+
+const TWO_FACTOR_SETUP_SECONDS = 5 * 60;
+const SITE_LOGO_CACHE_KEY = "forwardx.siteLogoDataUrl";
+type SidebarNavItem = {
+  icon: LucideIcon;
+  label: string;
+  path: string;
+  menuKey?: SidebarMenuKey;
+  iconSrc?: string;
+  externalUrl?: string;
+};
+
+const announcementsMenuItem: SidebarNavItem = { icon: Megaphone, label: "公告", path: "/announcements", menuKey: "announcements" };
+
+const mainMenuItems: SidebarNavItem[] = [
+  { icon: LayoutDashboard, label: "仪表盘", path: "/", menuKey: "dashboard" },
+  { icon: Server, label: "主机管理", path: "/hosts" },
+  { icon: Route, label: "链路管理", path: "/tunnels" },
+  { icon: Network, label: "Xray 节点", path: "/xray" },
+  { icon: ArrowRightLeft, label: "转发规则", path: "/rules" },
+];
+const profileMenuItem: SidebarNavItem = { icon: UserRound, label: "个人资料", path: "/profile", menuKey: "profile" };
+const lookingGlassMenuItem: SidebarNavItem = { icon: Globe2, label: "网络测试", path: "/looking-glass", menuKey: "lookingGlass" };
+const pluginManagementMenuItem: SidebarNavItem = { icon: Puzzle, label: "插件管理", path: "/plugins", menuKey: "plugins" };
+
+const adminMenuItems: SidebarNavItem[] = [
+  { icon: CreditCard, label: "支付对接", path: "/payments", menuKey: "payments" },
+  { icon: WalletCards, label: "账单与兑换", path: "/billing", menuKey: "billing" },
+  { icon: Package, label: "套餐管理", path: "/plans", menuKey: "plans" },
+  { icon: Users, label: "用户管理", path: "/users", menuKey: "users" },
+  lookingGlassMenuItem,
+  { icon: Settings, label: "系统设置", path: "/settings", menuKey: "settings" },
+];
+
+const PANEL_UPGRADE_SESSION_KEY = "forwardx.panel.upgrade";
+const PANEL_UPGRADE_NOTICE_DISMISSED_KEY = "forwardx.panel.upgrade.dismissedVersion";
+const PANEL_UPGRADE_SESSION_TTL_MS = 2 * 60 * 60 * 1000;
+const UPDATE_AUTO_CHECK_REFETCH_MS = 6 * 60 * 60 * 1000;
+const MOBILE_APP_UPDATE_SESSION_KEY = "forwardx.mobile.updateNotice";
+const POPUP_ANNOUNCEMENT_SESSION_KEY = "forwardx.popupAnnouncement.seen";
+const UPGRADE_ANNOUNCEMENT_VERSION_KEY = "forwardx.upgradeAnnouncement.lastSeenVersion";
+const UPGRADE_ANNOUNCEMENT_DISPLAY_SESSION_KEY = "forwardx.upgradeAnnouncement.displayed";
+const UPGRADE_ANNOUNCEMENT_COUNTDOWN_SECONDS = 5;
+type PanelUpgradeSession = { targetVersion: string; startedAt: number; mode?: "upgrade" | "rollback" };
+type UpgradeAnnouncementDisplaySession = { key: string; shownAt: number };
+
+function popupAnnouncementSessionKey(userId?: number | null) {
+  return `${POPUP_ANNOUNCEMENT_SESSION_KEY}:${Number(userId || 0)}`;
+}
+
+function upgradeAnnouncementVersionKey(userId?: number | null) {
+  return `${UPGRADE_ANNOUNCEMENT_VERSION_KEY}:${Number(userId || 0)}`;
+}
+
+function upgradeAnnouncementDisplaySessionKey(userId?: number | null) {
+  return `${UPGRADE_ANNOUNCEMENT_DISPLAY_SESSION_KEY}:${Number(userId || 0)}`;
+}
+
+function readSeenPopupAnnouncementIds(userId?: number | null) {
+  if (typeof window === "undefined" || !userId) return [] as number[];
+  try {
+    const raw = window.sessionStorage.getItem(popupAnnouncementSessionKey(userId));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0);
+  } catch {
+    return [];
+  }
+}
+
+function markPopupAnnouncementSeen(userId?: number | null, announcementId?: number | null) {
+  if (typeof window === "undefined" || !userId || !announcementId) return;
+  try {
+    const next = Array.from(new Set([...readSeenPopupAnnouncementIds(userId), Number(announcementId)]));
+    window.sessionStorage.setItem(popupAnnouncementSessionKey(userId), JSON.stringify(next));
+  } catch {
+    // Ignore storage failures so popup behavior still works with server-side dismiss.
+  }
+}
+
+function clearSeenPopupAnnouncements(userId?: number | null) {
+  if (typeof window === "undefined" || !userId) return;
+  try {
+    window.sessionStorage.removeItem(popupAnnouncementSessionKey(userId));
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function readLastSeenUpgradeAnnouncementVersion(userId?: number | null) {
+  if (typeof window === "undefined" || !userId) return "";
+  try {
+    return normalizePanelVersion(window.localStorage.getItem(upgradeAnnouncementVersionKey(userId)));
+  } catch {
+    return "";
+  }
+}
+
+function writeLastSeenUpgradeAnnouncementVersion(userId: number, version: string) {
+  if (typeof window === "undefined" || !userId) return;
+  const normalizedVersion = normalizePanelVersion(version);
+  if (!normalizedVersion) return;
+  try {
+    window.localStorage.setItem(upgradeAnnouncementVersionKey(userId), normalizedVersion);
+  } catch {
+    // Ignore storage failures and fall back to server-side read tracking.
+  }
+}
+
+function readUpgradeAnnouncementDisplaySession(userId?: number | null): UpgradeAnnouncementDisplaySession | null {
+  if (typeof window === "undefined" || !userId) return null;
+  try {
+    const raw = window.sessionStorage.getItem(upgradeAnnouncementDisplaySessionKey(userId));
+    if (!raw) return null;
+    const value = JSON.parse(raw);
+    const key = String(value?.key || "");
+    const shownAt = Number(value?.shownAt || 0);
+    if (!key || !Number.isFinite(shownAt) || shownAt <= 0) return null;
+    return { key, shownAt };
+  } catch {
+    return null;
+  }
+}
+
+
+function writeUpgradeAnnouncementDisplaySession(userId: number, session: UpgradeAnnouncementDisplaySession) {
+  if (typeof window === "undefined" || !userId) return;
+  try {
+    window.sessionStorage.setItem(upgradeAnnouncementDisplaySessionKey(userId), JSON.stringify(session));
+  } catch {
+    // Ignore storage failures; the announcement can still be dismissed normally.
+  }
+}
+
+
+function clearUpgradeAnnouncementDisplaySession(userId?: number | null) {
+  if (typeof window === "undefined" || !userId) return;
+  try {
+    window.sessionStorage.removeItem(upgradeAnnouncementDisplaySessionKey(userId));
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function readCachedSiteLogo() {
+  if (typeof window === "undefined") return "";
+  try {
+    return window.localStorage.getItem(SITE_LOGO_CACHE_KEY)?.trim() || "";
+  } catch {
+    return "";
+  }
+}
+
+function normalizePanelVersion(version: string | null | undefined) {
+  return String(version || "").trim().replace(/^v/i, "");
+}
+
+function comparePanelVersions(a: string | null | undefined, b: string | null | undefined) {
+  const pa = normalizePanelVersion(a).split(/[.-]/).map((x) => Number.parseInt(x, 10) || 0);
+  const pb = normalizePanelVersion(b).split(/[.-]/).map((x) => Number.parseInt(x, 10) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const diff = (pa[i] || 0) - (pb[i] || 0);
+    if (diff !== 0) return diff > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
+function clearPanelUpgradeSession() {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.removeItem(PANEL_UPGRADE_SESSION_KEY);
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function readDismissedPanelUpgradeNoticeVersion() {
+  if (typeof window === "undefined") return "";
+  try {
+    return normalizePanelVersion(window.localStorage.getItem(PANEL_UPGRADE_NOTICE_DISMISSED_KEY));
+  } catch {
+    return "";
+  }
+}
+
+function readPanelUpgradeSession(): PanelUpgradeSession | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(PANEL_UPGRADE_SESSION_KEY);
+    if (!raw) return null;
+    const value = JSON.parse(raw);
+    const startedAt = Number(value?.startedAt);
+    if (!value?.targetVersion || !Number.isFinite(startedAt)) {
+      clearPanelUpgradeSession();
+      return null;
+    }
+    if (Date.now() - startedAt > PANEL_UPGRADE_SESSION_TTL_MS) {
+      clearPanelUpgradeSession();
+      return null;
+    }
+    const mode = value?.mode === "rollback" ? "rollback" : "upgrade";
+    return { targetVersion: String(value.targetVersion), startedAt, mode };
+  } catch {
+    clearPanelUpgradeSession();
+    return null;
+  }
+}
+
+function getLayoutUpgradeProgress(job: any) {
+  const status = job?.status || "idle";
+  const isRollback = job?.mode === "rollback";
+  const actionLabel = isRollback ? "回退" : "升级";
+  const logs = Array.isArray(job?.logs) ? job.logs.join("\n") : "";
+  const matched = (patterns: RegExp[]) => patterns.some((pattern) => pattern.test(logs));
+  const steps = [
+    { label: `准备${actionLabel}`, done: status !== "idle" && matched([/开始升级/i, /开始回退/i, /Starting panel/i, /start/i]) },
+    {
+      label: "检查发布资产",
+      done: matched([
+        /Release assets/i,
+        /not available yet/i,
+        /still building/i,
+        /发布资产/i,
+        /构建完成/i,
+        /Docker image/i,
+        /panel bundle/i,
+      ]),
+    },
+    {
+      label: "下载或拉取资产",
+      done: matched([
+        /Downloading panel bundle/i,
+        /Pulling image/i,
+        /Downloaded newer image/i,
+        /Image is up to date/i,
+        /load metadata/i,
+        /load build context/i,
+        /pnpm install/i,
+        /npm install/i,
+        /downloaded/i,
+        /Lockfile is up to date/i,
+      ]),
+    },
+    { label: "安装并重启", done: matched([/Container .* (Creating|Created|Starting|Started)/i, /docker compose up/i, /systemctl restart/i, /已启动/i, /recreate/i]) },
+  ];
+
+  if (status === "success") {
+    return { percent: 100, label: `${actionLabel}完成，正在等待面板恢复`, steps: steps.map((step) => ({ ...step, done: true, active: false })) };
+  }
+  if (status === "waiting_assets") {
+    return { percent: 34, label: "等待 GitHub Actions 构建发布资产", steps: steps.map((step, index) => ({ ...step, done: index === 0, active: index === 1 })) };
+  }
+  if (status === "error") {
+    const doneCount = steps.filter((step) => step.done).length;
+    const activeIndex = Math.min(doneCount, steps.length - 1);
+    return { percent: Math.max(10, doneCount * 22), label: `${actionLabel}异常`, steps: steps.map((step, index) => ({ ...step, active: index === activeIndex && !step.done })) };
+  }
+  if (status === "running") {
+    const doneCount = steps.filter((step) => step.done).length;
+    const activeIndex = Math.min(doneCount, steps.length - 1);
+    return { percent: Math.min(92, Math.max(12, doneCount * 22 + 8)), label: steps[activeIndex]?.label || `正在${actionLabel}`, steps: steps.map((step, index) => ({ ...step, active: index === activeIndex && !step.done })) };
+  }
+  return { percent: 0, label: `等待确认${actionLabel}`, steps: steps.map((step) => ({ ...step, active: false })) };
+}
+
+export default function DashboardLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const { loading, user } = useAuth();
+
+  if (loading) return null;
+
+  if (!user) {
+    if (typeof window !== "undefined" && window.location.pathname !== "/login") {
+      window.location.href = "/login";
+    }
+    return null;
+  }
+
+  return (
+    <SidebarProvider>
+      <DashboardLayoutContent>
+        {children}
+      </DashboardLayoutContent>
+    </SidebarProvider>
+  );
+}
+
+function DashboardLayoutContent({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const { user, logout } = useAuth();
+  const [location, setLocation] = useLocation();
+  const { state, toggleSidebar, isMobile, openMobile, setOpenMobile } = useSidebar();
+  const openMobileRef = useRef(openMobile);
+  const mobileHeaderRef = useRef<HTMLDivElement | null>(null);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const accountMenuOpenRef = useRef(accountMenuOpen);
+  const isDesktopCollapsed = !isMobile && state === "collapsed";
+  const isAdmin = user?.role === "admin";
+  const utils = trpc.useUtils();
+  const { resolvedTheme, setTheme } = useTheme();
+  const [deferBackgroundQueries, setDeferBackgroundQueries] = useState(true);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDeferBackgroundQueries(false), 1200);
+    return () => window.clearTimeout(timer);
+  }, []);
+  const { data: publicInfo, isError: publicInfoError } = trpc.system.publicInfo.useQuery(undefined, {
+    enabled: !!user,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+  const { data: customSidebarPages = [] } = trpc.system.sidebarPages.useQuery(undefined, {
+    enabled: !!user,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+  const { data: pluginSidebarPages = [] } = trpc.plugins.sidebarPages.useQuery(undefined, {
+    enabled: isAdmin && publicInfo?.pluginsEnabled === true,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+  const updateAutoCheckReady = !isAdmin || !!publicInfo;
+  const updateAutoCheckEnabled = publicInfo?.updateAutoCheckEnabled !== false;
+  const { data: updateInfo } = trpc.system.checkUpdate.useQuery(undefined, {
+    enabled: isAdmin && !deferBackgroundQueries && updateAutoCheckReady && updateAutoCheckEnabled,
+    refetchInterval: updateAutoCheckEnabled ? UPDATE_AUTO_CHECK_REFETCH_MS : false,
+    refetchOnWindowFocus: false,
+    retry: false,
+    staleTime: 60 * 1000,
+  });
+  const { data: storeStatus } = trpc.plans.storeStatus.useQuery(undefined, {
+    enabled: !!user && !isAdmin,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+  const { data: popupAnnouncement } = trpc.announcements.popup.useQuery(undefined, {
+    enabled: !!user,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+  const { data: upgradeAnnouncement, isFetched: upgradeAnnouncementFetched } = trpc.announcements.upgradePopup.useQuery(undefined, {
+    enabled: !!user && isAdmin,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+  const { data: telegramStatus } = trpc.telegram.status.useQuery(undefined, {
+    enabled: !!user,
+    refetchInterval: (query) => {
+      const status = query.state.data;
+      if (!status || status.bound) return false;
+      const expiresAt = status.pendingBind?.expiresAt ? new Date(status.pendingBind.expiresAt).getTime() : 0;
+      return expiresAt > Date.now() ? 2000 : false;
+    },
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+  const sidebarMenuSettings = useMemo(
+    () => normalizeSidebarMenuSettings(publicInfo?.sidebarMenu),
+    [publicInfo?.sidebarMenu]
+  );
+  const siteTitle = (publicInfo?.siteTitle || "ForwardX").trim() || "ForwardX";
+  const [cachedSiteLogo, setCachedSiteLogo] = useState(() => readCachedSiteLogo());
+  const defaultLogoSrc = resolvedTheme === "dark" ? "/logo-dark.png" : "/logo-light.png";
+  const logoSrc = publicInfo?.siteLogoDataUrl || (publicInfo ? defaultLogoSrc : cachedSiteLogo);
+  const [displayLogoSrc, setDisplayLogoSrc] = useState(logoSrc);
+  const [logoLoadFailed, setLogoLoadFailed] = useState(false);
+  const logoMark = logoLoadFailed ? (
+    <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground">
+      <Zap className="h-4 w-4" />
+    </div>
+  ) : !displayLogoSrc ? (
+    <span className="h-7 w-7 shrink-0" aria-hidden="true" />
+  ) : (
+    <img
+      src={displayLogoSrc}
+      alt={siteTitle}
+      className="h-7 w-7 shrink-0 object-contain"
+      onError={() => setLogoLoadFailed(true)}
+    />
+  );
+  const [showAnnouncement, setShowAnnouncement] = useState(false);
+  const [showUpgradeAnnouncement, setShowUpgradeAnnouncement] = useState(false);
+  const [upgradeAnnouncementCountdown, setUpgradeAnnouncementCountdown] = useState(UPGRADE_ANNOUNCEMENT_COUNTDOWN_SECONDS);
+  const [showTelegramDialog, setShowTelegramDialog] = useState(false);
+  const [showUpgradeDialog, setShowUpgradeDialog] = useState(false);
+  const [checkingMobileUpdate, setCheckingMobileUpdate] = useState(false);
+  const [mobileUpdateInfo, setMobileUpdateInfo] = useState<MobileAppUpdateResult | null>(null);
+  const [showMobileUpdateDialog, setShowMobileUpdateDialog] = useState(false);
+  const upgradeRefreshTimerRef = useRef<number | null>(null);
+  const upgradeRefreshIntervalRef = useRef<number | null>(null);
+  const displayedUpgradeAnnouncementKeyRef = useRef("");
+  const [upgradeRefreshScheduled, setUpgradeRefreshScheduled] = useState(false);
+  const [upgradeRefreshCountdown, setUpgradeRefreshCountdown] = useState<number | null>(null);
+  const [backgroundUpgrade, setBackgroundUpgrade] = useState<PanelUpgradeSession | null>(() => readPanelUpgradeSession());
+  const [dismissedPanelUpgradeNoticeVersion, setDismissedPanelUpgradeNoticeVersion] = useState(() => readDismissedPanelUpgradeNoticeVersion());
+  const [telegramBind, setTelegramBind] = useState<any | null>(null);
+  const [telegramBindTick, setTelegramBindTick] = useState(Date.now());
+  const [showTwoFactorDialog, setShowTwoFactorDialog] = useState(false);
+  const [twoFactorSetup, setTwoFactorSetup] = useState<{ setupId: string; secret: string; otpauthUrl: string; expiresAt: Date; expiresInSeconds: number } | null>(null);
+  const [twoFactorQrCode, setTwoFactorQrCode] = useState("");
+  const [twoFactorSetupTick, setTwoFactorSetupTick] = useState(Date.now());
+  const [twoFactorPassword, setTwoFactorPassword] = useState("");
+  const [twoFactorCode, setTwoFactorCode] = useState("");
+  const { data: upgradeStatus, refetch: refetchUpgradeStatus } = trpc.system.upgradeStatus.useQuery(undefined, {
+    enabled: isAdmin,
+    refetchInterval: (query) => {
+      const status = (query.state.data as any)?.job?.status;
+      return status === "running" || backgroundUpgrade ? 2000 : false;
+    },
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+
+  const startUpgradeMutation = trpc.system.startUpgrade.useMutation({
+    onSuccess: (data) => {
+      const targetVersion = data?.targetVersion || upgradeTargetVersion || "";
+      if (targetVersion) {
+        const next: PanelUpgradeSession = { targetVersion, startedAt: Date.now(), mode: "upgrade" };
+        setBackgroundUpgrade(next);
+        try {
+          window.sessionStorage.setItem(PANEL_UPGRADE_SESSION_KEY, JSON.stringify(next));
+        } catch {
+          // Session persistence is only used to keep the upgrade notice visible after a temporary reconnect.
+        }
+      }
+      setShowUpgradeDialog(false);
+      toast.success("升级任务已在后台执行");
+      refetchUpgradeStatus();
+    },
+    onError: (error) => toast.error(error.message || "启动升级失败"),
+  });
+
+  const scheduleUpgradeRefresh = useCallback(() => {
+    if (upgradeRefreshTimerRef.current !== null) return;
+    clearPanelUpgradeSession();
+    setUpgradeRefreshScheduled(true);
+    setUpgradeRefreshCountdown(PANEL_UPGRADE_REFRESH_DELAY_SECONDS);
+    upgradeRefreshIntervalRef.current = window.setInterval(() => {
+      setUpgradeRefreshCountdown((value) => (value === null ? null : Math.max(0, value - 1)));
+    }, 1000);
+    upgradeRefreshTimerRef.current = window.setTimeout(() => {
+      if (upgradeRefreshIntervalRef.current !== null) {
+        window.clearInterval(upgradeRefreshIntervalRef.current);
+        upgradeRefreshIntervalRef.current = null;
+      }
+      window.location.reload();
+    }, PANEL_UPGRADE_REFRESH_DELAY_MS);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (upgradeRefreshTimerRef.current !== null) {
+        window.clearTimeout(upgradeRefreshTimerRef.current);
+      }
+      if (upgradeRefreshIntervalRef.current !== null) {
+        window.clearInterval(upgradeRefreshIntervalRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!popupAnnouncement?.id || !user?.id) return;
+    if (readSeenPopupAnnouncementIds(user.id).includes(Number(popupAnnouncement.id))) return;
+    markPopupAnnouncementSeen(user.id, popupAnnouncement.id);
+    setShowAnnouncement(true);
+  }, [popupAnnouncement?.id, user?.id]);
+
+  useEffect(() => {
+    if (!isAdmin) {
+      setShowUpgradeAnnouncement(false);
+      displayedUpgradeAnnouncementKeyRef.current = "";
+      clearUpgradeAnnouncementDisplaySession(user?.id);
+      return;
+    }
+    const currentVersion = normalizePanelVersion(publicInfo?.version);
+    const userId = user?.id;
+    if (!userId || !currentVersion || !upgradeAnnouncementFetched) return;
+
+    const seenVersion = readLastSeenUpgradeAnnouncementVersion(userId);
+    if (seenVersion && comparePanelVersions(seenVersion, currentVersion) >= 0) {
+      setShowUpgradeAnnouncement(false);
+      clearUpgradeAnnouncementDisplaySession(userId);
+      utils.announcements.upgradePopup.setData(undefined, undefined);
+      return;
+    }
+
+    if (upgradeAnnouncement?.id) {
+      const announcementKey = String(userId) + ":" + currentVersion + ":" + String(upgradeAnnouncement.id);
+      if (displayedUpgradeAnnouncementKeyRef.current !== announcementKey) {
+        displayedUpgradeAnnouncementKeyRef.current = announcementKey;
+        const existingDisplay = readUpgradeAnnouncementDisplaySession(userId);
+        const shownAt = existingDisplay?.key === announcementKey ? existingDisplay.shownAt : Date.now();
+        if (existingDisplay?.key !== announcementKey) {
+          writeUpgradeAnnouncementDisplaySession(userId, { key: announcementKey, shownAt });
+        }
+        const elapsedSeconds = Math.floor(Math.max(0, Date.now() - shownAt) / 1000);
+        setUpgradeAnnouncementCountdown(Math.max(0, UPGRADE_ANNOUNCEMENT_COUNTDOWN_SECONDS - elapsedSeconds));
+      }
+      setShowUpgradeAnnouncement(true);
+      return;
+    }
+
+    writeLastSeenUpgradeAnnouncementVersion(userId, currentVersion);
+    clearUpgradeAnnouncementDisplaySession(userId);
+  }, [isAdmin, publicInfo?.version, upgradeAnnouncement?.id, upgradeAnnouncementFetched, user?.id, utils.announcements.upgradePopup]);
+
+  useEffect(() => {
+    if (!showUpgradeAnnouncement) return;
+    const timer = window.setInterval(() => {
+      setUpgradeAnnouncementCountdown((value) => (value <= 1 ? 0 : value - 1));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [showUpgradeAnnouncement, upgradeAnnouncement?.id]);
+
+  useEffect(() => {
+    if (!publicInfo) return;
+    const nextLogo = publicInfo.siteLogoDataUrl || "";
+    setCachedSiteLogo(nextLogo);
+    try {
+      if (nextLogo) {
+        window.localStorage.setItem(SITE_LOGO_CACHE_KEY, nextLogo);
+      } else {
+        window.localStorage.removeItem(SITE_LOGO_CACHE_KEY);
+      }
+    } catch {
+      // Logo caching only prevents refresh flicker; it is safe to skip when storage is unavailable.
+    }
+  }, [publicInfo]);
+
+  useEffect(() => {
+    setLogoLoadFailed(false);
+    if (!logoSrc) {
+      setDisplayLogoSrc("");
+      return;
+    }
+    if (logoSrc === displayLogoSrc) return;
+
+    let disposed = false;
+    const image = new window.Image();
+    image.onload = () => {
+      if (!disposed) setDisplayLogoSrc(logoSrc);
+    };
+    image.onerror = () => {
+      if (!disposed && !displayLogoSrc) setLogoLoadFailed(true);
+    };
+    image.src = logoSrc;
+    return () => {
+      disposed = true;
+    };
+  }, [displayLogoSrc, logoSrc]);
+
+  useEffect(() => {
+    if (typeof document !== "undefined") {
+      document.title = siteTitle;
+    }
+    try {
+      window.localStorage.setItem("forwardx.siteTitle", siteTitle);
+    } catch {
+      // Title caching only prevents refresh flicker; it is safe to skip when storage is unavailable.
+    }
+  }, [siteTitle]);
+
+  useEffect(() => {
+    if (upgradeStatus?.job?.status !== "running" || backgroundUpgrade) return;
+    const targetVersion = upgradeStatus.job.targetVersion;
+    if (!targetVersion) return;
+    const next: PanelUpgradeSession = {
+      targetVersion,
+      startedAt: upgradeStatus.job.startedAt ? new Date(upgradeStatus.job.startedAt).getTime() : Date.now(),
+      mode: upgradeStatus.job.mode === "rollback" ? "rollback" : "upgrade",
+    };
+    setBackgroundUpgrade(next);
+    try {
+      window.sessionStorage.setItem(PANEL_UPGRADE_SESSION_KEY, JSON.stringify(next));
+    } catch {
+      // Ignore storage failures.
+    }
+  }, [backgroundUpgrade, upgradeStatus?.job?.mode, upgradeStatus?.job?.startedAt, upgradeStatus?.job?.status, upgradeStatus?.job?.targetVersion]);
+
+  useEffect(() => {
+    if (upgradeStatus?.job?.status !== "success") return;
+    scheduleUpgradeRefresh();
+  }, [scheduleUpgradeRefresh, upgradeStatus?.job?.status]);
+
+  useEffect(() => {
+    if (!backgroundUpgrade?.targetVersion || !upgradeStatus?.currentVersion) return;
+    if (upgradeStatus.job?.status === "running") return;
+
+    if (Date.now() - backgroundUpgrade.startedAt > PANEL_UPGRADE_SESSION_TTL_MS) {
+      clearPanelUpgradeSession();
+      setBackgroundUpgrade(null);
+      return;
+    }
+
+    const compareResult = comparePanelVersions(upgradeStatus.currentVersion, backgroundUpgrade.targetVersion);
+    if (backgroundUpgrade.mode === "rollback") {
+      if (compareResult > 0) return;
+    } else if (compareResult < 0) {
+      return;
+    }
+
+    clearPanelUpgradeSession();
+    setBackgroundUpgrade(null);
+    scheduleUpgradeRefresh();
+  }, [
+    backgroundUpgrade?.startedAt,
+    backgroundUpgrade?.mode,
+    backgroundUpgrade?.targetVersion,
+    scheduleUpgradeRefresh,
+    upgradeStatus?.currentVersion,
+    upgradeStatus?.job?.status,
+  ]);
+
+  const dismissAnnouncement = trpc.announcements.dismiss.useMutation({
+    onMutate: () => {
+      setShowAnnouncement(false);
+      markPopupAnnouncementSeen(user?.id, popupAnnouncement?.id);
+      utils.announcements.popup.setData(undefined, undefined);
+    },
+    onSuccess: () => {
+      setShowAnnouncement(false);
+      utils.announcements.popup.setData(undefined, undefined);
+    },
+    onError: (error) => {
+      toast.error(error.message || "关闭公告失败");
+    },
+    onSettled: () => {
+      utils.announcements.popup.invalidate();
+    },
+  });
+
+  const dismissUpgradeAnnouncement = trpc.announcements.dismiss.useMutation({
+    onMutate: () => {
+      if (user?.id && publicInfo?.version) {
+        writeLastSeenUpgradeAnnouncementVersion(user.id, publicInfo.version);
+        clearUpgradeAnnouncementDisplaySession(user.id);
+      }
+      setShowUpgradeAnnouncement(false);
+      setUpgradeAnnouncementCountdown(UPGRADE_ANNOUNCEMENT_COUNTDOWN_SECONDS);
+      displayedUpgradeAnnouncementKeyRef.current = "";
+      utils.announcements.upgradePopup.setData(undefined, undefined);
+    },
+    onSuccess: () => {
+      setShowUpgradeAnnouncement(false);
+      utils.announcements.upgradePopup.setData(undefined, undefined);
+    },
+    onError: (error) => {
+      toast.error(error.message || "关闭升级公告失败");
+    },
+    onSettled: () => {
+      utils.announcements.upgradePopup.invalidate();
+    },
+  });
+
+  const handleLogout = useCallback(() => {
+    clearSeenPopupAnnouncements(user?.id);
+    logout();
+  }, [logout, user?.id]);
+
+  // Change password dialog state
+  const [showChangePassword, setShowChangePassword] = useState(false);
+  const [showAvatarDialog, setShowAvatarDialog] = useState(false);
+  const [avatarDraft, setAvatarDraft] = useState("");
+  const [oldPassword, setOldPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+
+  const changePasswordMutation = trpc.auth.changePassword.useMutation({
+    onSuccess: () => {
+      toast.success("密码修改成功");
+      setShowChangePassword(false);
+      setOldPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+    },
+    onError: (error) => {
+      toast.error(error.message || "密码修改失败");
+    },
+  });
+
+  const updateAvatarMutation = trpc.users.updateAvatar.useMutation({
+    onSuccess: () => {
+      utils.auth.me.invalidate();
+      utils.users.list.invalidate();
+      toast.success("头像已更新");
+      setShowAvatarDialog(false);
+    },
+    onError: (error) => toast.error(error.message || "头像更新失败"),
+  });
+
+  const openAvatarDialog = () => {
+    setAvatarDraft(String((user as any)?.avatar || ""));
+    setShowAvatarDialog(true);
+    setAccountMenuOpen(false);
+  };
+
+  const handleSaveAvatar = () => {
+    if (!avatarDraft) {
+      toast.error("请选择头像");
+      return;
+    }
+    updateAvatarMutation.mutate({ avatar: avatarDraft });
+  };
+
+  const createTelegramBindMutation = trpc.telegram.createBindCode.useMutation({
+    onSuccess: (data) => {
+      setTelegramBind(data);
+      setTelegramBindTick(Date.now());
+      setShowTelegramDialog(true);
+      utils.telegram.status.invalidate();
+      toast.success("Telegram 绑定码已生成");
+    },
+    onError: (error) => toast.error(error.message || "生成 Telegram 绑定码失败"),
+  });
+
+  const unbindTelegramMutation = trpc.telegram.unbind.useMutation({
+    onSuccess: () => {
+      setTelegramBind(null);
+      utils.telegram.status.invalidate();
+      toast.success("Telegram 已解绑");
+      setShowTelegramDialog(false);
+    },
+    onError: (error) => toast.error(error.message || "解绑 Telegram 失败"),
+  });
+
+  const handleChangePassword = () => {
+    if (!oldPassword) {
+      toast.error("请输入当前密码");
+      return;
+    }
+    if (newPassword.length < 6) {
+      toast.error("新密码至少6个字符");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      toast.error("两次输入的新密码不一致");
+      return;
+    }
+    changePasswordMutation.mutate({ oldPassword, newPassword });
+  };
+
+  const copyText = async (text: string) => {
+    const copied = await copyTextToClipboard(text);
+    if (copied) toast.success("已复制到剪贴板");
+    else toast.error("复制失败，请长按或手动选中复制");
+  };
+
+  const openTelegramDialog = () => {
+    if (telegramStatus?.bound) {
+      setShowTelegramDialog(true);
+      return;
+    }
+    if (telegramStatus?.configured === false) {
+      setTelegramBind(null);
+      setShowTelegramDialog(true);
+      return;
+    }
+    createTelegramBindMutation.mutate();
+  };
+
+  const { data: twoFactorStatus } = trpc.auth.twoFactorStatus.useQuery(undefined, {
+    enabled: !!user,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+
+  const beginTwoFactorSetupMutation = trpc.auth.beginTwoFactorSetup.useMutation({
+    onSuccess: (data) => {
+      setTwoFactorSetup(data);
+      setTwoFactorQrCode("");
+      setTwoFactorSetupTick(Date.now());
+      setTwoFactorCode("");
+      toast.success("双重验证二维码已生成");
+    },
+    onError: (error) => toast.error(error.message || "生成双重验证二维码失败"),
+  });
+
+  const enableTwoFactorMutation = trpc.auth.enableTwoFactor.useMutation({
+    onSuccess: () => {
+      toast.success("双重验证已启用");
+      setTwoFactorSetup(null);
+      setTwoFactorQrCode("");
+      setTwoFactorPassword("");
+      setTwoFactorCode("");
+      utils.auth.twoFactorStatus.invalidate();
+      utils.auth.me.invalidate();
+    },
+    onError: (error) => toast.error(error.message || "启用双重验证失败"),
+  });
+
+  const disableTwoFactorMutation = trpc.auth.disableTwoFactor.useMutation({
+    onSuccess: () => {
+      toast.success("双重验证已关闭");
+      setTwoFactorPassword("");
+      setTwoFactorCode("");
+      utils.auth.twoFactorStatus.invalidate();
+      utils.auth.me.invalidate();
+    },
+    onError: (error) => toast.error(error.message || "关闭双重验证失败"),
+  });
+
+  useEffect(() => {
+    if (!twoFactorSetup?.otpauthUrl) {
+      setTwoFactorQrCode("");
+      return;
+    }
+    let cancelled = false;
+    QRCode.toDataURL(twoFactorSetup.otpauthUrl, {
+      errorCorrectionLevel: "M",
+      margin: 1,
+      scale: 8,
+      color: {
+        dark: "#0f172aff",
+        light: "#ffffffff",
+      },
+    })
+      .then((url) => {
+        if (!cancelled) setTwoFactorQrCode(url);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setTwoFactorQrCode("");
+          toast.error("二维码生成失败，请使用手动密钥添加");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [twoFactorSetup?.otpauthUrl]);
+
+  useEffect(() => {
+    if (!showTwoFactorDialog || twoFactorStatus?.enabled || !twoFactorSetup) return;
+    const timer = window.setInterval(() => setTwoFactorSetupTick(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [showTwoFactorDialog, twoFactorSetup, twoFactorStatus?.enabled]);
+
+  useEffect(() => {
+    if (!telegramBind?.expiresAt) return;
+    const timer = window.setInterval(() => setTelegramBindTick(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [telegramBind?.expiresAt]);
+
+  const twoFactorSetupExpiresAt = twoFactorSetup?.expiresAt ? new Date(twoFactorSetup.expiresAt).getTime() : 0;
+  const twoFactorSetupRemaining = twoFactorSetupExpiresAt ? Math.max(0, Math.ceil((twoFactorSetupExpiresAt - twoFactorSetupTick) / 1000)) : 0;
+  const twoFactorSetupExpired = !!twoFactorSetup && twoFactorSetupRemaining <= 0;
+  const twoFactorSetupRemainingLabel = `${Math.floor(twoFactorSetupRemaining / 60)}:${String(twoFactorSetupRemaining % 60).padStart(2, "0")}`;
+  const telegramBindExpiresAt = telegramBind?.expiresAt ? new Date(telegramBind.expiresAt).getTime() : 0;
+  const telegramBindRemaining = telegramBindExpiresAt ? Math.max(0, Math.ceil((telegramBindExpiresAt - telegramBindTick) / 1000)) : 0;
+  const telegramBindExpired = !!telegramBind && telegramBindRemaining <= 0;
+  const telegramBindRemainingLabel = `${Math.floor(telegramBindRemaining / 60)}:${String(telegramBindRemaining % 60).padStart(2, "0")}`;
+
+  const openTwoFactorDialog = () => {
+    setShowTwoFactorDialog(true);
+    setTwoFactorPassword("");
+    setTwoFactorCode("");
+    setTwoFactorQrCode("");
+    if (!twoFactorStatus?.enabled && twoFactorStatus?.globalEnabled) {
+      beginTwoFactorSetupMutation.mutate();
+    }
+  };
+
+  const handleEnableTwoFactor = () => {
+    if (!twoFactorSetup) {
+      beginTwoFactorSetupMutation.mutate();
+      return;
+    }
+    if (twoFactorSetupExpired) {
+      toast.error("二维码已过期，请重新生成");
+      return;
+    }
+    if (!twoFactorPassword) {
+      toast.error("请输入当前密码");
+      return;
+    }
+    if (twoFactorCode.length < 6) {
+      toast.error("请输入 6 位动态验证码");
+      return;
+    }
+    enableTwoFactorMutation.mutate({
+      setupId: twoFactorSetup.setupId,
+      password: twoFactorPassword,
+      code: twoFactorCode,
+    });
+  };
+
+  const handleDisableTwoFactor = () => {
+    if (!twoFactorPassword) {
+      toast.error("请输入当前密码");
+      return;
+    }
+    if (twoFactorCode.length < 6) {
+      toast.error("请输入 6 位动态验证码");
+      return;
+    }
+    disableTwoFactorMutation.mutate({
+      password: twoFactorPassword,
+      code: twoFactorCode,
+    });
+  };
+
+  const handleMobileUpdateCheck = async () => {
+    if (!mobileAuth.isNative || checkingMobileUpdate) return;
+    try {
+      setCheckingMobileUpdate(true);
+      const result = await checkMobileAppUpdate({ silent: false });
+      setMobileUpdateInfo(result);
+      if (result?.hasUpdate) {
+        try {
+          window.sessionStorage.setItem(MOBILE_APP_UPDATE_SESSION_KEY, result.latestVersion);
+        } catch {
+          // Ignore storage failures.
+        }
+        setShowMobileUpdateDialog(true);
+      } else if (result) {
+        toast.success(result.hasPackage ? "当前 APP 已是最新版本" : `当前版本暂无 ${result.packageLabel} 更新`);
+      }
+    } catch (error: any) {
+      toast.error(error?.message || "APP 更新检查失败");
+    } finally {
+      setCheckingMobileUpdate(false);
+    }
+  };
+
+  const openDetectedMobileRelease = () => {
+    void openMobileReleasePage(mobileUpdateInfo?.releaseUrl);
+    setShowMobileUpdateDialog(false);
+  };
+
+  const telegramBindUrl = telegramBind?.botUsername && telegramBind?.code
+    ? `https://t.me/${telegramBind.botUsername}?start=${encodeURIComponent(telegramBind.code)}`
+    : "";
+  const telegramBotUrl = (telegramBind?.botUsername || telegramStatus?.botUsername)
+    ? `https://t.me/${telegramBind?.botUsername || telegramStatus?.botUsername}`
+    : "";
+  const accountDisplayName = String(user?.name || "").trim() || String(user?.username || "").trim() || "账号";
+  const accountUsername = String(user?.username || "").trim() || accountDisplayName;
+
+  useEffect(() => {
+    if (telegramStatus?.bound) {
+      if (telegramBind) setTelegramBind(null);
+      return;
+    }
+    if (!telegramBind && telegramStatus?.pendingBind?.code) {
+      setTelegramBind(telegramStatus.pendingBind);
+      setTelegramBindTick(Date.now());
+    }
+  }, [telegramBind, telegramStatus?.bound, telegramStatus?.pendingBind]);
+
+  const toggleTheme = () => {
+    setTheme(resolvedTheme === "dark" ? "light" : "dark");
+  };
+
+  const hiddenNormalUserMainPaths = ["/hosts", "/tunnels"];
+  const isSidebarNavItemVisible = (item: SidebarNavItem) => {
+    if (item.path === "/xray") return shouldShowXraySidebar(user?.role, publicInfo?.xrayEnabled === true, publicInfoError);
+    if (item.menuKey === "plugins" && publicInfo?.pluginsEnabled !== true) return false;
+    return !item.menuKey || sidebarMenuSettings[item.menuKey] !== false;
+  };
+  const filterSidebarNavItems = (items: SidebarNavItem[]) => items.filter(isSidebarNavItemVisible);
+  const visibleMainMenuItems = filterSidebarNavItems(
+    isAdmin
+      ? mainMenuItems
+      : mainMenuItems.filter((item) => !hiddenNormalUserMainPaths.includes(item.path))
+  );
+  const canShowNetworkTest = (isAdmin || publicInfo?.lookingGlassUserEnabled === true) && sidebarMenuSettings.lookingGlass !== false;
+  const userStoreMenuItems = !isAdmin
+    ? [
+        { icon: Package, label: "我的订阅", path: "/subscriptions" },
+        { icon: ReceiptText, label: "账单中心", path: "/wallet" },
+        ...(storeStatus?.enabled ? [{ icon: ShoppingBag, label: "商店", path: "/store" }] : []),
+      ]
+    : [];
+  const visibleAnnouncementsMenuItems = isSidebarNavItemVisible(announcementsMenuItem) ? [announcementsMenuItem] : [];
+  const visibleProfileMenuItems = isSidebarNavItemVisible(profileMenuItem) ? [profileMenuItem] : [];
+  const visibleAdminMenuItems = filterSidebarNavItems(adminMenuItems);
+  const customPageMenuItems: SidebarNavItem[] = customSidebarPages.map((page: {
+    id: string;
+    name: string;
+    url: string;
+    openMode: "embed" | "external";
+    iconDataUrl?: string;
+  }) => ({
+    icon: Globe2,
+    iconSrc: page.iconDataUrl,
+    label: page.name,
+    path: `/custom-pages/${page.id}`,
+    ...(page.openMode === "external" ? { externalUrl: page.url } : {}),
+  }));
+  const pluginPageMenuItems: SidebarNavItem[] = isAdmin
+    ? pluginSidebarPages.map((page: { pluginId: string; label: string; icon?: string }) => ({
+        icon: Puzzle,
+        iconSrc: page.icon || undefined,
+        label: page.label,
+        path: `/plugins/sidebar/${page.pluginId}`,
+      }))
+    : [];
+  const primaryMenuItems = [
+    ...visibleMainMenuItems,
+    ...userStoreMenuItems,
+    ...visibleAnnouncementsMenuItems,
+  ];
+  const otherMenuItems: SidebarNavItem[] = [
+    ...(isAdmin && isSidebarNavItemVisible(pluginManagementMenuItem) ? [pluginManagementMenuItem] : []),
+    ...pluginPageMenuItems,
+    ...customPageMenuItems,
+  ];
+
+  const allMenuItems = isAdmin
+    ? [...primaryMenuItems, ...visibleProfileMenuItems, ...visibleAdminMenuItems, ...otherMenuItems]
+    : [...primaryMenuItems, ...(canShowNetworkTest ? [lookingGlassMenuItem] : []), ...visibleProfileMenuItems, ...otherMenuItems];
+
+  const currentPath = location.split("?")[0] || "/";
+  const activeMenuItem = allMenuItems.find((item) => item.path === currentPath);
+  const upgradeJob = upgradeStatus?.job;
+  const displayUpgradeJob = useMemo(() => {
+    if (upgradeRefreshScheduled) {
+      return {
+        status: "success",
+        startedAt: upgradeJob?.startedAt || (backgroundUpgrade?.startedAt ? new Date(backgroundUpgrade.startedAt).toISOString() : null),
+        finishedAt: upgradeJob?.finishedAt || new Date().toISOString(),
+        targetVersion: upgradeJob?.targetVersion || backgroundUpgrade?.targetVersion || upgradeStatus?.currentVersion || "",
+        logs: upgradeJob?.logs || ["[ForwardX] Upgrade completed; browser refresh scheduled"],
+        error: null,
+        mode: upgradeJob?.mode || backgroundUpgrade?.mode || "upgrade",
+      };
+    }
+    if (upgradeJob?.status && upgradeJob.status !== "idle") return upgradeJob;
+    if (!backgroundUpgrade) return upgradeJob;
+    return {
+      status: "running",
+      startedAt: new Date(backgroundUpgrade.startedAt).toISOString(),
+      finishedAt: null,
+      targetVersion: backgroundUpgrade.targetVersion,
+      logs: ["[ForwardX] Starting upgrade in background"],
+      error: null,
+      mode: backgroundUpgrade.mode || "upgrade",
+    };
+  }, [backgroundUpgrade, upgradeJob, upgradeRefreshScheduled, upgradeStatus?.currentVersion]);
+  const upgradeProgress = getLayoutUpgradeProgress(displayUpgradeJob);
+  const isPanelVersionTaskVisible = !!displayUpgradeJob?.status && displayUpgradeJob.status !== "idle";
+  const isPanelRollbackTask = displayUpgradeJob?.mode === "rollback";
+  const panelVersionActionLabel = isPanelRollbackTask ? "回退" : "升级";
+  const upgradeTargetVersion = isPanelVersionTaskVisible
+    ? (displayUpgradeJob?.targetVersion || "")
+    : (updateInfo?.latestVersion || upgradeStatus?.update?.latestVersion || "");
+  const upgradeChangelogUrl = getPanelChangelogUrl(
+    upgradeTargetVersion,
+    isPanelVersionTaskVisible ? null : (updateInfo?.releaseUrl || upgradeStatus?.update?.releaseUrl),
+    upgradeStatus?.githubAccelerator,
+  );
+  const normalizedUpgradeTargetVersion = normalizePanelVersion(upgradeTargetVersion);
+  const isPanelUpdateNoticeDismissed = !!normalizedUpgradeTargetVersion && dismissedPanelUpgradeNoticeVersion === normalizedUpgradeTargetVersion;
+  const isDockerDeployment = !!upgradeStatus?.docker;
+  const dockerUpgradeCommand = upgradeStatus?.manualUpgradeCommand || buildPanelInstallerCommand({
+    deployment: "docker",
+    action: "upgrade",
+    accelerator: upgradeStatus?.githubAccelerator?.panelUpdateEnabled
+      ? upgradeStatus.githubAccelerator
+      : null,
+  });
+  const upgradeRefreshText = upgradeRefreshCountdown !== null
+    ? (upgradeRefreshCountdown > 0 ? `${upgradeRefreshCountdown} 秒后自动刷新` : "正在刷新页面")
+    : "系统恢复后将自动刷新";
+  const hasPanelUpdate = isAdmin && !!updateInfo?.hasUpdate && !!upgradeTargetVersion;
+  const showUpgradeNotice = isAdmin && (
+    (hasPanelUpdate && !isPanelUpdateNoticeDismissed) ||
+    displayUpgradeJob?.status === "running" ||
+    displayUpgradeJob?.status === "success" ||
+    displayUpgradeJob?.status === "waiting_assets" ||
+    displayUpgradeJob?.status === "error"
+  );
+  const canDismissPanelUpdateNotice = hasPanelUpdate && !isPanelVersionTaskVisible && !!normalizedUpgradeTargetVersion;
+  const dismissPanelUpdateNotice = () => {
+    if (!canDismissPanelUpdateNotice) return;
+    setDismissedPanelUpgradeNoticeVersion(normalizedUpgradeTargetVersion);
+    try {
+      window.localStorage.setItem(PANEL_UPGRADE_NOTICE_DISMISSED_KEY, normalizedUpgradeTargetVersion);
+    } catch {
+      // Local dismissal only affects the sidebar notice.
+    }
+    setShowUpgradeDialog(false);
+    toast.success(`v${normalizedUpgradeTargetVersion} 不再在左下角提醒`);
+  };
+  const managementMenuItems: SidebarNavItem[] = isAdmin
+    ? [...visibleProfileMenuItems, ...visibleAdminMenuItems]
+    : [...(canShowNetworkTest ? [lookingGlassMenuItem] : []), ...visibleProfileMenuItems];
+  const closeMobileNavigation = () => {
+    if (isMobile) {
+      setAccountMenuOpen(false);
+      setOpenMobile(false);
+    }
+  };
+  const navigateFromSidebar = (path: string) => {
+    closeMobileNavigation();
+    if (path === currentPath) return;
+    setLocation(path);
+  };
+  const navigateFromAccountMenu = (path: string) => {
+    setAccountMenuOpen(false);
+    window.requestAnimationFrame(() => navigateFromSidebar(path));
+  };
+  const openPanelUpdateFromAccountMenu = async () => {
+    if (!isAdmin) return;
+    setAccountMenuOpen(false);
+    if (
+      hasPanelUpdate ||
+      displayUpgradeJob?.status === "running" ||
+      displayUpgradeJob?.status === "success" ||
+      displayUpgradeJob?.status === "waiting_assets" ||
+      displayUpgradeJob?.status === "error"
+    ) {
+      setShowUpgradeDialog(true);
+      refetchUpgradeStatus();
+      return;
+    }
+    try {
+      const latestInfo = await utils.system.checkUpdate.fetch({ force: true });
+      await refetchUpgradeStatus();
+      if (latestInfo?.hasUpdate) {
+        setShowUpgradeDialog(true);
+      } else {
+        toast.success("当前已是最新版本");
+      }
+    } catch (error: any) {
+      toast.error(error?.message || "检查更新失败");
+    }
+  };
+  const renderSidebarItems = (items: SidebarNavItem[]) => items.map((item) => {
+    const isActive = currentPath === item.path;
+    const handleClick = () => {
+      if (!item.externalUrl) {
+        navigateFromSidebar(item.path);
+        return;
+      }
+      closeMobileNavigation();
+      window.open(item.externalUrl, "_blank", "noopener,noreferrer");
+    };
+    return (
+      <SidebarMenuItem key={item.path}>
+        <SidebarMenuButton
+          isActive={isActive}
+          onClick={handleClick}
+          tooltip={item.label}
+          className={cn("h-10 transition-[width,height,padding,background-color,color,box-shadow] font-normal mobile-sidebar-menu-button", isDesktopCollapsed && "justify-center", mobileAuth.isNative && "text-[13px]")}
+        >
+          {item.iconSrc ? (
+            <img
+              src={item.iconSrc}
+              alt=""
+              className={cn("sidebar-nav-icon h-4 w-4 shrink-0 rounded-[3px] object-contain", isDesktopCollapsed && "h-[18px] w-[18px]")}
+            />
+          ) : (
+            <item.icon className={cn("sidebar-nav-icon h-4 w-4", isDesktopCollapsed && "h-[18px] w-[18px]")} />
+          )}
+          <span className={cn(isDesktopCollapsed && "sr-only")}>{item.label}</span>
+        </SidebarMenuButton>
+      </SidebarMenuItem>
+    );
+  });
+
+  useEffect(() => {
+    openMobileRef.current = openMobile;
+  }, [openMobile]);
+
+  useEffect(() => {
+    accountMenuOpenRef.current = accountMenuOpen;
+  }, [accountMenuOpen]);
+
+  useEffect(() => {
+    if (isMobile && !openMobile) setAccountMenuOpen(false);
+  }, [isMobile, openMobile]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (!isMobile) {
+      root.style.removeProperty("--forwardx-mobile-header-offset");
+      return;
+    }
+    const header = mobileHeaderRef.current;
+    if (!header) return;
+
+    let frame = 0;
+    const syncHeaderOffset = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        const height = Math.ceil(header.getBoundingClientRect().height || 0);
+        const fallbackHeight = 56;
+        const safeAreaTop = Number.parseFloat(getComputedStyle(root).getPropertyValue("--forwardx-safe-area-top")) || 0;
+        const nextHeight = Math.max(height, fallbackHeight + safeAreaTop);
+        root.style.setProperty("--forwardx-mobile-header-offset", `${nextHeight}px`);
+      });
+    };
+
+    syncHeaderOffset();
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(syncHeaderOffset) : null;
+    observer?.observe(header);
+    const visualViewport = window.visualViewport;
+    window.addEventListener("resize", syncHeaderOffset);
+    window.addEventListener("orientationchange", syncHeaderOffset);
+    visualViewport?.addEventListener("resize", syncHeaderOffset);
+    visualViewport?.addEventListener("scroll", syncHeaderOffset);
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer?.disconnect();
+      window.removeEventListener("resize", syncHeaderOffset);
+      window.removeEventListener("orientationchange", syncHeaderOffset);
+      visualViewport?.removeEventListener("resize", syncHeaderOffset);
+      visualViewport?.removeEventListener("scroll", syncHeaderOffset);
+      root.style.removeProperty("--forwardx-mobile-header-offset");
+    };
+  }, [isMobile]);
+
+  useEffect(() => {
+    if (!mobileAuth.isNative || !isMobile) return;
+    let disposed = false;
+    let removeListener: (() => void) | undefined;
+    CapacitorApp.addListener("backButton", (event) => {
+      if (accountMenuOpenRef.current || openMobileRef.current) {
+        setAccountMenuOpen(false);
+        setOpenMobile(false);
+        return;
+      }
+      if (event.canGoBack) {
+        window.history.back();
+        return;
+      }
+      void CapacitorApp.minimizeApp();
+    })
+      .then((handle) => {
+        if (disposed) {
+          handle.remove();
+          return;
+        }
+        removeListener = () => handle.remove();
+      })
+      .catch(() => undefined);
+
+    return () => {
+      disposed = true;
+      removeListener?.();
+    };
+  }, [isMobile, setOpenMobile]);
+
+  return (
+    <>
+      <Sidebar collapsible="icon" className="border-r border-sidebar-border/60 bg-sidebar/75 backdrop-blur-2xl">
+        <SidebarHeader className="h-16 justify-center mobile-sidebar-header">
+          <div className={cn("flex w-full items-center gap-3 transition-all", isDesktopCollapsed ? "justify-center px-0" : "px-2")}>
+            {!isDesktopCollapsed ? (
+              <div className="flex items-center justify-between flex-1 min-w-0">
+                <div className="flex items-center gap-2 min-w-0">
+                  {logoMark}
+                  <span className="font-bold tracking-tight truncate text-base">
+                    {siteTitle}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={toggleTheme}
+                    className="h-8 w-8 flex items-center justify-center hover:bg-accent rounded-lg transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring shrink-0"
+                    aria-label="Toggle theme"
+                    title={resolvedTheme === "dark" ? "切换到白天模式" : "切换到黑夜模式"}
+                  >
+                    {resolvedTheme === "dark" ? (
+                      <Sun className="h-4 w-4 text-muted-foreground" />
+                    ) : (
+                      <Moon className="h-4 w-4 text-muted-foreground" />
+                    )}
+                  </button>
+                  <button
+                    onClick={toggleSidebar}
+                    className="h-8 w-8 flex items-center justify-center hover:bg-accent rounded-lg transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring shrink-0"
+                    aria-label="Toggle navigation"
+                  >
+                    <PanelLeft className="h-4 w-4 text-muted-foreground" />
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                onClick={toggleSidebar}
+                className="collapsed-sidebar-logo-button flex h-9 w-9 items-center justify-center rounded-lg transition-colors hover:bg-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                aria-label="Toggle navigation"
+                title={siteTitle}
+              >
+                {logoMark}
+              </button>
+            )}
+          </div>
+        </SidebarHeader>
+
+        <SidebarContent className="gap-1 pb-2 mobile-sidebar-content">
+          {primaryMenuItems.length > 0 && (
+            <SidebarGroup className={cn("pb-2 mobile-sidebar-group", mobileAuth.isNative && "pb-1.5")}>
+              <SidebarGroupLabel className="text-xs text-muted-foreground/60 uppercase tracking-wider">
+                主菜单
+              </SidebarGroupLabel>
+              <SidebarMenu className={cn("py-1 mobile-sidebar-menu", isDesktopCollapsed ? "items-center px-0" : "px-2")}>
+                {renderSidebarItems(primaryMenuItems)}
+              </SidebarMenu>
+            </SidebarGroup>
+          )}
+
+          {managementMenuItems.length > 0 && (
+            <SidebarGroup className={cn("mt-1 shrink-0 pt-2 mobile-sidebar-group mobile-sidebar-admin-group", !mobileAuth.isNative && "border-t border-sidebar-border/50", mobileAuth.isNative && "mt-0 pt-2 border-t border-sidebar-border/50")}>
+              <SidebarGroupLabel className="text-xs text-muted-foreground/60 uppercase tracking-wider">
+                管理
+              </SidebarGroupLabel>
+              <SidebarMenu className={cn("py-1 mobile-sidebar-menu", isDesktopCollapsed ? "items-center px-0" : "px-2")}>
+                {renderSidebarItems(managementMenuItems)}
+              </SidebarMenu>
+            </SidebarGroup>
+          )}
+
+          {otherMenuItems.length > 0 && (
+            <SidebarGroup className={cn("mt-1 shrink-0 pt-2 mobile-sidebar-group mobile-sidebar-admin-group", !mobileAuth.isNative && "border-t border-sidebar-border/50", mobileAuth.isNative && "mt-0 pt-2 border-t border-sidebar-border/50")}>
+              <SidebarGroupLabel className="text-xs text-muted-foreground/60 uppercase tracking-wider">
+                其他
+              </SidebarGroupLabel>
+              <SidebarMenu className={cn("py-1 mobile-sidebar-menu", isDesktopCollapsed ? "items-center px-0" : "px-2")}>
+                {renderSidebarItems(otherMenuItems)}
+              </SidebarMenu>
+            </SidebarGroup>
+          )}
+
+          {/* Theme toggle for collapsed sidebar */}
+          {isDesktopCollapsed && (
+            <SidebarGroup>
+              <SidebarMenu className="items-center px-0">
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    onClick={toggleTheme}
+                    tooltip={resolvedTheme === "dark" ? "切换到白天模式" : "切换到黑夜模式"}
+                    className="h-10 justify-center"
+                  >
+                    {resolvedTheme === "dark" ? (
+                      <Sun className="sidebar-nav-icon h-[18px] w-[18px]" />
+                    ) : (
+                      <Moon className="sidebar-nav-icon h-[18px] w-[18px]" />
+                    )}
+                    <span className="sr-only">{resolvedTheme === "dark" ? "白天模式" : "黑夜模式"}</span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              </SidebarMenu>
+            </SidebarGroup>
+          )}
+        </SidebarContent>
+
+        <SidebarFooter className={cn("mobile-sidebar-footer", isDesktopCollapsed ? "items-center p-1.5" : "p-3")}>
+          {showUpgradeNotice && (
+            <button
+              type="button"
+              onClick={() => {
+                setShowUpgradeDialog(true);
+                refetchUpgradeStatus();
+              }}
+              className="w-full rounded-lg border border-primary/20 bg-primary/10 px-3 py-2.5 text-left text-primary shadow-sm transition-colors hover:bg-primary/15 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:h-9 group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0 group-data-[collapsible=icon]:py-0"
+              title={
+                displayUpgradeJob?.status === "running"
+                  ? upgradeProgress.label
+                  : displayUpgradeJob?.status === "success"
+                    ? upgradeRefreshText
+                    : displayUpgradeJob?.status === "waiting_assets"
+                      ? "发布资产构建中"
+                    : displayUpgradeJob?.status === "error"
+                      ? `${panelVersionActionLabel}失败`
+                      : `发现新版本 ${upgradeTargetVersion}`
+              }
+            >
+              <div className="flex items-center gap-2">
+                {displayUpgradeJob?.status === "running" ? (
+                  <Loader2 className="forwardx-icon-spin h-4 w-4 shrink-0" />
+                ) : displayUpgradeJob?.status === "success" ? (
+                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                ) : displayUpgradeJob?.status === "waiting_assets" ? (
+                  <RefreshCw className="h-4 w-4 shrink-0 text-amber-500" />
+                ) : displayUpgradeJob?.status === "error" ? (
+                  <AlertTriangle className="h-4 w-4 shrink-0 text-destructive" />
+                ) : (
+                  <Rocket className="h-4 w-4 shrink-0" />
+                )}
+                <div className="min-w-0 flex-1 group-data-[collapsible=icon]:hidden">
+                  <p className="truncate text-xs font-semibold">
+                    {displayUpgradeJob?.status === "running"
+                      ? `正在${panelVersionActionLabel}`
+                      : displayUpgradeJob?.status === "success"
+                        ? `${panelVersionActionLabel}完成，正在重启`
+                        : displayUpgradeJob?.status === "waiting_assets"
+                          ? "发布资产构建中"
+                        : displayUpgradeJob?.status === "error"
+                          ? `${panelVersionActionLabel}失败`
+                          : "发现新版本"}
+                  </p>
+                  <p className="mt-1 truncate text-[11px] text-primary/75">
+                    {displayUpgradeJob?.status === "running"
+                      ? upgradeProgress.label
+                      : displayUpgradeJob?.status === "success"
+                        ? upgradeRefreshText
+                        : displayUpgradeJob?.status === "waiting_assets"
+                          ? (displayUpgradeJob.error || "请稍后重新检查更新")
+                        : displayUpgradeJob?.status === "error"
+                          ? (displayUpgradeJob.error || "点击查看详情")
+                          : `可升级到 ${upgradeTargetVersion}`}
+                  </p>
+                  {(displayUpgradeJob?.status === "running" || displayUpgradeJob?.status === "waiting_assets") && (
+                    <div className="mt-2 space-y-2">
+                      <Progress value={upgradeProgress.percent} className="h-1" />
+                      <div className="space-y-1">
+                        {upgradeProgress.steps.map((step) => (
+                          <div key={step.label} className="flex min-w-0 items-center gap-1.5 text-[10px] leading-4 text-primary/75">
+                            {step.done ? (
+                              <CheckCircle2 className="h-3 w-3 shrink-0 text-emerald-500" />
+                            ) : step.active ? (
+                              <Loader2 className="forwardx-icon-spin h-3 w-3 shrink-0" />
+                            ) : (
+                              <span className="h-3 w-3 shrink-0 rounded-full border border-primary/25" />
+                            )}
+                            <span className="truncate">{step.label}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </button>
+          )}
+          <DropdownMenu open={accountMenuOpen} onOpenChange={setAccountMenuOpen} modal={false}>
+            <DropdownMenuTrigger asChild>
+              <button
+                className="flex items-center gap-2 rounded-lg border border-border/40 bg-background/35 px-2 py-2.5 text-left transition-colors hover:bg-accent/50 w-full group-data-[collapsible=icon]:h-10 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:border-0 group-data-[collapsible=icon]:bg-transparent group-data-[collapsible=icon]:px-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                title={accountDisplayName}
+              >
+                <UserAvatar user={user as any} className={cn("shrink-0", isDesktopCollapsed ? "h-8 w-8" : "h-9 w-9")} />
+                <div className="min-w-0 flex-1 group-data-[collapsible=icon]:hidden">
+                  <p className="truncate text-sm font-medium leading-5">{accountDisplayName}</p>
+                  <p className="mt-1 truncate text-xs leading-4 text-muted-foreground">
+                    {isAdmin ? "管理员" : "用户"} · {telegramStatus?.bound ? "TG 已绑定" : "TG 未绑定"}
+                  </p>
+                </div>
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-56">
+              <div className="px-2 py-1.5">
+                <div className="flex items-start gap-2">
+                  <UserAvatar user={user as any} className="h-8 w-8 shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium">{accountDisplayName}</p>
+                    <p className="mt-1 truncate text-xs text-muted-foreground">{isAdmin ? "管理员" : "普通用户"} · {accountUsername}</p>
+                  </div>
+                </div>
+              </div>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={() => navigateFromAccountMenu("/profile")}
+                className="cursor-pointer"
+              >
+                <UserRound />
+                <span>个人资料</span>
+              </DropdownMenuItem>
+              {!mobileAuth.isNative && isAdmin && (
+                <DropdownMenuItem
+                  onClick={openPanelUpdateFromAccountMenu}
+                  className="cursor-pointer"
+                >
+                  <Download />
+                  <span>软件更新</span>
+                </DropdownMenuItem>
+              )}
+              {mobileAuth.isNative && (
+                <DropdownMenuItem
+                  onClick={handleMobileUpdateCheck}
+                  disabled={checkingMobileUpdate}
+                  className="cursor-pointer"
+                >
+                  {checkingMobileUpdate ? (
+                    <RefreshCw className="forwardx-icon-spin" />
+                  ) : (
+                    <Download />
+                  )}
+                  <span>{checkingMobileUpdate ? "检查中..." : "软件更新"}</span>
+                </DropdownMenuItem>
+              )}
+              {isAdmin && (
+                <DropdownMenuItem
+                  onClick={() => navigateFromAccountMenu("/settings")}
+                  className="cursor-pointer"
+                >
+                  <Settings />
+                  <span>系统设置</span>
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={handleLogout}
+                variant="destructive"
+              >
+                <LogOut />
+                <span>退出登录</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </SidebarFooter>
+      </Sidebar>
+
+      <SidebarInset>
+        {isMobile && (
+          <div ref={mobileHeaderRef} data-mobile-header="true" className="glass-surface fixed inset-x-0 top-0 z-40 flex min-h-14 items-center justify-between border-b px-2 md:sticky">
+            <div className="flex items-center gap-2">
+              <SidebarTrigger className="h-9 w-9 rounded-lg bg-background" />
+              <div className="flex items-center gap-3">
+                <div className="flex flex-col gap-1">
+                  <span className="tracking-tight text-foreground">
+                    {activeMenuItem?.label ?? siteTitle}
+                  </span>
+                </div>
+              </div>
+            </div>
+            <button
+              onClick={toggleTheme}
+              className="h-9 w-9 flex items-center justify-center hover:bg-accent rounded-lg transition-colors"
+              aria-label="Toggle theme"
+            >
+              {resolvedTheme === "dark" ? (
+                <Sun className="h-4 w-4" />
+              ) : (
+                <Moon className="h-4 w-4" />
+              )}
+            </button>
+          </div>
+        )}
+        <main data-mobile-main="true" className="flex-1 px-3 pb-3 pt-3 sm:p-6">
+          <div key={location} className="route-content-enter">
+            {children}
+          </div>
+        </main>
+        <footer className="pb-4 text-center text-xs text-muted-foreground">
+          <div className="inline-flex flex-wrap items-center justify-center gap-x-3 gap-y-1">
+            <a
+              href={publicInfo?.repoUrl || "https://github.com/wzwys9/Forwardplus"}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="transition-colors hover:text-foreground"
+            >
+              项目地址
+            </a>
+            <span className="text-muted-foreground/45">|</span>
+            <a
+              href="https://github.com/wzwys9/Forwardplus/tree/main/docs"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="transition-colors hover:text-foreground"
+            >
+              使用教程
+            </a>
+            <span className="text-muted-foreground/45">|</span>
+            <a
+              href={publicInfo?.telegramBotUrl || "https://t.me/miyin_private_bot"}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="transition-colors hover:text-foreground"
+            >
+              联系TG
+            </a>
+            <span className="text-muted-foreground/45">|</span>
+            <a
+              href="https://t.me/ForwardX_panel"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="transition-colors hover:text-foreground"
+            >
+              TG群组
+            </a>
+          </div>
+        </footer>
+      </SidebarInset>
+
+      <Dialog open={showUpgradeDialog} onOpenChange={setShowUpgradeDialog}>
+        <DialogContent className="w-[calc(100vw-2rem)] max-w-[560px] overflow-x-hidden sm:max-w-xl">
+          <DialogTitle className="flex items-center gap-2">
+            <Rocket className="h-5 w-5 text-primary" />
+            {isPanelRollbackTask ? "面板版本回退" : "发现新版本"}
+          </DialogTitle>
+          <DialogDescription>
+            {isPanelRollbackTask
+              ? "后台回退，完成后自动重启。"
+              : (isDockerDeployment ? "复制一键脚本后在服务器执行，脚本会重建 ForwardX 容器。" : "后台升级，完成后自动重启。")}
+          </DialogDescription>
+          {(() => {
+            const job = displayUpgradeJob;
+            const progress = upgradeProgress;
+            const isRunning = job?.status === "running";
+            const isSuccess = job?.status === "success";
+            const isWaitingAssets = job?.status === "waiting_assets";
+            const isError = job?.status === "error";
+            const targetVersion = upgradeTargetVersion || "-";
+            const currentVersion = upgradeStatus?.currentVersion || updateInfo?.currentVersion || "-";
+            return (
+              <div className="min-w-0 space-y-4 overflow-x-hidden py-2">
+                <div className="grid gap-3 rounded-lg border border-border/40 bg-muted/20 p-3 text-sm sm:grid-cols-2">
+                  <div className="min-w-0">
+                    <p className="text-xs text-muted-foreground">当前版本</p>
+                    <p className="mt-1 break-all font-mono">v{currentVersion}</p>
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-xs text-muted-foreground">目标版本</p>
+                    <p className="mt-1 break-all font-mono">{String(targetVersion).startsWith("v") ? targetVersion : `v${targetVersion}`}</p>
+                  </div>
+                </div>
+
+                {upgradeStatus?.upgradeEnabled === false && (
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300">
+                    {isDockerDeployment ? `Docker 部署请复制下方一键脚本到服务器执行${panelVersionActionLabel}。` : `当前环境未配置自动${panelVersionActionLabel}命令，无法在面板内一键${panelVersionActionLabel}。`}
+                  </div>
+                )}
+
+                {isDockerDeployment && (
+                  <div className="space-y-3 rounded-lg border border-border/40 bg-background/60 p-3">
+                    {updateInfo?.pendingReason && !updateInfo.error && (
+                      <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-5 text-amber-700 dark:text-amber-300">
+                        {updateInfo.pendingReason}
+                      </div>
+                    )}
+                    <code className="block max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/30 p-3 font-mono text-xs leading-relaxed">
+                      {dockerUpgradeCommand}
+                    </code>
+                  </div>
+                )}
+
+                {(isRunning || isSuccess || isWaitingAssets || isError) && (
+                  <div className="space-y-3 rounded-lg border border-border/40 bg-background/60 p-3">
+                    <div className="flex items-center justify-between gap-3 text-sm">
+                      <span className="font-medium">{progress.label}</span>
+                      <span className="text-xs text-muted-foreground">{progress.percent}%</span>
+                    </div>
+                    <Progress value={progress.percent} className="h-2" />
+                    <div className="grid min-w-0 gap-2 sm:grid-cols-2">
+                      {progress.steps.map((step) => (
+                        <div key={step.label} className="flex min-w-0 items-center gap-2 text-xs">
+                          {step.done ? (
+                            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
+                          ) : step.active ? (
+                            <Loader2 className="forwardx-icon-spin h-3.5 w-3.5 shrink-0 text-primary" />
+                          ) : (
+                            <span className="h-3.5 w-3.5 shrink-0 rounded-full border border-border" />
+                          )}
+                          <span className={step.done || step.active ? "truncate text-foreground" : "truncate text-muted-foreground"}>{step.label}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {isWaitingAssets && (
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300">
+                    <div className="flex items-center gap-2 font-medium">
+                      <RefreshCw className="h-4 w-4" />
+                      发布资产构建中
+                    </div>
+                    <p className="mt-2 break-words text-xs leading-5">
+                      {job?.error || `GitHub Actions 正在生成面板安装包或 Docker 镜像，请稍后重新检查${panelVersionActionLabel}。`}
+                    </p>
+                  </div>
+                )}
+
+                {isError && (
+                  <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+                    <div className="flex items-center gap-2 font-medium">
+                      <AlertTriangle className="h-4 w-4" />
+                      {panelVersionActionLabel}失败
+                    </div>
+                    <p className="mt-1 text-xs">{job?.error || `${panelVersionActionLabel}命令执行失败，请到系统设置查看日志。`}</p>
+                  </div>
+                )}
+
+                {isSuccess && (
+                  <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3 text-sm text-emerald-700 dark:text-emerald-300">
+                    {panelVersionActionLabel}任务已完成，面板正在重启。{upgradeRefreshText}。
+                  </div>
+                )}
+
+              </div>
+            );
+          })()}
+          <DialogFooter className="gap-2">
+            <Button className="w-full gap-2 sm:w-auto" variant="ghost" asChild>
+              <a href={upgradeChangelogUrl} target="_blank" rel="noopener noreferrer">
+                <ExternalLink className="h-4 w-4" />
+                {panelVersionActionLabel}日志
+              </a>
+            </Button>
+            {canDismissPanelUpdateNotice && (
+              <Button className="w-full gap-2 sm:w-auto" variant="outline" onClick={dismissPanelUpdateNotice}>
+                <BellOff className="h-4 w-4" />
+                不再提醒
+              </Button>
+            )}
+            <Button className="w-full sm:w-auto" variant="outline" onClick={() => setShowUpgradeDialog(false)}>
+              {displayUpgradeJob?.status === "running" ? "后台执行" : "取消"}
+            </Button>
+            {isDockerDeployment ? (
+              <Button className="w-full gap-2 sm:w-auto" onClick={() => copyText(dockerUpgradeCommand)}>
+                <Copy className="h-4 w-4" />
+                复制脚本
+              </Button>
+            ) : (
+              <Button
+                className="w-full gap-2 sm:w-auto"
+                disabled={
+                  !upgradeTargetVersion ||
+                  isPanelRollbackTask ||
+                  upgradeStatus?.upgradeEnabled === false ||
+                  displayUpgradeJob?.status === "running" ||
+                  displayUpgradeJob?.status === "success" ||
+                  startUpgradeMutation.isPending
+                }
+                onClick={() => upgradeTargetVersion && startUpgradeMutation.mutate({ targetVersion: upgradeTargetVersion })}
+              >
+                {startUpgradeMutation.isPending || displayUpgradeJob?.status === "running" ? (
+                  <Loader2 className="forwardx-icon-spin h-4 w-4" />
+                ) : (
+                  <Rocket className="h-4 w-4" />
+                )}
+                {isPanelRollbackTask
+                  ? (displayUpgradeJob?.status === "running" ? "回退中..." : "请到系统设置处理")
+                  : (displayUpgradeJob?.status === "running" ? "升级中..." : "确认升级")}
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showMobileUpdateDialog} onOpenChange={setShowMobileUpdateDialog}>
+        <DialogContent className="w-[calc(100vw-2rem)] max-w-[420px] overflow-hidden rounded-xl border-border/60 bg-background p-0 shadow-2xl">
+          <div className="border-b border-border/40 bg-primary/10 px-5 py-4">
+            <DialogTitle className="flex items-center gap-2 text-base">
+              <Download className="h-5 w-5 text-primary" />
+              发现 APP 新版本
+            </DialogTitle>
+            <DialogDescription className="mt-1 text-xs">
+              前往下载新版 {mobileUpdateInfo?.packageLabel || "安装包"}。
+            </DialogDescription>
+          </div>
+          <div className="space-y-3 px-5 py-4">
+            <div className="grid grid-cols-2 gap-3 text-sm">
+              <div className="rounded-lg border border-border/40 bg-muted/25 p-3">
+                <p className="text-xs text-muted-foreground">当前版本</p>
+                <p className="mt-1 font-mono">{mobileUpdateInfo?.currentVersion ? `v${mobileUpdateInfo.currentVersion.replace(/^v/i, "")}` : "-"}</p>
+              </div>
+              <div className="rounded-lg border border-primary/25 bg-primary/10 p-3">
+                <p className="text-xs text-muted-foreground">最新版本</p>
+                <p className="mt-1 font-mono text-primary">{mobileUpdateInfo?.latestVersion ? `v${mobileUpdateInfo.latestVersion.replace(/^v/i, "")}` : "-"}</p>
+              </div>
+            </div>
+          </div>
+          <DialogFooter className="gap-2 border-t border-border/40 px-5 py-4">
+            <Button variant="outline" className="w-full sm:w-auto" onClick={() => setShowMobileUpdateDialog(false)}>
+              稍后再说
+            </Button>
+            <Button className="w-full gap-2 sm:w-auto" onClick={openDetectedMobileRelease}>
+              <ExternalLink className="h-4 w-4" />
+              前往下载
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Change Password Dialog */}
+      <Dialog open={showChangePassword} onOpenChange={setShowChangePassword}>
+        <DialogContent className="sm:max-w-md">
+          <DialogTitle>修改密码</DialogTitle>
+          <DialogDescription>请输入当前密码和新密码</DialogDescription>
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <Label htmlFor="old-password">当前密码</Label>
+              <Input
+                id="old-password"
+                type="password"
+                value={oldPassword}
+                onChange={(e) => setOldPassword(e.target.value)}
+                placeholder="请输入当前密码"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="new-password">新密码</Label>
+              <Input
+                id="new-password"
+                type="password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                placeholder="请输入新密码（至少6个字符）"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="confirm-password">确认新密码</Label>
+              <Input
+                id="confirm-password"
+                type="password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                placeholder="请再次输入新密码"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowChangePassword(false)}>
+              取消
+            </Button>
+            <Button
+              onClick={handleChangePassword}
+              disabled={changePasswordMutation.isPending}
+            >
+              {changePasswordMutation.isPending ? "修改中..." : "确认修改"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showAvatarDialog} onOpenChange={setShowAvatarDialog}>
+        <DialogContent className="sm:max-w-md">
+          <DialogTitle>头像设置</DialogTitle>
+          <DialogDescription>选择预设头像或上传自定义头像。</DialogDescription>
+          <AvatarPicker
+            value={avatarDraft}
+            onChange={setAvatarDraft}
+            fallback={user?.id || user?.username}
+            disabled={updateAvatarMutation.isPending}
+            onError={(message) => toast.error(message)}
+            className="py-2"
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowAvatarDialog(false)} disabled={updateAvatarMutation.isPending}>
+              取消
+            </Button>
+            <Button onClick={handleSaveAvatar} disabled={updateAvatarMutation.isPending}>
+              {updateAvatarMutation.isPending ? "保存中..." : "保存头像"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showTwoFactorDialog} onOpenChange={setShowTwoFactorDialog}>
+        <DialogContent className="sm:max-w-md">
+          <DialogTitle className="flex items-center gap-2">
+            <Shield className="h-5 w-5 text-primary" />
+            双重验证
+          </DialogTitle>
+          <DialogDescription>使用 2FA 软件生成动态验证码。</DialogDescription>
+          {!twoFactorStatus?.globalEnabled ? (
+            <div className="rounded-lg border border-primary/20 bg-primary/5 p-3 text-sm text-primary">
+              管理员尚未启用双重验证功能。
+            </div>
+          ) : twoFactorStatus?.enabled ? (
+            <div className="space-y-4 py-2">
+              <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 p-3 text-sm text-emerald-700 dark:text-emerald-300">
+                当前账户已启用双重验证。
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="two-factor-disable-password">当前密码</Label>
+                <Input
+                  id="two-factor-disable-password"
+                  type="password"
+                  value={twoFactorPassword}
+                  onChange={(e) => setTwoFactorPassword(e.target.value)}
+                  placeholder="请输入当前密码"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="two-factor-disable-code">动态验证码</Label>
+                <Input
+                  id="two-factor-disable-code"
+                  inputMode="numeric"
+                  maxLength={6}
+                  value={twoFactorCode}
+                  onChange={(e) => setTwoFactorCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                  placeholder="请输入 6 位验证码"
+                />
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-4 py-2">
+              <div className="rounded-lg border border-border/40 bg-muted/20 p-3 text-sm text-muted-foreground">
+                扫码添加，{Math.round((twoFactorSetup?.expiresInSeconds || TWO_FACTOR_SETUP_SECONDS) / 60)} 分钟内有效。
+              </div>
+              <div className="flex flex-col items-center gap-3">
+                <div className={`flex h-48 w-48 items-center justify-center rounded-lg border bg-white p-3 ${twoFactorSetupExpired ? "opacity-45" : ""}`}>
+                  {beginTwoFactorSetupMutation.isPending ? (
+                    <Loader2 className="forwardx-icon-spin h-6 w-6 text-slate-500" />
+                  ) : twoFactorQrCode ? (
+                    <img src={twoFactorQrCode} alt="2FA 绑定二维码" className="h-full w-full" />
+                  ) : (
+                    <span className="text-xs text-slate-500">二维码生成中</span>
+                  )}
+                </div>
+                <div className={`text-xs ${twoFactorSetupExpired ? "text-destructive" : "text-muted-foreground"}`}>
+                  {twoFactorSetup
+                    ? twoFactorSetupExpired
+                      ? "二维码已过期，请重新生成"
+                      : `剩余 ${twoFactorSetupRemainingLabel}`
+                    : "正在生成二维码"}
+                </div>
+              </div>
+              {twoFactorSetup?.otpauthUrl && (
+                <Button variant="outline" asChild className="w-full gap-2">
+                  <a href={twoFactorSetup.otpauthUrl}>
+                    <ExternalLink className="h-4 w-4" />
+                    打开 2FA 软件添加
+                  </a>
+                </Button>
+              )}
+              <div className="space-y-2">
+                <Label>备用密钥</Label>
+                <div className="flex items-center gap-2">
+                  <code className="min-w-0 flex-1 break-all rounded-md border bg-background px-3 py-2 font-mono text-sm">
+                    {twoFactorSetup?.secret || "正在生成..."}
+                  </code>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={() => twoFactorSetup?.secret && copyText(twoFactorSetup.secret)}
+                    disabled={!twoFactorSetup?.secret || twoFactorSetupExpired}
+                    title="复制备用密钥"
+                  >
+                    <Copy className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="two-factor-enable-password">当前密码</Label>
+                <Input
+                  id="two-factor-enable-password"
+                  type="password"
+                  value={twoFactorPassword}
+                  onChange={(e) => setTwoFactorPassword(e.target.value)}
+                  placeholder="请输入当前密码"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="two-factor-enable-code">动态验证码</Label>
+                <Input
+                  id="two-factor-enable-code"
+                  inputMode="numeric"
+                  maxLength={6}
+                  value={twoFactorCode}
+                  onChange={(e) => setTwoFactorCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                  placeholder="请输入 6 位验证码"
+                />
+              </div>
+            </div>
+          )}
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setShowTwoFactorDialog(false)}>
+              关闭
+            </Button>
+            {twoFactorStatus?.globalEnabled && twoFactorStatus?.enabled ? (
+              <Button
+                variant="destructive"
+                onClick={handleDisableTwoFactor}
+                disabled={disableTwoFactorMutation.isPending}
+              >
+                {disableTwoFactorMutation.isPending ? "关闭中..." : "关闭双重验证"}
+              </Button>
+            ) : twoFactorStatus?.globalEnabled ? (
+              <>
+                {twoFactorSetupExpired && (
+                  <Button
+                    variant="outline"
+                    onClick={() => beginTwoFactorSetupMutation.mutate()}
+                    disabled={beginTwoFactorSetupMutation.isPending}
+                  >
+                    {beginTwoFactorSetupMutation.isPending ? "生成中..." : "重新生成二维码"}
+                  </Button>
+                )}
+                <Button
+                  onClick={handleEnableTwoFactor}
+                  disabled={beginTwoFactorSetupMutation.isPending || enableTwoFactorMutation.isPending || twoFactorSetupExpired}
+                >
+                  {enableTwoFactorMutation.isPending ? "启用中..." : "启用双重验证"}
+                </Button>
+              </>
+            ) : null}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showTelegramDialog} onOpenChange={setShowTelegramDialog}>
+        <DialogContent className="sm:max-w-md">
+          <DialogTitle className="flex items-center gap-2">
+            <Send className="h-5 w-5 text-primary" />
+            Telegram 绑定
+          </DialogTitle>
+          <DialogDescription>绑定后可用 Telegram 登录和查询。</DialogDescription>
+          <div className="space-y-4 py-2">
+            {telegramStatus?.bound ? (
+              <div className="rounded-lg border border-border/40 bg-muted/20 p-3">
+                <p className="text-sm font-medium">
+                  {telegramStatus.account?.username ? `@${telegramStatus.account.username}` : telegramStatus.account?.id}
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  绑定时间：{telegramStatus.account?.linkedAt ? new Date(telegramStatus.account.linkedAt).toLocaleString() : "-"}
+                </p>
+              </div>
+            ) : telegramBind ? (
+              <div className="space-y-3">
+                {telegramBotUrl && (
+                  <a
+                    href={telegramBotUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center justify-between rounded-lg border border-primary/20 bg-primary/5 p-3 text-sm text-primary transition-colors hover:bg-primary/10"
+                  >
+                    <span>
+                      当前机器人：<b>@{telegramBind.botUsername || telegramStatus?.botUsername}</b>
+                    </span>
+                    <Send className="h-4 w-4" />
+                  </a>
+                )}
+                <div className="rounded-lg border border-primary/20 bg-primary/5 p-3">
+                  <p className="text-xs text-muted-foreground">绑定码</p>
+                  <div className="mt-1 flex items-center gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <code className={`break-all font-mono text-lg font-semibold tracking-widest ${telegramBindExpired ? "text-muted-foreground line-through" : ""}`}>
+                          {telegramBind.code}
+                        </code>
+                        <Badge variant={telegramBindExpired ? "destructive" : "outline"} className="shrink-0">
+                          {telegramBindExpired ? "已过期" : `${telegramBindRemainingLabel} 后过期`}
+                        </Badge>
+                      </div>
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        {telegramBindExpired ? "绑定码已过期，请重新生成。" : "5 分钟内有效，可复制备用，也可以直接打开 Telegram 完成绑定。"}
+                      </p>
+                    </div>
+                    <Button variant="outline" size="icon" onClick={() => copyText(telegramBind.code)} disabled={telegramBindExpired}>
+                      <Copy className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  打开 Telegram 点 Start，或发送 <code>/bind {telegramBind.code}</code>。
+                </p>
+                {telegramBindUrl && !telegramBindExpired && (
+                  <Button variant="outline" asChild className="w-full gap-2">
+                    <a href={telegramBindUrl} target="_blank" rel="noopener noreferrer">
+                      <Send className="h-4 w-4" />
+                      打开 Telegram 完成绑定
+                    </a>
+                  </Button>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {telegramBotUrl && (
+                  <a
+                    href={telegramBotUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center justify-between rounded-lg border border-primary/20 bg-primary/5 p-3 text-sm text-primary transition-colors hover:bg-primary/10"
+                  >
+                    <span>
+                      当前机器人：<b>@{telegramStatus?.botUsername}</b>
+                    </span>
+                    <Send className="h-4 w-4" />
+                  </a>
+                )}
+                <div className="rounded-lg border border-primary/20 bg-primary/5 p-3 text-sm text-primary">
+                  {telegramStatus?.configured ? "先生成绑定码。" : "Telegram 尚未配置。"}
+                </div>
+              </div>
+            )}
+          </div>
+          <DialogFooter className="gap-2">
+            {telegramStatus?.bound ? (
+              <>
+                {telegramBotUrl && (
+                  <Button variant="outline" asChild className="gap-2">
+                    <a href={telegramBotUrl} target="_blank" rel="noopener noreferrer">
+                      <Send className="h-4 w-4" />
+                      打开机器人
+                    </a>
+                  </Button>
+                )}
+                <Button
+                  variant="destructive"
+                  className="gap-2"
+                  onClick={() => unbindTelegramMutation.mutate()}
+                  disabled={unbindTelegramMutation.isPending}
+                >
+                  <Link2Off className="h-4 w-4" />
+                  解除绑定
+                </Button>
+              </>
+            ) : (
+              <Button
+                onClick={() => createTelegramBindMutation.mutate()}
+                disabled={createTelegramBindMutation.isPending || telegramStatus?.configured === false}
+              >
+                {createTelegramBindMutation.isPending ? "生成中..." : telegramBindExpired ? "重新生成绑定码" : "生成绑定码"}
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showAnnouncement} onOpenChange={(open) => {
+        if (!open && popupAnnouncement?.id) dismissAnnouncement.mutate({ id: popupAnnouncement.id });
+        setShowAnnouncement(open);
+      }}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogTitle className="flex items-center gap-2">
+            <Megaphone className="h-5 w-5" />
+            {popupAnnouncement?.title || "公告"}
+          </DialogTitle>
+          <DialogDescription>关闭后可在公告中查看。</DialogDescription>
+          <div
+            className="max-h-[50svh] overflow-y-auto rounded-lg border bg-background/45 p-4 text-sm leading-6"
+            dangerouslySetInnerHTML={{ __html: renderMixedHtml(popupAnnouncement?.content || "") }}
+          />
+          <DialogFooter>
+            <Button onClick={() => popupAnnouncement?.id && dismissAnnouncement.mutate({ id: popupAnnouncement.id })}>我知道了</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showUpgradeAnnouncement} onOpenChange={(open) => {
+        if (open) setShowUpgradeAnnouncement(true);
+      }}>
+        <DialogContent className="sm:max-w-lg [&>button]:hidden">
+          <DialogTitle className="flex items-center gap-2">
+            <Megaphone className="h-5 w-5" />
+            {upgradeAnnouncement?.title || "升级公告"}
+          </DialogTitle>
+          <DialogDescription>
+            已检测到面板已升级。请阅读本次版本公告，{UPGRADE_ANNOUNCEMENT_COUNTDOWN_SECONDS}S 后可确认进入页面。
+          </DialogDescription>
+          <div
+            className="max-h-[50svh] overflow-y-auto rounded-lg border bg-background/45 p-4 text-sm leading-6"
+            dangerouslySetInnerHTML={{ __html: renderMixedHtml(upgradeAnnouncement?.content || "") }}
+          />
+          <DialogFooter>
+            <Button
+              onClick={() => upgradeAnnouncement?.id && dismissUpgradeAnnouncement.mutate({ id: upgradeAnnouncement.id })}
+              disabled={upgradeAnnouncementCountdown > 0 || dismissUpgradeAnnouncement.isPending}
+            >
+              {upgradeAnnouncementCountdown > 0 ? `${upgradeAnnouncementCountdown}S` : "我知道了"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}

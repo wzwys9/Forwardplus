@@ -1,0 +1,147 @@
+{
+  "capability": {
+    "schemaVersion": 1,
+    "supportedKinds": ["MTPROTO_FAKE_TLS"],
+    "kindCapabilities": [
+      {
+        "kind": "MTPROTO_FAKE_TLS",
+        "supervisor": "AGENT_CHILD",
+        "supportsArtifactInstall": true,
+        "runsAsDedicatedUser": true,
+        "network": "tcp"
+      },
+      {
+        "kind": "AMNEZIAWG",
+        "supervisor": "AGENT_CHILD",
+        "supportsArtifactInstall": false,
+        "runsAsDedicatedUser": true,
+        "network": "udp"
+      }
+    ],
+    "supervisor": "AGENT_CHILD",
+    "supportsArtifactInstall": true,
+    "runsAsDedicatedUser": true,
+    "supportedOS": "linux",
+    "supportedArch": "amd64"
+  },
+  "desired": {
+    "schemaVersion": 1,
+    "generation": 8,
+    "issuedAt": "2026-09-03T08:00:00.000Z",
+    "configHash": "85aca0c0ce29be48e33bf09072243c7cd1611788eb5abeb2f60606283e613edc",
+    "services": [
+      {
+        "kind": "MTPROTO_FAKE_TLS",
+        "serviceId": 41,
+        "serviceTag": "forwardx-mtproto-11111111-1111-4111-8111-111111111111",
+        "targetVersion": "v1.15.0",
+        "artifact": {
+          "artifactId": 7,
+          "packageFormat": "tar.gz",
+          "sha256": "f1f8763504753fb863a0ddff83eab19c856747289c376275c44b717f1747908e",
+          "fileSize": 5307638
+        },
+        "listenAddress": "0.0.0.0",
+        "listenPort": 24443,
+        "fakeTlsDomain": "example.com",
+        "accounts": [
+          {
+            "accountTag": "forwardx-mtproto-account-22222222-2222-4222-8222-222222222222",
+            "secret": "ee000102030405060708090a0b0c0d0e0f6578616d706c652e636f6d"
+          }
+        ]
+      },
+      {
+        "kind": "AMNEZIAWG",
+        "serviceId": 42,
+        "serviceTag": "forwardx-amneziawg-33333333-3333-4333-8333-333333333333",
+        "targetVersion": "v3.1.20260814",
+        "listenAddress": "0.0.0.0",
+        "listenPort": 24444,
+        "publicAddress": "vpn.example.com",
+        "subnet": "10.8.1.0/24",
+        "mtu": 1420,
+        "dns": ["1.1.1.1", "1.0.0.1"],
+        "serverPrivateKey": "CAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAUA=",
+        "obfuscation": {
+          "jc": 4,
+          "jmin": 40,
+          "jmax": 80,
+          "s1": 64,
+          "s2": 256,
+          "s3": 32,
+          "s4": 16,
+          "h1": "100-199",
+          "h2": "300-399",
+          "h3": "500-599",
+          "h4": "700-799",
+          "i1": "<r 64>",
+          "headerProtectionKey": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+          "contentPaddingAddition": "0-16",
+          "rekeyAfterTime": "120-180",
+          "rekeyTimeout": "5-10",
+          "rejectAfterTime": "180-240",
+          "keepaliveTimeout": "10-20",
+          "maxHandshakeAttempts": "10-20",
+          "randomTrailers": true,
+          "disableCookies": true
+        },
+        "peers": [
+          {
+            "accountTag": "forwardx-amneziawg-peer-44444444-4444-4444-8444-444444444444",
+            "address": "10.8.1.2/32",
+            "publicKey": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "preSharedKey": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM="
+          }
+        ]
+      }
+    ]
+  },
+  "observedReport": {
+    "managedServicesStateSignature": "a9c6b77239ce23ebffe2eba9ec137f7461ced1e817b9c00faadb5919cee52973",
+    "managedServicesState": {
+      "schemaVersion": 1,
+      "appliedGeneration": 8,
+      "appliedConfigHash": "85aca0c0ce29be48e33bf09072243c7cd1611788eb5abeb2f60606283e613edc",
+      "services": [
+        {
+          "kind": "MTPROTO_FAKE_TLS",
+          "serviceId": 41,
+          "serviceTag": "forwardx-mtproto-11111111-1111-4111-8111-111111111111",
+          "installedVersion": "v1.15.0",
+          "runningVersion": "v1.15.0",
+          "serviceStatus": "RUNNING",
+          "processId": 4242,
+          "binarySha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "listener": {
+            "network": "tcp",
+            "listenAddress": "0.0.0.0",
+            "port": 24443,
+            "status": "READY",
+            "errorCode": null
+          },
+          "errorCode": null
+        },
+        {
+          "kind": "AMNEZIAWG",
+          "serviceId": 42,
+          "serviceTag": "forwardx-amneziawg-33333333-3333-4333-8333-333333333333",
+          "installedVersion": "v3.1.20260814",
+          "runningVersion": "v3.1.20260814",
+          "serviceStatus": "RUNNING",
+          "processId": 4243,
+          "binarySha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "listener": {
+            "network": "udp",
+            "listenAddress": "0.0.0.0",
+            "port": 24444,
+            "status": "READY",
+            "errorCode": null
+          },
+          "errorCode": null
+        }
+      ],
+      "observedAt": "2026-09-03T08:00:05.000Z"
+    }
+  }
+}

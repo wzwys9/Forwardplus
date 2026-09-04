@@ -1,0 +1,3409 @@
+import crypto from "crypto";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
+import {
+  balanceTransactions, InsertBalanceTransaction,
+  discountCodePlans,
+  discountCodes, InsertDiscountCode,
+  forwardGroups,
+  forwardRules,
+  paymentOrders, InsertPaymentOrder,
+  redemptionCodes, InsertRedemptionCode,
+  subscriptionPlans, InsertSubscriptionPlan,
+  subscriptionPlanForwardGroups,
+  subscriptionPlanHosts,
+  subscriptionPlanTrafficAddons,
+  subscriptionPlanTunnels,
+  userTrafficAddons,
+  userSubscriptions, InsertUserSubscription,
+  users,
+} from "../../drizzle/schema";
+import { executeRaw, getDatabaseKind, getDb, insertAndGetId, isDatabaseTransactionActive, nowDate, queryRaw, quoteDbIdentifier, rawAffectedRows, withDatabaseTransaction } from "../dbRuntime";
+import { getForwardRulesForUserSync, resetForwardRulesForUserSync } from "./forwardRuleRepository";
+import { getForwardGroupEntryPortRange } from "./forwardGroupRepository";
+import { getHostById } from "./hostRepository";
+import { getTunnelById, updateTunnel } from "./tunnelRepository";
+import { pruneMapEntries, setBoundedMapValue } from "../boundedCache";
+import {
+  disableAllUserRules,
+  getAllUsers,
+  getUserById,
+  resetUserTraffic,
+  resetUserTrafficForCycle,
+  setUserForwardAccess,
+  updateUserTrafficSettings,
+  type ForwardAccessPauseReason,
+} from "./userRepository";
+import { sqlBool } from "./repositoryUtils";
+import { pushAgentRefresh } from "../agentEvents";
+import { getUserUsableTrafficBillingResourceIds } from "./trafficBillingRepository";
+import { getSetting, setSetting } from "./settingsRepository";
+import { pageResult, pageWindowForTotal, type PageRequest } from "../../shared/pagination";
+import { withKeyedTaskLock, withTrafficBillingUserLock } from "../keyedTaskLock";
+import {
+  getUserForwardRuleIdsDisabledByAccess,
+  scheduleUserForwardRulesAfterAccessRecovery,
+  restoreUserForwardRulesAfterAccessRecovery,
+} from "./userForwardAccessRecovery";
+import {
+  billingAddMonthsClamped,
+  billingCalendarParts,
+  billingMonthlyBoundary,
+  billingStartOfCalendarDay,
+} from "../../shared/billingTime";
+
+let lastActiveSubscriptionWarningAt = 0;
+const SUBSCRIPTION_PORT_ALLOCATION_LOCK_KEY = "subscription-port-allocation";
+const SUBSCRIPTION_PORT_ALLOCATION_MARKER = "subscription-port-allocation-lock";
+const SUBSCRIPTION_PLAN_PAYMENT_MARKER = "subscription-plan-payment-lock";
+
+function warnActiveSubscriptionLookupFailure(error: unknown) {
+  const now = Date.now();
+  if (now - lastActiveSubscriptionWarningAt < 60_000) return;
+  lastActiveSubscriptionWarningAt = now;
+  console.warn("[Billing] optional subscription lookup failed; self-owned resources remain available:", error instanceof Error ? error.message : String(error));
+}
+
+async function lockTrafficBillingUserRow(userId: number) {
+  const q = quoteDbIdentifier;
+  const lock = getDatabaseKind() === "sqlite" ? "" : " FOR UPDATE";
+  const rows = await queryRaw<{ id: number }>(
+    `SELECT ${q("id")} AS ${q("id")} FROM ${q("users")} WHERE ${q("id")} = ?${lock}`,
+    [userId],
+  );
+  if (!rows[0]) throw new Error("用户不存在");
+}
+
+async function withTrafficBillingUserTransaction<T>(userId: number, task: () => Promise<T>) {
+  return withTrafficBillingUserLock(userId, () => withDatabaseTransaction(async () => {
+    await lockTrafficBillingUserRow(userId);
+    return task();
+  }));
+}
+
+async function withSubscriptionPortAllocationLock<T>(task: () => Promise<T>) {
+  return withKeyedTaskLock(SUBSCRIPTION_PORT_ALLOCATION_LOCK_KEY, async () => {
+    // Updating one stable row gives MySQL/PostgreSQL instances the same lock;
+    // SQLite is already serialized by BEGIN IMMEDIATE.
+    await setSetting(SUBSCRIPTION_PORT_ALLOCATION_MARKER, "1");
+    return task();
+  });
+}
+
+// ==================== Payment Orders ====================
+
+export async function createPaymentOrder(order: InsertPaymentOrder) {
+  return withDatabaseTransaction(async () => {
+    const db = await getDb();
+    if (!db) return undefined;
+    if (order.planId) {
+      // Serialize against plan deletion across panel instances. The setting
+      // update holds one stable database row until this transaction commits.
+      await setSetting(SUBSCRIPTION_PLAN_PAYMENT_MARKER, "1");
+      const plan = await db
+        .select({ id: subscriptionPlans.id })
+        .from(subscriptionPlans)
+        .where(eq(subscriptionPlans.id, Number(order.planId)))
+        .limit(1);
+      if (!plan[0]) throw new Error("套餐已删除，无法创建支付订单");
+    }
+    await db.insert(paymentOrders).values(order);
+    return getPaymentOrderByOutTradeNo(order.outTradeNo);
+  });
+}
+
+function normalizeCode(code: string) {
+  return code.trim().toUpperCase();
+}
+
+const BILLING_CODE_BODY_LENGTH = 24;
+
+export function generateBillingCode(prefix = "") {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bodyLength = BILLING_CODE_BODY_LENGTH;
+  const raw = crypto.randomBytes(bodyLength);
+  let body = "";
+  for (let i = 0; i < bodyLength; i++) {
+    body += chars[raw[i] % chars.length];
+  }
+  return `${prefix}${body}`.slice(0, 64).toUpperCase();
+}
+
+type RedemptionAttemptEntry = {
+  count: number;
+  lastFailAt: number;
+};
+
+const redemptionAttemptStore = new Map<string, RedemptionAttemptEntry>();
+const redemptionCodeLocks = new Map<string, Promise<void>>();
+const redemptionScopeLocks = new Map<string, Promise<void>>();
+const REDEMPTION_ATTEMPT_WINDOW_MS = 30 * 60 * 1000;
+const REDEMPTION_ATTEMPT_BLOCK_MS = 15 * 60 * 1000;
+const REDEMPTION_ATTEMPT_THRESHOLD = 8;
+const REDEMPTION_ATTEMPT_SOURCE_THRESHOLD = 20;
+const REDEMPTION_ATTEMPT_MAX_KEYS = 50_000;
+
+function redemptionAttemptUserKey(userId: number) {
+  return `user:${userId}`;
+}
+
+function redemptionAttemptSourceKey(scope?: string | null) {
+  const normalized = String(scope || "").trim().slice(0, 128);
+  return normalized ? `source:${normalized}` : null;
+}
+
+function getActiveRedemptionAttemptEntry(key: string) {
+  const entry = redemptionAttemptStore.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.lastFailAt < REDEMPTION_ATTEMPT_WINDOW_MS) return entry;
+  redemptionAttemptStore.delete(key);
+  return null;
+}
+
+function recordRedemptionAttemptFailureForKey(key: string) {
+  const entry = getActiveRedemptionAttemptEntry(key);
+  const now = Date.now();
+  if (entry) {
+    entry.count += 1;
+    entry.lastFailAt = now;
+    setBoundedMapValue(redemptionAttemptStore, key, entry, REDEMPTION_ATTEMPT_MAX_KEYS);
+  } else {
+    setBoundedMapValue(redemptionAttemptStore, key, { count: 1, lastFailAt: now }, REDEMPTION_ATTEMPT_MAX_KEYS);
+  }
+}
+
+export function pruneRedemptionAttemptStore(now = Date.now()) {
+  return pruneMapEntries(redemptionAttemptStore, (entry) => now - entry.lastFailAt >= REDEMPTION_ATTEMPT_WINDOW_MS);
+}
+
+const redemptionAttemptCleanupTimer = setInterval(() => pruneRedemptionAttemptStore(), 5 * 60 * 1000);
+redemptionAttemptCleanupTimer.unref?.();
+
+function redemptionAttemptKeys(userId: number, scope?: string | null) {
+  const keys = [redemptionAttemptUserKey(userId)];
+  const sourceKey = redemptionAttemptSourceKey(scope);
+  if (sourceKey) keys.push(sourceKey);
+  return keys;
+}
+
+function recordRedemptionAttemptFailure(userId: number, scope?: string | null) {
+  for (const key of redemptionAttemptKeys(userId, scope)) {
+    recordRedemptionAttemptFailureForKey(key);
+  }
+}
+
+function clearRedemptionAttemptFailures(userId: number, scope?: string | null) {
+  for (const key of redemptionAttemptKeys(userId, scope)) {
+    redemptionAttemptStore.delete(key);
+  }
+}
+
+function redemptionAttemptRateLimitState(userId: number, scope?: string | null) {
+  const checks = [
+    { key: redemptionAttemptUserKey(userId), threshold: REDEMPTION_ATTEMPT_THRESHOLD },
+    ...(redemptionAttemptSourceKey(scope) ? [{ key: redemptionAttemptSourceKey(scope)!, threshold: REDEMPTION_ATTEMPT_SOURCE_THRESHOLD }] : []),
+  ];
+  let retryAfterSeconds = 0;
+  for (const check of checks) {
+    const entry = getActiveRedemptionAttemptEntry(check.key);
+    if (!entry || entry.count < check.threshold) {
+      continue;
+    }
+    const now = Date.now();
+    const retryAt = entry.lastFailAt + REDEMPTION_ATTEMPT_BLOCK_MS;
+    if (retryAt <= now) {
+      redemptionAttemptStore.delete(check.key);
+      continue;
+    }
+    retryAfterSeconds = Math.max(retryAfterSeconds, Math.ceil((retryAt - now) / 1000));
+  }
+  return retryAfterSeconds > 0
+    ? { limited: true, retryAfterSeconds: Math.max(1, retryAfterSeconds) }
+    : { limited: false, retryAfterSeconds: 0 };
+}
+
+async function withRedemptionLock<T>(locks: Map<string, Promise<void>>, key: string, fn: () => Promise<T>) {
+  const previous = locks.get(key);
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  locks.set(key, current);
+  if (previous) await previous.catch(() => undefined);
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (locks.get(key) === current) {
+      locks.delete(key);
+    }
+  }
+}
+
+function redemptionAttemptLockKey(userId: number, scope?: string | null) {
+  return redemptionAttemptSourceKey(scope) || redemptionAttemptUserKey(userId);
+}
+
+async function withRedemptionScopeLock<T>(userId: number, scope: string | null | undefined, fn: () => Promise<T>) {
+  return withRedemptionLock(redemptionScopeLocks, redemptionAttemptLockKey(userId, scope), fn);
+}
+
+async function withRedemptionCodeLock<T>(code: string, fn: () => Promise<T>) {
+  return withRedemptionLock(redemptionCodeLocks, code, fn);
+}
+
+export async function getPaymentOrderByOutTradeNo(outTradeNo: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const r = await db.select().from(paymentOrders).where(eq(paymentOrders.outTradeNo, outTradeNo)).limit(1);
+  return r[0];
+}
+
+export async function getPaymentOrderByOutTradeNoForUpdate(outTradeNo: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const q = quoteDbIdentifier;
+  const lock = getDatabaseKind() === "sqlite" ? "" : " FOR UPDATE";
+  const rows = await queryRaw<{ id: number }>(
+    `SELECT ${q("id")} AS ${q("id")} FROM ${q("payment_orders")} WHERE ${q("outTradeNo")} = ? LIMIT 1${lock}`,
+    [outTradeNo],
+  );
+  if (!rows[0]) return undefined;
+  return getPaymentOrderByOutTradeNo(outTradeNo);
+}
+
+// ==================== Subscription Plans ====================
+
+async function getPlanHostIds(planId: number): Promise<number[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db.select({ hostId: subscriptionPlanHosts.hostId }).from(subscriptionPlanHosts).where(eq(subscriptionPlanHosts.planId, planId));
+  return rows.map((r: any) => r.hostId);
+}
+
+async function getPlanTunnelIds(planId: number): Promise<number[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db.select({ tunnelId: subscriptionPlanTunnels.tunnelId }).from(subscriptionPlanTunnels).where(eq(subscriptionPlanTunnels.planId, planId));
+  return rows.map((r: any) => r.tunnelId);
+}
+
+async function getPlanForwardGroupIds(planId: number): Promise<number[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db
+    .select({ forwardGroupId: subscriptionPlanForwardGroups.forwardGroupId })
+    .from(subscriptionPlanForwardGroups)
+    .where(eq(subscriptionPlanForwardGroups.planId, planId));
+  return rows.map((r: any) => Number(r.forwardGroupId)).filter(Boolean);
+}
+
+async function getPlanTrafficAddons(planId: number, includeInactive = true) {
+  const db = await getDb();
+  if (!db) return [];
+  const conds: any[] = [eq(subscriptionPlanTrafficAddons.planId, planId)];
+  if (!includeInactive) conds.push(eq(subscriptionPlanTrafficAddons.isActive, true));
+  return db
+    .select()
+    .from(subscriptionPlanTrafficAddons)
+    .where(and(...conds))
+    .orderBy(asc(subscriptionPlanTrafficAddons.sortOrder), asc(subscriptionPlanTrafficAddons.priceCents));
+}
+
+function normalizeTrafficAddons(addons: any[] = []) {
+  return addons
+    .map((addon, index) => ({
+      trafficBytes: Math.max(0, Math.floor(Number(addon?.trafficBytes || 0))),
+      priceCents: Math.max(0, Math.floor(Number(addon?.priceCents || 0))),
+      isActive: addon?.isActive !== false,
+      sortOrder: Math.max(0, Math.floor(Number(addon?.sortOrder ?? index))),
+    }))
+    .filter((addon) => addon.trafficBytes > 0)
+    .slice(0, 20);
+}
+
+function normalizeNumericIds(values: any[] = []) {
+  return Array.from(new Set(values.map(Number).filter((id) => Number.isFinite(id) && id > 0)));
+}
+
+function buildPlanSnapshot(plan: any) {
+  return {
+    name: plan?.name || null,
+    portCount: Number(plan?.portCount ?? 20),
+    trafficLimit: Number(plan?.trafficLimit || 0),
+    rateLimitMbps: Number(plan?.rateLimitMbps || 0),
+    maxRules: Number(plan?.maxRules ?? 20),
+    maxConnections: Number(plan?.maxConnections ?? 2000),
+    maxIPs: Number(plan?.maxIPs ?? 10),
+    hostIds: normalizeNumericIds(plan?.hostIds || []),
+    tunnelIds: normalizeNumericIds(plan?.tunnelIds || []),
+    forwardGroupIds: normalizeNumericIds(plan?.forwardGroupIds || []),
+  };
+}
+
+function parsePlanSnapshot(value: unknown) {
+  if (!value || typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      name: typeof parsed.name === "string" ? parsed.name : null,
+      portCount: Number(parsed.portCount ?? 20),
+      trafficLimit: Number(parsed.trafficLimit || 0),
+      rateLimitMbps: Number(parsed.rateLimitMbps || 0),
+      maxRules: Number(parsed.maxRules ?? 20),
+      maxConnections: Number(parsed.maxConnections ?? 2000),
+      maxIPs: Number(parsed.maxIPs ?? 10),
+      hostIds: normalizeNumericIds(Array.isArray(parsed.hostIds) ? parsed.hostIds : []),
+      tunnelIds: normalizeNumericIds(Array.isArray(parsed.tunnelIds) ? parsed.tunnelIds : []),
+      forwardGroupIds: normalizeNumericIds(Array.isArray(parsed.forwardGroupIds) ? parsed.forwardGroupIds : []),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function snapshotForPlanId(planId: number) {
+  const plan = await getSubscriptionPlanById(planId);
+  return plan ? buildPlanSnapshot(plan) : null;
+}
+
+async function attachSubscriptionSnapshots<T extends { planId: number; planSnapshot?: string | null }>(subscriptions: T[]) {
+  return Promise.all(subscriptions.map(async (subscription: any) => {
+    const snapshot = parsePlanSnapshot(subscription.planSnapshot);
+    const addonTraffic = await getActiveTrafficAddonBreakdownForSubscription(Number(subscription.id));
+    return {
+      ...subscription,
+      planName: snapshot?.name || subscription.planName,
+      portCount: snapshot?.portCount ?? subscription.portCount,
+      trafficLimit: snapshot?.trafficLimit ?? subscription.trafficLimit,
+      rateLimitMbps: snapshot?.rateLimitMbps ?? subscription.rateLimitMbps,
+      maxRules: snapshot?.maxRules ?? subscription.maxRules,
+      maxConnections: snapshot?.maxConnections ?? subscription.maxConnections,
+      maxIPs: snapshot?.maxIPs ?? subscription.maxIPs,
+      hostIds: snapshot ? snapshot.hostIds : await getPlanHostIds(Number(subscription.planId)),
+      tunnelIds: snapshot ? snapshot.tunnelIds : await getPlanTunnelIds(Number(subscription.planId)),
+      forwardGroupIds: snapshot ? snapshot.forwardGroupIds : await getPlanForwardGroupIds(Number(subscription.planId)),
+      trafficAddons: await getPlanTrafficAddons(Number(subscription.planId), false),
+      activeTrafficAddonBytes: addonTraffic.totalBytes,
+      purchasedTrafficAddonBytes: addonTraffic.purchasedBytes,
+      grantedTrafficAddonBytes: addonTraffic.grantedBytes,
+    };
+  }));
+}
+
+
+async function attachPlanResources<T extends { id: number }>(plans: T[]) {
+  const db = await getDb();
+  if (!db || plans.length === 0) {
+    return plans.map((plan) => ({
+      ...plan,
+      hostIds: [] as number[],
+      tunnelIds: [] as number[],
+      forwardGroupIds: [] as number[],
+      forwardGroupRefs: [] as Array<{ id: number; groupMode: string | null; groupType: string | null }>,
+      trafficAddons: [] as any[],
+    }));
+  }
+  const planIds = Array.from(new Set(plans.map((plan) => Number(plan.id)).filter((id) => id > 0)));
+  const [hostRows, tunnelRows, groupRows, addonRows] = await Promise.all([
+    db.select({
+      planId: subscriptionPlanHosts.planId,
+      hostId: subscriptionPlanHosts.hostId,
+    }).from(subscriptionPlanHosts).where(inArray(subscriptionPlanHosts.planId, planIds)),
+    db.select({
+      planId: subscriptionPlanTunnels.planId,
+      tunnelId: subscriptionPlanTunnels.tunnelId,
+    }).from(subscriptionPlanTunnels).where(inArray(subscriptionPlanTunnels.planId, planIds)),
+    db.select({
+      planId: subscriptionPlanForwardGroups.planId,
+      forwardGroupId: subscriptionPlanForwardGroups.forwardGroupId,
+      groupMode: forwardGroups.groupMode,
+      groupType: forwardGroups.groupType,
+    })
+      .from(subscriptionPlanForwardGroups)
+      .leftJoin(forwardGroups, eq(forwardGroups.id, subscriptionPlanForwardGroups.forwardGroupId))
+      .where(inArray(subscriptionPlanForwardGroups.planId, planIds)),
+    db.select()
+      .from(subscriptionPlanTrafficAddons)
+      .where(inArray(subscriptionPlanTrafficAddons.planId, planIds))
+      .orderBy(
+        asc(subscriptionPlanTrafficAddons.planId),
+        asc(subscriptionPlanTrafficAddons.sortOrder),
+        asc(subscriptionPlanTrafficAddons.priceCents),
+      ),
+  ]);
+  const hostIdsByPlan = new Map<number, number[]>();
+  const tunnelIdsByPlan = new Map<number, number[]>();
+  const groupRefsByPlan = new Map<number, Array<{ id: number; groupMode: string | null; groupType: string | null }>>();
+  const addonsByPlan = new Map<number, any[]>();
+  for (const row of hostRows as any[]) {
+    const planId = Number(row.planId);
+    const values = hostIdsByPlan.get(planId) || [];
+    values.push(Number(row.hostId));
+    hostIdsByPlan.set(planId, values);
+  }
+  for (const row of tunnelRows as any[]) {
+    const planId = Number(row.planId);
+    const values = tunnelIdsByPlan.get(planId) || [];
+    values.push(Number(row.tunnelId));
+    tunnelIdsByPlan.set(planId, values);
+  }
+  for (const row of groupRows as any[]) {
+    const planId = Number(row.planId);
+    const values = groupRefsByPlan.get(planId) || [];
+    values.push({
+      id: Number(row.forwardGroupId),
+      groupMode: row.groupMode ? String(row.groupMode) : null,
+      groupType: row.groupType ? String(row.groupType) : null,
+    });
+    groupRefsByPlan.set(planId, values);
+  }
+  for (const row of addonRows as any[]) {
+    const planId = Number(row.planId);
+    const values = addonsByPlan.get(planId) || [];
+    values.push(row);
+    addonsByPlan.set(planId, values);
+  }
+  return plans.map((plan) => {
+    const refs = groupRefsByPlan.get(Number(plan.id)) || [];
+    return {
+      ...plan,
+      hostIds: hostIdsByPlan.get(Number(plan.id)) || [],
+      tunnelIds: tunnelIdsByPlan.get(Number(plan.id)) || [],
+      forwardGroupIds: refs.map((ref) => ref.id),
+      forwardGroupRefs: refs,
+      trafficAddons: addonsByPlan.get(Number(plan.id)) || [],
+    };
+  });
+}
+
+export async function listSubscriptionPlans(includeHidden = true) {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = includeHidden
+    ? await db.select().from(subscriptionPlans).orderBy(asc(subscriptionPlans.sortOrder), desc(subscriptionPlans.createdAt))
+    : await db.select().from(subscriptionPlans).where(and(eq(subscriptionPlans.isActive, true), eq(subscriptionPlans.isStoreVisible, true))).orderBy(asc(subscriptionPlans.sortOrder), desc(subscriptionPlans.createdAt));
+  return attachPlanResources(rows);
+}
+
+export async function listSubscriptionPlanOptions(includeHidden = true) {
+  const db = await getDb();
+  if (!db) return [];
+  const query = db
+    .select({
+      id: subscriptionPlans.id,
+      name: subscriptionPlans.name,
+      durationDays: subscriptionPlans.durationDays,
+      portCount: subscriptionPlans.portCount,
+      priceCents: subscriptionPlans.priceCents,
+      currency: subscriptionPlans.currency,
+      isActive: subscriptionPlans.isActive,
+      isStoreVisible: subscriptionPlans.isStoreVisible,
+    })
+    .from(subscriptionPlans);
+  return includeHidden
+    ? query.orderBy(asc(subscriptionPlans.sortOrder), desc(subscriptionPlans.createdAt))
+    : query
+      .where(and(eq(subscriptionPlans.isActive, true), eq(subscriptionPlans.isStoreVisible, true)))
+      .orderBy(asc(subscriptionPlans.sortOrder), desc(subscriptionPlans.createdAt));
+}
+
+
+export async function getSubscriptionPlanSummary() {
+  const db = await getDb();
+  if (!db) {
+    return {
+      totalItems: 0,
+      activeItems: 0,
+      resources: {
+        legacyHosts: 0,
+        tunnels: 0,
+        ports: 0,
+        chains: 0,
+        groups: 0,
+        otherForwardResources: 0,
+      },
+    };
+  }
+  const [planRows, hostRows, tunnelRows, groupRows] = await Promise.all([
+    db.select({
+      totalItems: sql<number>`COUNT(*)`,
+      activeItems: sql<number>`COALESCE(SUM(CASE WHEN ${subscriptionPlans.isActive} = ${sqlBool(true)} THEN 1 ELSE 0 END), 0)`,
+    }).from(subscriptionPlans),
+    db.select({ count: sql<number>`COUNT(*)` }).from(subscriptionPlanHosts),
+    db.select({ count: sql<number>`COUNT(*)` }).from(subscriptionPlanTunnels),
+    db.select({
+      groupMode: forwardGroups.groupMode,
+      count: sql<number>`COUNT(*)`,
+    })
+      .from(subscriptionPlanForwardGroups)
+      .leftJoin(forwardGroups, eq(forwardGroups.id, subscriptionPlanForwardGroups.forwardGroupId))
+      .groupBy(forwardGroups.groupMode),
+  ]);
+  const resources = {
+    legacyHosts: Number(hostRows[0]?.count || 0),
+    tunnels: Number(tunnelRows[0]?.count || 0),
+    ports: 0,
+    chains: 0,
+    groups: 0,
+    otherForwardResources: 0,
+  };
+  for (const row of groupRows as any[]) {
+    const count = Number(row.count || 0);
+    const mode = String(row.groupMode || "");
+    if (mode === "port") resources.ports += count;
+    else if (mode === "chain") resources.chains += count;
+    else if (mode === "failover") resources.groups += count;
+    else resources.otherForwardResources += count;
+  }
+  return {
+    totalItems: Number(planRows[0]?.totalItems || 0),
+    activeItems: Number(planRows[0]?.activeItems || 0),
+    resources,
+  };
+}
+
+export async function listSubscriptionPlansPage(input: PageRequest) {
+  const db = await getDb();
+  if (!db) return { ...pageResult([], 0, input), activeItems: 0 };
+  const [totals] = await db
+    .select({
+      totalItems: sql<number>`COUNT(*)`,
+      activeItems: sql<number>`COALESCE(SUM(CASE WHEN ${subscriptionPlans.isActive} = ${sqlBool(true)} THEN 1 ELSE 0 END), 0)`,
+    })
+    .from(subscriptionPlans);
+  const totalItems = Number(totals?.totalItems || 0);
+  const activeItems = Number(totals?.activeItems || 0);
+  const window = pageWindowForTotal(input, totalItems);
+  const rows = await db
+    .select()
+    .from(subscriptionPlans)
+    .orderBy(asc(subscriptionPlans.sortOrder), desc(subscriptionPlans.createdAt), desc(subscriptionPlans.id))
+    .limit(window.pageSize)
+    .offset(window.offset);
+  return {
+    ...pageResult(await attachPlanResources(rows), totalItems, window),
+    activeItems,
+  };
+}
+
+export async function getSubscriptionPlanById(id: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(subscriptionPlans).where(eq(subscriptionPlans.id, id)).limit(1);
+  if (!rows[0]) return undefined;
+  return (await attachPlanResources([rows[0]]))[0];
+}
+
+export async function createSubscriptionPlan(data: InsertSubscriptionPlan, hostIds: number[], tunnelIds: number[], forwardGroupIds: number[] = [], trafficAddons: any[] = []) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const id = await insertAndGetId("subscription_plans", data as any);
+  await setSubscriptionPlanResources(id, hostIds, tunnelIds, forwardGroupIds);
+  await setSubscriptionPlanTrafficAddons(id, trafficAddons);
+  return getSubscriptionPlanById(id);
+}
+
+export async function updateSubscriptionPlan(id: number, data: Partial<InsertSubscriptionPlan>, hostIds?: number[], tunnelIds?: number[], forwardGroupIds?: number[], trafficAddons?: any[]) {
+  const db = await getDb();
+  if (!db) return undefined;
+  await db.update(subscriptionPlans).set({ ...data, updatedAt: nowDate() } as any).where(eq(subscriptionPlans.id, id));
+  if (hostIds || tunnelIds || forwardGroupIds) {
+    await setSubscriptionPlanResources(
+      id,
+      hostIds ?? await getPlanHostIds(id),
+      tunnelIds ?? await getPlanTunnelIds(id),
+      forwardGroupIds ?? await getPlanForwardGroupIds(id),
+    );
+  }
+  if (trafficAddons) await setSubscriptionPlanTrafficAddons(id, trafficAddons);
+  return getSubscriptionPlanById(id);
+}
+
+export async function freezePlanSubscriberSnapshots(planId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const currentSnapshot = await snapshotForPlanId(planId);
+  if (!currentSnapshot) return [];
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rows = await db
+    .select({
+      id: userSubscriptions.id,
+      userId: userSubscriptions.userId,
+      planSnapshot: userSubscriptions.planSnapshot,
+    })
+    .from(userSubscriptions)
+    .where(and(
+      eq(userSubscriptions.planId, planId),
+      eq(userSubscriptions.status, "active"),
+      sql`(${userSubscriptions.expiresAt} IS NULL OR ${userSubscriptions.expiresAt} > ${nowSec})`,
+    ));
+  const userIds = new Set<number>();
+  for (const row of rows as any[]) {
+    const userId = Number(row.userId || 0);
+    if (userId > 0) userIds.add(userId);
+    if (parsePlanSnapshot(row.planSnapshot)) continue;
+    await updateUserSubscription(Number(row.id), { planSnapshot: JSON.stringify(currentSnapshot) } as any);
+  }
+  return Array.from(userIds);
+}
+
+export async function syncPlanSubscribers(planId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const snapshot = await snapshotForPlanId(planId);
+  if (!snapshot) return [];
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rows = await db
+    .select({
+      id: userSubscriptions.id,
+      userId: userSubscriptions.userId,
+    })
+    .from(userSubscriptions)
+    .where(and(
+      eq(userSubscriptions.planId, planId),
+      eq(userSubscriptions.status, "active"),
+      sql`(${userSubscriptions.expiresAt} IS NULL OR ${userSubscriptions.expiresAt} > ${nowSec})`,
+    ));
+  const subscriptionIdsByUser = new Map<number, number[]>();
+  for (const row of rows as any[]) {
+    const subscriptionId = Number(row.id || 0);
+    const userId = Number(row.userId || 0);
+    if (subscriptionId <= 0 || userId <= 0) continue;
+    const subscriptionIds = subscriptionIdsByUser.get(userId) || [];
+    subscriptionIds.push(subscriptionId);
+    subscriptionIdsByUser.set(userId, subscriptionIds);
+  }
+  const affectedUserIds = Array.from(subscriptionIdsByUser.keys());
+  for (const [userId, subscriptionIds] of subscriptionIdsByUser) {
+    await withTrafficBillingUserTransaction(userId, async () => {
+      for (const subscriptionId of subscriptionIds) {
+        await updateUserSubscription(subscriptionId, { planSnapshot: JSON.stringify(snapshot) } as any);
+      }
+      await syncUserSubscriptionEntitlementsUnlocked(userId);
+    });
+  }
+  return affectedUserIds;
+}
+
+export async function deleteSubscriptionPlan(id: number) {
+  return withDatabaseTransaction(async () => {
+    const db = await getDb();
+    if (!db) return;
+    await setSetting(SUBSCRIPTION_PLAN_PAYMENT_MARKER, "1");
+    const blockingOrder = await db
+      .select({ outTradeNo: paymentOrders.outTradeNo })
+      .from(paymentOrders)
+      .where(and(
+        eq(paymentOrders.planId, id),
+        inArray(paymentOrders.status, ["pending", "paid", "processing"] as any),
+      ))
+      .limit(1);
+    if (blockingOrder[0]) {
+      throw new Error("套餐仍有待支付或待发放订单，暂时不能删除");
+    }
+    await db.delete(subscriptionPlanHosts).where(eq(subscriptionPlanHosts.planId, id));
+    await db.delete(subscriptionPlanTunnels).where(eq(subscriptionPlanTunnels.planId, id));
+    await db.delete(subscriptionPlanForwardGroups).where(eq(subscriptionPlanForwardGroups.planId, id));
+    await db.delete(subscriptionPlanTrafficAddons).where(eq(subscriptionPlanTrafficAddons.planId, id));
+    await db.delete(subscriptionPlans).where(eq(subscriptionPlans.id, id));
+  });
+}
+
+export async function setSubscriptionPlanResources(planId: number, hostIds: number[], tunnelIds: number[], forwardGroupIds: number[] = []) {
+  const db = await getDb();
+  if (!db) return;
+  await db.delete(subscriptionPlanHosts).where(eq(subscriptionPlanHosts.planId, planId));
+  await db.delete(subscriptionPlanTunnels).where(eq(subscriptionPlanTunnels.planId, planId));
+  await db.delete(subscriptionPlanForwardGroups).where(eq(subscriptionPlanForwardGroups.planId, planId));
+  const uniqueHostIds = Array.from(new Set(hostIds.filter(id => id > 0)));
+  const uniqueTunnelIds = Array.from(new Set(tunnelIds.filter(id => id > 0)));
+  const uniqueForwardGroupIds = Array.from(new Set(forwardGroupIds.filter(id => id > 0)));
+  if (uniqueHostIds.length > 0) await db.insert(subscriptionPlanHosts).values(uniqueHostIds.map(hostId => ({ planId, hostId })));
+  if (uniqueTunnelIds.length > 0) await db.insert(subscriptionPlanTunnels).values(uniqueTunnelIds.map(tunnelId => ({ planId, tunnelId })));
+  if (uniqueForwardGroupIds.length > 0) await db.insert(subscriptionPlanForwardGroups).values(uniqueForwardGroupIds.map(forwardGroupId => ({ planId, forwardGroupId })));
+}
+
+export async function setSubscriptionPlanTrafficAddons(planId: number, addons: any[] = []) {
+  const db = await getDb();
+  if (!db) return;
+  await db.delete(subscriptionPlanTrafficAddons).where(eq(subscriptionPlanTrafficAddons.planId, planId));
+  const rows = normalizeTrafficAddons(addons);
+  if (rows.length === 0) return;
+  await db.insert(subscriptionPlanTrafficAddons).values(rows.map((addon) => ({
+    planId,
+    trafficBytes: addon.trafficBytes,
+    priceCents: addon.priceCents,
+    isActive: addon.isActive,
+    sortOrder: addon.sortOrder,
+  })));
+}
+
+function userSubscriptionsListQuery(db: any) {
+  const base = db
+    .select({
+      id: userSubscriptions.id,
+      userId: userSubscriptions.userId,
+      username: users.username,
+      name: users.name,
+      planId: userSubscriptions.planId,
+      planName: subscriptionPlans.name,
+      priceCents: subscriptionPlans.priceCents,
+      currency: subscriptionPlans.currency,
+      durationDays: subscriptionPlans.durationDays,
+      portCount: subscriptionPlans.portCount,
+      trafficLimit: subscriptionPlans.trafficLimit,
+      rateLimitMbps: subscriptionPlans.rateLimitMbps,
+      maxRules: subscriptionPlans.maxRules,
+      maxConnections: subscriptionPlans.maxConnections,
+      maxIPs: subscriptionPlans.maxIPs,
+      status: userSubscriptions.status,
+      source: userSubscriptions.source,
+      paymentOrderNo: userSubscriptions.paymentOrderNo,
+      planSnapshot: userSubscriptions.planSnapshot,
+      portRangeStart: userSubscriptions.portRangeStart,
+      portRangeEnd: userSubscriptions.portRangeEnd,
+      nextTrafficResetAt: userSubscriptions.nextTrafficResetAt,
+      lastTrafficResetAt: userSubscriptions.lastTrafficResetAt,
+      userDismissedAt: userSubscriptions.userDismissedAt,
+      adminDismissedAt: userSubscriptions.adminDismissedAt,
+      startedAt: userSubscriptions.startedAt,
+      expiresAt: userSubscriptions.expiresAt,
+      createdAt: userSubscriptions.createdAt,
+      updatedAt: userSubscriptions.updatedAt,
+    })
+    .from(userSubscriptions)
+    .leftJoin(users, eq(userSubscriptions.userId, users.id))
+    .leftJoin(subscriptionPlans, eq(userSubscriptions.planId, subscriptionPlans.id));
+  return base;
+}
+
+type SubscriptionListVisibility = "all" | "user" | "admin";
+
+function subscriptionVisibilityConditions(visibility: SubscriptionListVisibility) {
+  if (visibility === "user") {
+    return [isNull(userSubscriptions.userDismissedAt), isNull(userSubscriptions.adminDismissedAt)];
+  }
+  if (visibility === "admin") return [isNull(userSubscriptions.adminDismissedAt)];
+  return [];
+}
+
+export async function listUserSubscriptions(
+  userId?: number,
+  options: { visibility?: SubscriptionListVisibility } = {},
+) {
+  const db = await getDb();
+  if (!db) return [];
+  const base = userSubscriptionsListQuery(db);
+  const conditions = subscriptionVisibilityConditions(options.visibility || "all");
+  if (userId !== undefined) conditions.push(eq(userSubscriptions.userId, userId));
+  const rows = conditions.length > 0
+    ? await base.where(and(...conditions)).orderBy(desc(userSubscriptions.createdAt))
+    : await base.orderBy(desc(userSubscriptions.createdAt));
+  return attachUserSubscriptionDetails(rows);
+}
+
+export async function getUserSubscriptionById(id: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await userSubscriptionsListQuery(db)
+    .where(eq(userSubscriptions.id, id))
+    .limit(1);
+  if (!rows[0]) return undefined;
+  return (await attachUserSubscriptionDetails(rows))[0];
+}
+
+export async function listUserSubscriptionsPage(input: PageRequest & {
+  userId?: number;
+  excludeCancelled?: boolean;
+  visibility?: SubscriptionListVisibility;
+}) {
+  const db = await getDb();
+  if (!db) return { ...pageResult([], 0, input), activeItems: 0 };
+  const conditions = [] as any[];
+  if (input.userId !== undefined) conditions.push(eq(userSubscriptions.userId, input.userId));
+  if (input.excludeCancelled !== false) conditions.push(sql`${userSubscriptions.status} <> 'cancelled'`);
+  conditions.push(...subscriptionVisibilityConditions(input.visibility || "all"));
+  const where = conditions.length > 0 ? and(...conditions) : undefined;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const aggregateQuery = db
+    .select({
+      totalItems: sql<number>`COUNT(*)`,
+      activeItems: sql<number>`COALESCE(SUM(CASE
+        WHEN ${userSubscriptions.status} = 'active'
+          AND (${userSubscriptions.expiresAt} IS NULL OR ${userSubscriptions.expiresAt} > ${nowSec})
+        THEN 1 ELSE 0 END), 0)`,
+    })
+    .from(userSubscriptions);
+  const [totals] = where ? await aggregateQuery.where(where) : await aggregateQuery;
+  const totalItems = Number(totals?.totalItems || 0);
+  const activeItems = Number(totals?.activeItems || 0);
+  const window = pageWindowForTotal(input, totalItems);
+  const listQuery = userSubscriptionsListQuery(db);
+  const rows = where
+    ? await listQuery
+      .where(where)
+      .orderBy(desc(userSubscriptions.createdAt), desc(userSubscriptions.id))
+      .limit(window.pageSize)
+      .offset(window.offset)
+    : await listQuery
+      .orderBy(desc(userSubscriptions.createdAt), desc(userSubscriptions.id))
+      .limit(window.pageSize)
+      .offset(window.offset);
+  return {
+    ...pageResult(await attachUserSubscriptionDetails(rows), totalItems, window),
+    activeItems,
+  };
+}
+
+async function attachUserSubscriptionDetails<T extends { id: number; planId: number }>(subscriptions: T[]) {
+  return attachSubscriptionSnapshots(subscriptions as any);
+}
+
+async function getActiveTrafficAddonBreakdownForSubscription(subscriptionId: number) {
+  const db = await getDb();
+  if (!db || !subscriptionId) return { totalBytes: 0, purchasedBytes: 0, grantedBytes: 0 };
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rows = await db
+    .select({
+      total: sql<number>`COALESCE(SUM(${userTrafficAddons.trafficBytes}), 0)`,
+      purchased: sql<number>`COALESCE(SUM(CASE WHEN ${userTrafficAddons.source} = 'user' THEN ${userTrafficAddons.trafficBytes} ELSE 0 END), 0)`,
+      granted: sql<number>`COALESCE(SUM(CASE WHEN ${userTrafficAddons.source} = 'admin' THEN ${userTrafficAddons.trafficBytes} ELSE 0 END), 0)`,
+    })
+    .from(userTrafficAddons)
+    .innerJoin(userSubscriptions, eq(userTrafficAddons.subscriptionId, userSubscriptions.id))
+    .where(and(
+      eq(userTrafficAddons.subscriptionId, subscriptionId),
+      eq(userTrafficAddons.status, "active"),
+      sql`(${userTrafficAddons.expiresAt} IS NULL OR ${userTrafficAddons.expiresAt} > ${nowSec})`,
+      eq(userSubscriptions.status, "active"),
+      sql`(${userSubscriptions.expiresAt} IS NULL OR ${userSubscriptions.expiresAt} > ${nowSec})`,
+    ));
+  return {
+    totalBytes: Number(rows?.[0]?.total || 0),
+    purchasedBytes: Number(rows?.[0]?.purchased || 0),
+    grantedBytes: Number(rows?.[0]?.granted || 0),
+  };
+}
+
+export async function getActiveUserTrafficAddonBytes(userId: number) {
+  const db = await getDb();
+  if (!db || !userId) return 0;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rows = await db
+    .select({ total: sql<number>`COALESCE(SUM(${userTrafficAddons.trafficBytes}), 0)` })
+    .from(userTrafficAddons)
+    .innerJoin(userSubscriptions, eq(userTrafficAddons.subscriptionId, userSubscriptions.id))
+    .where(and(
+      eq(userTrafficAddons.userId, userId),
+      eq(userTrafficAddons.status, "active"),
+      sql`(${userTrafficAddons.expiresAt} IS NULL OR ${userTrafficAddons.expiresAt} > ${nowSec})`,
+      eq(userSubscriptions.status, "active"),
+      sql`(${userSubscriptions.expiresAt} IS NULL OR ${userSubscriptions.expiresAt} > ${nowSec})`,
+    ));
+  return Number(rows?.[0]?.total || 0);
+}
+
+export async function getActiveUserSubscriptions(userId?: number) {
+  try {
+    const db = await getDb();
+    if (!db) return [];
+    const nowSec = Math.floor(Date.now() / 1000);
+    const conds: any[] = [
+      eq(userSubscriptions.status, "active"),
+      sql`(${userSubscriptions.expiresAt} IS NULL OR ${userSubscriptions.expiresAt} > ${nowSec})`,
+    ];
+    if (userId !== undefined) conds.push(eq(userSubscriptions.userId, userId));
+    const rows = await db
+      .select({
+        id: userSubscriptions.id,
+        userId: userSubscriptions.userId,
+        planId: userSubscriptions.planId,
+        status: userSubscriptions.status,
+        source: userSubscriptions.source,
+        paymentOrderNo: userSubscriptions.paymentOrderNo,
+        planSnapshot: userSubscriptions.planSnapshot,
+        portRangeStart: userSubscriptions.portRangeStart,
+        portRangeEnd: userSubscriptions.portRangeEnd,
+        nextTrafficResetAt: userSubscriptions.nextTrafficResetAt,
+        lastTrafficResetAt: userSubscriptions.lastTrafficResetAt,
+        startedAt: userSubscriptions.startedAt,
+        expiresAt: userSubscriptions.expiresAt,
+        planName: subscriptionPlans.name,
+        portCount: subscriptionPlans.portCount,
+        trafficLimit: subscriptionPlans.trafficLimit,
+        rateLimitMbps: subscriptionPlans.rateLimitMbps,
+        maxRules: subscriptionPlans.maxRules,
+        maxConnections: subscriptionPlans.maxConnections,
+        maxIPs: subscriptionPlans.maxIPs,
+      })
+      .from(userSubscriptions)
+      .leftJoin(subscriptionPlans, eq(userSubscriptions.planId, subscriptionPlans.id))
+      .where(and(...conds))
+      .orderBy(desc(userSubscriptions.createdAt));
+    return attachSubscriptionSnapshots(rows as any);
+  } catch (error) {
+    warnActiveSubscriptionLookupFailure(error);
+    return [];
+  }
+}
+
+export async function createUserSubscription(data: InsertUserSubscription) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  return insertAndGetId("user_subscriptions", data as any);
+}
+
+export async function updateUserSubscription(id: number, data: Partial<InsertUserSubscription>) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(userSubscriptions).set({ ...data, updatedAt: nowDate() } as any).where(eq(userSubscriptions.id, id));
+}
+
+function validDate(value: unknown): Date | null {
+  if (!value) return null;
+  const date = value instanceof Date ? new Date(value.getTime()) : new Date(value as any);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
+function boundTrafficResetAt(resetAt: Date | null, expiresAt: Date | null) {
+  if (!resetAt) return null;
+  return !expiresAt || resetAt.getTime() < expiresAt.getTime() ? resetAt : null;
+}
+
+function nextBillingMonthlyTrafficReset(start: Date, expiresAt: Date | null) {
+  const next = billingStartOfCalendarDay(billingAddMonthsClamped(start, 1));
+  return !expiresAt || next.getTime() < expiresAt.getTime() ? next : null;
+}
+
+function nextAnchoredSubscriptionTrafficReset(startedAt: unknown, reference: Date, expiresAt: Date | null) {
+  const anchor = validDate(startedAt) || reference;
+  const referenceCalendar = billingCalendarParts(reference);
+  const anchorCalendar = billingCalendarParts(anchor);
+  const monthDelta = Math.max(
+    1,
+    (referenceCalendar.year - anchorCalendar.year) * 12 + referenceCalendar.month - anchorCalendar.month,
+  );
+  let months = monthDelta;
+  let next = billingStartOfCalendarDay(billingAddMonthsClamped(anchor, months));
+  while (next.getTime() <= reference.getTime()) {
+    months += 1;
+    next = billingStartOfCalendarDay(billingAddMonthsClamped(anchor, months));
+  }
+  return boundTrafficResetAt(next, expiresAt);
+}
+
+function nextConfiguredSubscriptionTrafficReset(
+  user: { trafficResetDay?: unknown },
+  subscription: { startedAt?: unknown; lastTrafficResetAt?: unknown },
+  reference: Date,
+  expiresAt: Date | null,
+) {
+  const resetDay = Math.min(28, Math.max(1, Math.floor(Number(user.trafficResetDay) || 1)));
+  let monthOffset = 0;
+  let next = billingMonthlyBoundary(reference, resetDay, monthOffset);
+
+  // A subscription created after this month's boundary did not participate in
+  // that cycle. A boundary already settled for it must not run twice.
+  const startedAt = validDate(subscription.startedAt);
+  const lastTrafficResetAt = validDate(subscription.lastTrafficResetAt);
+  const handledThrough = Math.max(
+    startedAt?.getTime() ?? Number.NEGATIVE_INFINITY,
+    lastTrafficResetAt?.getTime() ?? Number.NEGATIVE_INFINITY,
+  );
+  while (next.getTime() <= handledThrough) {
+    monthOffset += 1;
+    next = billingMonthlyBoundary(reference, resetDay, monthOffset);
+  }
+  return boundTrafficResetAt(next, expiresAt);
+}
+
+function subscriptionTrafficLimit(row: any) {
+  return Number(parsePlanSnapshot(row?.planSnapshot)?.trafficLimit ?? row?.planTrafficLimit ?? row?.trafficLimit ?? 0);
+}
+
+function sameEpochSecond(left: unknown, right: unknown) {
+  const leftDate = validDate(left);
+  const rightDate = validDate(right);
+  if (!leftDate || !rightDate) return leftDate === rightDate;
+  return Math.floor(leftDate.getTime() / 1000) === Math.floor(rightDate.getTime() / 1000);
+}
+
+async function updateActiveTrafficAddonCycleEnd(
+  subscriptionId: number,
+  nextTrafficResetAt: Date | null,
+  expiresAt: Date | null,
+) {
+  const db = await getDb();
+  if (!db || subscriptionId <= 0) return;
+  const cycleEnd = nextTrafficResetAt || expiresAt;
+  await db.update(userTrafficAddons).set({
+    cycleResetAt: cycleEnd,
+    expiresAt: cycleEnd,
+    updatedAt: nowDate(),
+  } as any).where(and(
+    eq(userTrafficAddons.subscriptionId, subscriptionId),
+    eq(userTrafficAddons.status, "active"),
+    cycleEnd
+      ? or(
+        isNull(userTrafficAddons.expiresAt),
+        ne(userTrafficAddons.expiresAt, cycleEnd),
+        isNull(userTrafficAddons.cycleResetAt),
+        ne(userTrafficAddons.cycleResetAt, cycleEnd),
+      )
+      : or(isNotNull(userTrafficAddons.expiresAt), isNotNull(userTrafficAddons.cycleResetAt)),
+  ));
+}
+
+async function subscriptionCycleRows(input: { userId?: number; autoResetOnly?: boolean; preserveDue?: boolean } = {}) {
+  const db = await getDb();
+  if (!db) return [];
+  const nowSec = Math.floor(Date.now() / 1000);
+  const conditions: any[] = [
+    eq(userSubscriptions.status, "active"),
+    sql`(${userSubscriptions.expiresAt} IS NULL OR ${userSubscriptions.expiresAt} > ${nowSec})`,
+  ];
+  if (input.userId !== undefined) conditions.push(eq(userSubscriptions.userId, input.userId));
+  if (input.autoResetOnly) conditions.push(eq(users.trafficAutoReset, true));
+  return db.select({
+    id: userSubscriptions.id,
+    userId: userSubscriptions.userId,
+    planSnapshot: userSubscriptions.planSnapshot,
+    nextTrafficResetAt: userSubscriptions.nextTrafficResetAt,
+    lastTrafficResetAt: userSubscriptions.lastTrafficResetAt,
+    startedAt: userSubscriptions.startedAt,
+    expiresAt: userSubscriptions.expiresAt,
+    planTrafficLimit: subscriptionPlans.trafficLimit,
+    trafficAutoReset: users.trafficAutoReset,
+    trafficResetDay: users.trafficResetDay,
+  })
+    .from(userSubscriptions)
+    .innerJoin(users, eq(userSubscriptions.userId, users.id))
+    .leftJoin(subscriptionPlans, eq(userSubscriptions.planId, subscriptionPlans.id))
+    .where(and(...conditions));
+}
+
+async function alignSubscriptionTrafficCycles(
+  reference: Date,
+  input: { userId?: number; autoResetOnly?: boolean; preserveDue?: boolean } = {},
+) {
+  const rows = await subscriptionCycleRows(input);
+  let updated = 0;
+  for (const row of rows as any[]) {
+    const existingResetAt = validDate(row.nextTrafficResetAt);
+    if (input.preserveDue && existingResetAt && existingResetAt.getTime() <= reference.getTime()) {
+      continue;
+    }
+    const expiresAt = validDate(row.expiresAt);
+    const nextTrafficResetAt = subscriptionTrafficLimit(row) > 0
+      ? row.trafficAutoReset
+        ? nextConfiguredSubscriptionTrafficReset(row, row, reference, expiresAt)
+        : nextAnchoredSubscriptionTrafficReset(row.startedAt, reference, expiresAt)
+      : null;
+    await updateActiveTrafficAddonCycleEnd(Number(row.id), nextTrafficResetAt, expiresAt);
+    if (sameEpochSecond(row.nextTrafficResetAt, nextTrafficResetAt)) continue;
+    await updateUserSubscription(Number(row.id), { nextTrafficResetAt } as any);
+    updated += 1;
+  }
+  return updated;
+}
+
+async function expireTrafficAddonsForSubscriptionIds(subscriptionIds: number[]) {
+  const db = await getDb();
+  const ids = Array.from(new Set(subscriptionIds.map(Number).filter((id) => id > 0)));
+  if (!db || ids.length === 0) return [];
+  const now = nowDate();
+  const rows = await db
+    .select({ userId: userTrafficAddons.userId })
+    .from(userTrafficAddons)
+    .where(and(
+      eq(userTrafficAddons.status, "active"),
+      inArray(userTrafficAddons.subscriptionId, ids),
+    ));
+  await db.update(userTrafficAddons).set({
+    status: "expired",
+    expiredAt: now,
+    updatedAt: now,
+  } as any).where(and(
+    eq(userTrafficAddons.status, "active"),
+    inArray(userTrafficAddons.subscriptionId, ids),
+  ));
+  return Array.from(new Set((rows as any[]).map((row: any) => Number(row.userId)).filter((id: number) => id > 0)));
+}
+
+async function expireTrafficAddonsForSubscriptionCycles(
+  cycles: Array<{ id: number; dueBoundary: Date }>,
+) {
+  const db = await getDb();
+  if (!db || cycles.length === 0) return [];
+  const now = nowDate();
+  const userIds = new Set<number>();
+  const boundaryBySubscription = new Map<number, number>();
+  for (const cycle of cycles) {
+    const id = Number(cycle.id || 0);
+    const boundarySec = Math.floor(cycle.dueBoundary.getTime() / 1000);
+    if (id <= 0 || !Number.isFinite(boundarySec)) continue;
+    boundaryBySubscription.set(id, Math.max(boundaryBySubscription.get(id) ?? Number.NEGATIVE_INFINITY, boundarySec));
+  }
+  for (const [subscriptionId, boundarySec] of boundaryBySubscription) {
+    // createdAt is compared strictly so an add-on bought at or after the cycle
+    // boundary belongs to the new cycle, even if another panel instance is
+    // still finishing the old one.
+    const conditions = and(
+      eq(userTrafficAddons.subscriptionId, subscriptionId),
+      eq(userTrafficAddons.status, "active"),
+      sql`${userTrafficAddons.createdAt} < ${boundarySec}`,
+    );
+    const rows = await db.select({ userId: userTrafficAddons.userId })
+      .from(userTrafficAddons)
+      .where(conditions);
+    for (const row of rows as any[]) {
+      const userId = Number(row.userId || 0);
+      if (userId > 0) userIds.add(userId);
+    }
+    await db.update(userTrafficAddons).set({
+      status: "expired",
+      expiredAt: now,
+      updatedAt: now,
+    } as any).where(conditions);
+  }
+  return Array.from(userIds);
+}
+
+export async function expireDueTrafficAddons(userId?: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const now = nowDate();
+  const nowSec = Math.floor(now.getTime() / 1000);
+  const conds: any[] = [
+    eq(userTrafficAddons.status, "active"),
+    sql`${userTrafficAddons.expiresAt} IS NOT NULL`,
+    sql`${userTrafficAddons.expiresAt} <= ${nowSec}`,
+  ];
+  if (userId !== undefined) conds.push(eq(userTrafficAddons.userId, userId));
+  const rows = await db
+    .select({ userId: userTrafficAddons.userId })
+    .from(userTrafficAddons)
+    .where(and(...conds));
+  await db.update(userTrafficAddons).set({
+    status: "expired",
+    expiredAt: now,
+    updatedAt: now,
+  } as any).where(and(...conds));
+  return Array.from(new Set((rows as any[]).map((row: any) => Number(row.userId)).filter((id: number) => id > 0)));
+}
+
+async function expireInvalidTrafficAddonsForUser(userId: number, now = nowDate()) {
+  const db = await getDb();
+  if (!db || userId <= 0) return 0;
+  const nowSec = Math.floor(now.getTime() / 1000);
+  const rows = await db.select({ id: userTrafficAddons.id })
+    .from(userTrafficAddons)
+    .innerJoin(userSubscriptions, eq(userTrafficAddons.subscriptionId, userSubscriptions.id))
+    .where(and(
+      eq(userTrafficAddons.userId, userId),
+      eq(userTrafficAddons.status, "active"),
+      or(
+        ne(userSubscriptions.status, "active"),
+        and(
+          isNotNull(userSubscriptions.expiresAt),
+          sql`${userSubscriptions.expiresAt} <= ${nowSec}`,
+        ),
+      ),
+    ));
+  const ids = (rows as any[]).map((row) => Number(row.id || 0)).filter((id) => id > 0);
+  if (ids.length === 0) return 0;
+  await db.update(userTrafficAddons).set({
+    status: "expired",
+    expiredAt: now,
+    updatedAt: now,
+  } as any).where(and(
+    eq(userTrafficAddons.status, "active"),
+    inArray(userTrafficAddons.id, ids),
+  ));
+  return ids.length;
+}
+
+async function withUserSubscriptionLock<T>(id: number, task: () => Promise<T>) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const [subscription] = await db.select({
+    userId: userSubscriptions.userId,
+  }).from(userSubscriptions).where(eq(userSubscriptions.id, id)).limit(1);
+  if (!subscription) throw new Error("订阅不存在");
+  return withTrafficBillingUserTransaction(Number(subscription.userId), task);
+}
+
+export async function cancelUserSubscription(id: number) {
+  return withUserSubscriptionLock(id, () => withDatabaseTransaction(async () => {
+    const db = await getDb();
+    if (!db) throw new Error("Database not available");
+    const [subscription] = await db.select({
+      id: userSubscriptions.id,
+      userId: userSubscriptions.userId,
+      status: userSubscriptions.status,
+    }).from(userSubscriptions).where(eq(userSubscriptions.id, id)).limit(1);
+    if (!subscription) throw new Error("订阅不存在");
+    if (subscription.status !== "cancelled") {
+      await updateUserSubscription(id, { status: "cancelled" } as any);
+    }
+    await expireTrafficAddonsForSubscriptionIds([id]);
+    const limits = await syncUserSubscriptionEntitlements(Number(subscription.userId));
+    return {
+      id: Number(subscription.id),
+      userId: Number(subscription.userId),
+      trafficLimit: limits.trafficLimit,
+    };
+  }));
+}
+
+export async function dismissCancelledUserSubscription(input: {
+  id: number;
+  viewerUserId: number;
+  isAdmin: boolean;
+}) {
+  return withDatabaseTransaction(async () => {
+    const db = await getDb();
+    if (!db) throw new Error("Database not available");
+    const [subscription] = await db.select({
+      id: userSubscriptions.id,
+      userId: userSubscriptions.userId,
+      status: userSubscriptions.status,
+    }).from(userSubscriptions).where(eq(userSubscriptions.id, input.id)).limit(1);
+    if (!subscription) throw new Error("订阅不存在");
+    if (subscription.status !== "cancelled") throw new Error("只能删除已取消的订阅记录");
+    if (!input.isAdmin && Number(subscription.userId) !== Number(input.viewerUserId)) {
+      throw new Error("无权删除该订阅记录");
+    }
+
+    const dismissedAt = nowDate();
+    await db.update(userSubscriptions).set(input.isAdmin
+      ? { adminDismissedAt: dismissedAt, updatedAt: dismissedAt } as any
+      : { userDismissedAt: dismissedAt, updatedAt: dismissedAt } as any)
+      .where(eq(userSubscriptions.id, input.id));
+    return { id: Number(subscription.id), userId: Number(subscription.userId) };
+  });
+}
+
+async function setUserSubscriptionExpiresAtUnlocked(id: number, expiresAt: Date | null) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const rows = await db.select().from(userSubscriptions).where(eq(userSubscriptions.id, id)).limit(1);
+  const subscription = rows[0] as any;
+  if (!subscription) throw new Error("订阅不存在");
+  if (subscription.status === "cancelled") throw new Error("已取消的订阅不能更改到期时间");
+  const nextExpiresAt = expiresAt ? new Date(expiresAt) : null;
+  if (nextExpiresAt && !Number.isFinite(nextExpiresAt.getTime())) throw new Error("到期时间无效");
+  const now = nowDate();
+  const expired = !!nextExpiresAt && nextExpiresAt.getTime() <= now.getTime();
+  let nextTrafficResetAt = subscription.nextTrafficResetAt ? new Date(subscription.nextTrafficResetAt) : null;
+  const plan = await getSubscriptionPlanById(Number(subscription.planId));
+  const user = await getUserById(Number(subscription.userId));
+  const subscriptionSnapshot = parsePlanSnapshot((subscription as any).planSnapshot);
+  const subscriptionTrafficLimit = Number(subscriptionSnapshot?.trafficLimit ?? plan?.trafficLimit ?? 0);
+  if (subscriptionTrafficLimit > 0 && !expired) {
+    if ((user as any)?.trafficAutoReset) {
+      nextTrafficResetAt = nextConfiguredSubscriptionTrafficReset(user as any, subscription, now, nextExpiresAt);
+    } else if (
+      !nextTrafficResetAt ||
+      !Number.isFinite(nextTrafficResetAt.getTime()) ||
+      nextTrafficResetAt.getTime() <= now.getTime() ||
+      (nextExpiresAt && nextTrafficResetAt.getTime() >= nextExpiresAt.getTime())
+    ) {
+      nextTrafficResetAt = nextBillingMonthlyTrafficReset(now, nextExpiresAt);
+    }
+    if (nextTrafficResetAt && nextExpiresAt && nextTrafficResetAt.getTime() >= nextExpiresAt.getTime()) {
+      nextTrafficResetAt = null;
+    }
+  } else {
+    nextTrafficResetAt = null;
+  }
+  await updateUserSubscription(id, {
+    status: expired ? "expired" : "active",
+    expiresAt: nextExpiresAt,
+    nextTrafficResetAt,
+  } as any);
+  await updateActiveTrafficAddonCycleEnd(id, nextTrafficResetAt, nextExpiresAt);
+  if (expired) await expireTrafficAddonsForSubscriptionIds([id]);
+  const limits = await syncUserSubscriptionEntitlements(Number(subscription.userId));
+  return {
+    id,
+    userId: Number(subscription.userId),
+    expiresAt: nextExpiresAt,
+    nextTrafficResetAt,
+    trafficLimit: limits.trafficLimit,
+  };
+}
+
+export async function setUserSubscriptionExpiresAt(id: number, expiresAt: Date | null) {
+  return withUserSubscriptionLock(id, () => withDatabaseTransaction(
+    () => setUserSubscriptionExpiresAtUnlocked(id, expiresAt),
+  ));
+}
+
+async function extendUserSubscriptionUnlocked(id: number, days: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const extraDays = Math.floor(Number(days || 0));
+  if (!Number.isFinite(extraDays) || extraDays <= 0) throw new Error("延长天数必须大于 0");
+  const rows = await db.select().from(userSubscriptions).where(eq(userSubscriptions.id, id)).limit(1);
+  const subscription = rows[0] as any;
+  if (!subscription) throw new Error("订阅不存在");
+  if (subscription.status === "cancelled") throw new Error("已取消的订阅不能延长");
+  if (!subscription.expiresAt) throw new Error("永久订阅无需延长");
+  const now = nowDate();
+  const currentExpiresAt = new Date(subscription.expiresAt);
+  const base = Number.isFinite(currentExpiresAt.getTime()) && currentExpiresAt.getTime() > now.getTime()
+    ? currentExpiresAt
+    : now;
+  const expiresAt = new Date(base.getTime() + extraDays * 24 * 3600 * 1000);
+  let nextTrafficResetAt = subscription.nextTrafficResetAt ? new Date(subscription.nextTrafficResetAt) : null;
+  const plan = await getSubscriptionPlanById(Number(subscription.planId));
+  const user = await getUserById(Number(subscription.userId));
+  const subscriptionSnapshot = parsePlanSnapshot((subscription as any).planSnapshot);
+  const subscriptionTrafficLimit = Number(subscriptionSnapshot?.trafficLimit ?? plan?.trafficLimit ?? 0);
+  if (subscriptionTrafficLimit > 0) {
+    if ((user as any)?.trafficAutoReset) {
+      nextTrafficResetAt = nextConfiguredSubscriptionTrafficReset(user as any, subscription, now, expiresAt);
+    } else if (!nextTrafficResetAt || !Number.isFinite(nextTrafficResetAt.getTime()) || nextTrafficResetAt.getTime() <= now.getTime()) {
+      nextTrafficResetAt = nextBillingMonthlyTrafficReset(now, expiresAt);
+    }
+    if (nextTrafficResetAt && nextTrafficResetAt.getTime() >= expiresAt.getTime()) nextTrafficResetAt = null;
+  } else {
+    nextTrafficResetAt = null;
+  }
+  await updateUserSubscription(id, {
+    status: "active",
+    expiresAt,
+    nextTrafficResetAt,
+  } as any);
+  await updateActiveTrafficAddonCycleEnd(id, nextTrafficResetAt, expiresAt);
+  const limits = await syncUserSubscriptionEntitlements(Number(subscription.userId));
+  return {
+    id,
+    userId: Number(subscription.userId),
+    expiresAt,
+    nextTrafficResetAt,
+    trafficLimit: limits.trafficLimit,
+  };
+}
+
+export async function expireUserSubscriptions() {
+  const db = await getDb();
+  if (!db) return 0;
+  const now = nowDate();
+  const nowSec = Math.floor(now.getTime() / 1000);
+  const [subscriptionCandidates, addonCandidates] = await Promise.all([
+    db.select({ userId: userSubscriptions.userId })
+      .from(userSubscriptions)
+      .where(and(
+        eq(userSubscriptions.status, "active"),
+        isNotNull(userSubscriptions.expiresAt),
+        sql`${userSubscriptions.expiresAt} <= ${nowSec}`,
+      )),
+    db.select({ userId: userTrafficAddons.userId })
+      .from(userTrafficAddons)
+      .innerJoin(userSubscriptions, eq(userTrafficAddons.subscriptionId, userSubscriptions.id))
+      .where(and(
+        eq(userTrafficAddons.status, "active"),
+        or(
+          and(
+            isNotNull(userTrafficAddons.expiresAt),
+            sql`${userTrafficAddons.expiresAt} <= ${nowSec}`,
+          ),
+          ne(userSubscriptions.status, "active"),
+          and(
+            isNotNull(userSubscriptions.expiresAt),
+            sql`${userSubscriptions.expiresAt} <= ${nowSec}`,
+          ),
+        ),
+      )),
+  ]);
+  const userIds = Array.from(new Set([
+    ...(subscriptionCandidates as any[]).map((row) => Number(row.userId || 0)),
+    ...(addonCandidates as any[]).map((row) => Number(row.userId || 0)),
+  ].filter((userId) => userId > 0)));
+  const addonCandidateUserIds = new Set(
+    (addonCandidates as any[])
+      .map((row) => Number(row.userId || 0))
+      .filter((userId) => userId > 0),
+  );
+  let expiredCount = 0;
+  for (const userId of userIds) {
+    await withTrafficBillingUserLock(userId, async () => {
+      const outcome = await withDatabaseTransaction(async () => {
+        await lockTrafficBillingUserRow(userId);
+        const txDb = await getDb();
+        if (!txDb) throw new Error("Database not available");
+        const rules = await getForwardRulesForUserSync(userId);
+        const userBeforeSync = await getUserById(userId);
+        const dueRows = await txDb.select({ id: userSubscriptions.id })
+          .from(userSubscriptions)
+          .where(and(
+            eq(userSubscriptions.userId, userId),
+            eq(userSubscriptions.status, "active"),
+            isNotNull(userSubscriptions.expiresAt),
+            sql`${userSubscriptions.expiresAt} <= ${nowSec}`,
+          ));
+        const expiredSubscriptionIds: number[] = [];
+        for (const row of dueRows as any[]) {
+          const id = Number(row.id || 0);
+          if (id <= 0) continue;
+          const result = await executeRaw(
+            `UPDATE ${quoteDbIdentifier("user_subscriptions")}
+             SET ${quoteDbIdentifier("status")} = 'expired', ${quoteDbIdentifier("updatedAt")} = ?
+             WHERE ${quoteDbIdentifier("id")} = ?
+               AND ${quoteDbIdentifier("userId")} = ?
+               AND ${quoteDbIdentifier("status")} = 'active'
+               AND ${quoteDbIdentifier("expiresAt")} IS NOT NULL
+               AND ${quoteDbIdentifier("expiresAt")} <= ?`,
+            [nowSec, id, userId, nowSec],
+          );
+          if (rawAffectedRows(result) > 0) expiredSubscriptionIds.push(id);
+        }
+
+        await expireDueTrafficAddons(userId);
+        await expireTrafficAddonsForSubscriptionIds(expiredSubscriptionIds);
+        await expireInvalidTrafficAddonsForUser(userId, now);
+        const limits = await syncUserSubscriptionEntitlementsUnlocked(userId);
+        const active = await getActiveUserSubscriptions(userId);
+        const accessBecameDisabled = !!(userBeforeSync as any)?.canAddRules && !limits.canAddRules;
+        return {
+          expiredCount: expiredSubscriptionIds.length,
+          rules,
+          // Even when another subscription remains active, the resource ACL
+          // may have changed. Invalidate the Agent's stable heartbeat plan so
+          // it gates and removes rules that belonged only to the expired
+          // subscription. Add-on expiry can also cross the traffic limit and
+          // therefore needs the same runtime refresh.
+          shouldRefreshRuntime: expiredSubscriptionIds.length > 0 || addonCandidateUserIds.has(userId),
+          shouldResetRuntime: active.length === 0 || accessBecameDisabled,
+        };
+      });
+      expiredCount += outcome.expiredCount;
+      if (!outcome.shouldRefreshRuntime) return;
+
+      if (outcome.shouldResetRuntime) {
+        await resetForwardRulesForUserSync(userId);
+      }
+      const hostIds = new Set<number>();
+      const tunnelIds = new Set<number>();
+      for (const rule of outcome.rules as any[]) {
+        if (rule.hostId) hostIds.add(Number(rule.hostId));
+        if (rule.tunnelId) tunnelIds.add(Number(rule.tunnelId));
+      }
+      for (const tunnelId of tunnelIds) {
+        const tunnel = await getTunnelById(tunnelId);
+        if (tunnel) {
+          await updateTunnel(tunnelId, { isRunning: false } as any);
+          hostIds.add(Number(tunnel.entryHostId));
+          hostIds.add(Number(tunnel.exitHostId));
+        }
+      }
+      for (const hostId of hostIds) {
+        if (hostId > 0) pushAgentRefresh(hostId, "subscription-expired");
+      }
+    });
+  }
+  return expiredCount;
+}
+
+export async function getEffectiveUserPlanLimits(userId: number) {
+  const active = await getActiveUserSubscriptions(userId);
+  if (active.length === 0) {
+    return {
+      canAddRules: false,
+      allowForwardXTunnel: false,
+      maxPorts: 0,
+      maxRules: 0,
+      maxConnections: 0,
+      maxIPs: 0,
+      baseTrafficLimit: 0,
+      addonTrafficLimit: 0,
+      trafficLimit: 0,
+      gostRateLimitIn: 0,
+      gostRateLimitOut: 0,
+      expiresAt: null as Date | null,
+    };
+  }
+
+  let expiresAt: Date | null = null;
+  const maxOf = (field: string) => Math.max(...active.map((sub: any) => Number(sub[field] || 0)));
+  const sumWithUnlimited = (field: string) => {
+    if (active.some((sub: any) => Number(sub[field] || 0) === 0)) return 0;
+    return active.reduce((total, sub: any) => total + Math.max(0, Number(sub[field] || 0)), 0);
+  };
+  for (const sub of active as any[]) {
+    const subExpiresAt = sub.expiresAt ? new Date(sub.expiresAt) : null;
+    if (!subExpiresAt) {
+      expiresAt = null;
+      break;
+    }
+    if (!expiresAt || subExpiresAt.getTime() > expiresAt.getTime()) expiresAt = subExpiresAt;
+  }
+
+  const hasUnlimitedTraffic = (active as any[]).some((sub: any) => Number(sub.trafficLimit || 0) === 0);
+  const baseTrafficLimit = hasUnlimitedTraffic
+    ? 0
+    : active.reduce((total, sub: any) => total + Math.max(0, Number(sub.trafficLimit || 0)), 0);
+  const addonTrafficLimit = baseTrafficLimit > 0 ? await getActiveUserTrafficAddonBytes(userId) : 0;
+
+  return {
+    canAddRules: true,
+    allowForwardXTunnel: true,
+    maxPorts: sumWithUnlimited("portCount"),
+    maxRules: sumWithUnlimited("maxRules"),
+    maxConnections: sumWithUnlimited("maxConnections"),
+    maxIPs: sumWithUnlimited("maxIPs"),
+    baseTrafficLimit,
+    addonTrafficLimit,
+    trafficLimit: baseTrafficLimit > 0 ? baseTrafficLimit + addonTrafficLimit : baseTrafficLimit,
+    gostRateLimitIn: maxOf("rateLimitMbps"),
+    gostRateLimitOut: maxOf("rateLimitMbps"),
+    expiresAt,
+  };
+}
+
+function normalizeForwardAccessPauseReason(value: unknown): ForwardAccessPauseReason {
+  const reason = String(value || "").trim();
+  if (reason === "manual" || reason === "traffic_billing_balance" || reason === "traffic_limit" || reason === "expired") {
+    return reason;
+  }
+  return null;
+}
+
+function isExpiredAt(value: unknown) {
+  return !!value && new Date(value as any).getTime() <= Date.now();
+}
+
+function isTrafficLimitExceeded(trafficUsed: unknown, trafficLimit: unknown) {
+  const limit = Number(trafficLimit || 0);
+  return limit > 0 && Number(trafficUsed || 0) >= limit;
+}
+
+function positiveInt(value: unknown) {
+  return Math.max(0, Math.floor(Number(value) || 0));
+}
+
+function mergeLimitValue(sources: Array<{ active: boolean; value: unknown }>) {
+  let hasSource = false;
+  let max = 0;
+  for (const source of sources) {
+    if (!source.active) continue;
+    hasSource = true;
+    const value = positiveInt(source.value);
+    if (value === 0) return 0;
+    max = Math.max(max, value);
+  }
+  return hasSource ? max : 0;
+}
+
+function latestExpiresAtValue(sources: Array<{ active: boolean; value: unknown }>): Date | null {
+  let latest: Date | null = null;
+  for (const source of sources) {
+    if (!source.active) continue;
+    if (!source.value) return null;
+    const date = new Date(source.value as any);
+    if (!Number.isFinite(date.getTime())) continue;
+    if (!latest || date.getTime() > latest.getTime()) latest = date;
+  }
+  return latest;
+}
+
+export function mergeManualAndPlanLimits(user: any, planLimits: any) {
+  const manualCanAddRules = !!user?.manualCanAddRules;
+  const planCanAddRules = !!planLimits?.canAddRules;
+  const manualAllowForwardXTunnel = !!user?.manualAllowForwardXTunnel;
+  const planAllowForwardXTunnel = !!planLimits?.allowForwardXTunnel;
+  const manualDefaultActive = manualCanAddRules && !planCanAddRules;
+  const manualMaxRules = positiveInt(user?.manualMaxRules);
+  const manualMaxPorts = positiveInt(user?.manualMaxPorts);
+  const manualMaxConnections = positiveInt(user?.manualMaxConnections);
+  const manualMaxIPs = positiveInt(user?.manualMaxIPs);
+  const manualTrafficLimit = positiveInt(user?.manualTrafficLimit);
+  const manualGostRateLimitIn = positiveInt(user?.manualGostRateLimitIn);
+  const manualGostRateLimitOut = positiveInt(user?.manualGostRateLimitOut);
+  const planBaseTrafficLimit = positiveInt(
+    planLimits?.baseTrafficLimit === undefined
+      ? planLimits?.trafficLimit
+      : planLimits.baseTrafficLimit,
+  );
+  const addonTrafficLimit = planCanAddRules ? positiveInt(planLimits?.addonTrafficLimit) : 0;
+  const baseTrafficLimit = mergeLimitValue([
+    { active: planCanAddRules, value: planBaseTrafficLimit },
+    { active: manualDefaultActive || manualTrafficLimit > 0, value: manualTrafficLimit },
+  ]);
+  return {
+    canAddRules: manualCanAddRules || planCanAddRules,
+    allowForwardXTunnel: manualAllowForwardXTunnel || planAllowForwardXTunnel,
+    maxPorts: mergeLimitValue([
+      { active: planCanAddRules, value: planLimits?.maxPorts },
+      { active: manualDefaultActive || manualMaxPorts > 0, value: manualMaxPorts },
+    ]),
+    maxRules: mergeLimitValue([
+      { active: planCanAddRules, value: planLimits?.maxRules },
+      { active: manualDefaultActive || manualMaxRules > 0, value: manualMaxRules },
+    ]),
+    maxConnections: mergeLimitValue([
+      { active: planCanAddRules, value: planLimits?.maxConnections },
+      { active: manualDefaultActive || manualMaxConnections > 0, value: manualMaxConnections },
+    ]),
+    maxIPs: mergeLimitValue([
+      { active: planCanAddRules, value: planLimits?.maxIPs },
+      { active: manualDefaultActive || manualMaxIPs > 0, value: manualMaxIPs },
+    ]),
+    trafficLimit: baseTrafficLimit > 0 ? baseTrafficLimit + addonTrafficLimit : baseTrafficLimit,
+    gostRateLimitIn: mergeLimitValue([
+      { active: planCanAddRules, value: planLimits?.gostRateLimitIn },
+      { active: manualDefaultActive || manualGostRateLimitIn > 0, value: manualGostRateLimitIn },
+    ]),
+    gostRateLimitOut: mergeLimitValue([
+      { active: planCanAddRules, value: planLimits?.gostRateLimitOut },
+      { active: manualDefaultActive || manualGostRateLimitOut > 0, value: manualGostRateLimitOut },
+    ]),
+    expiresAt: latestExpiresAtValue([
+      { active: planCanAddRules, value: planLimits?.expiresAt },
+      { active: manualDefaultActive || !!user?.manualExpiresAt, value: user?.manualExpiresAt },
+    ]),
+  };
+}
+
+export type ForwardAccessCheckResult = {
+  allowed: boolean;
+  restored: boolean;
+  user: any | null;
+  restoredRuleIds?: number[];
+  reason?: ForwardAccessPauseReason | "not_found" | "no_access";
+  message?: string;
+};
+
+async function restoreUserForwardRulesIfEligible(userId: number) {
+  const user = await getUserById(userId) as any;
+  if (
+    !user
+    || user.accountEnabled === false
+    || !user.canAddRules
+    || String(user.forwardAccessPauseReason || "").trim()
+  ) {
+    return { affectedRuleIds: [] as number[], restoredRuleIds: [] as number[], forwardGroupIds: [] as number[] };
+  }
+  const affectedRuleIds = await getUserForwardRuleIdsDisabledByAccess(userId);
+  if (affectedRuleIds.length === 0) {
+    return { affectedRuleIds, restoredRuleIds: [] as number[], forwardGroupIds: [] as number[] };
+  }
+  const recovery = await scheduleUserForwardRulesAfterAccessRecovery(userId);
+  return {
+    affectedRuleIds,
+    restoredRuleIds: recovery?.enabledRuleIds ?? [],
+    forwardGroupIds: [] as number[],
+  };
+}
+
+export async function extendUserSubscription(id: number, days: number) {
+  return withUserSubscriptionLock(id, () => withDatabaseTransaction(
+    () => extendUserSubscriptionUnlocked(id, days),
+  ));
+}
+
+async function recoverUserForwardAccessIfEligibleUnlocked(
+  userId: number,
+  options: { allowTrafficBillingRecovery?: boolean } = {},
+): Promise<ForwardAccessCheckResult> {
+  await expireDueTrafficAddons(userId);
+  const user = await getUserById(userId);
+  if (!user) {
+    return { allowed: false, restored: false, user: null, reason: "not_found", message: "用户不存在" };
+  }
+  if ((user as any).role === "admin") {
+    return { allowed: true, restored: false, user };
+  }
+
+  const pauseReason = normalizeForwardAccessPauseReason((user as any).forwardAccessPauseReason);
+  if (pauseReason === "manual") {
+    return {
+      allowed: false,
+      restored: false,
+      user,
+      reason: "manual",
+      message: "转发权限已由管理员暂停，请联系管理员开启",
+    };
+  }
+
+  const limits = await getEffectiveUserPlanLimits(userId);
+  const billingResources = await getUserUsableTrafficBillingResourceIds(userId);
+  const effectiveLimits = mergeManualAndPlanLimits(user, limits);
+  const hasTrafficBillingResource = billingResources.hostIds.length > 0 || billingResources.tunnelIds.length > 0 || billingResources.forwardGroupIds.length > 0;
+  const hasTrafficBillingBalance = Number((user as any).balanceCents || 0) > 0;
+  if (pauseReason === "traffic_billing_balance" && hasTrafficBillingResource && !hasTrafficBillingBalance) {
+    return {
+      allowed: false,
+      restored: false,
+      user,
+      reason: "traffic_billing_balance",
+      message: "流量计费余额不足，请充值后再启用规则",
+    };
+  }
+
+  if (effectiveLimits.canAddRules) {
+    if (isTrafficLimitExceeded((user as any).trafficUsed, effectiveLimits.trafficLimit)) {
+      if (options.allowTrafficBillingRecovery && hasTrafficBillingResource && hasTrafficBillingBalance) {
+        let restored = !(user as any).canAddRules || !!pauseReason;
+        await updateUserTrafficSettings(userId, {
+          ...effectiveLimits,
+          canAddRules: true,
+          allowForwardXTunnel: true,
+          forwardAccessPauseReason: null,
+        });
+        const ruleRecovery = await restoreUserForwardRulesIfEligible(userId);
+        restored = restored || ruleRecovery.affectedRuleIds.length > 0;
+        return {
+          allowed: true,
+          restored,
+          restoredRuleIds: ruleRecovery.restoredRuleIds,
+          user: await getUserById(userId) ?? user,
+        };
+      }
+      if ((user as any).canAddRules || pauseReason !== "traffic_limit") {
+        await setUserForwardAccess(userId, false, "traffic_limit");
+      }
+      return {
+        allowed: false,
+        restored: false,
+        user: await getUserById(userId) ?? user,
+        reason: "traffic_limit",
+        message: "套餐流量已用完，请购买附加流量包或等待下个周期重置后再启用规则",
+      };
+    }
+
+    let restored = !(user as any).canAddRules || !!pauseReason;
+    await updateUserTrafficSettings(userId, {
+      ...effectiveLimits,
+      canAddRules: true,
+      allowForwardXTunnel: true,
+      forwardAccessPauseReason: null,
+    });
+    const ruleRecovery = await restoreUserForwardRulesIfEligible(userId);
+    restored = restored || ruleRecovery.affectedRuleIds.length > 0;
+    return {
+      allowed: true,
+      restored,
+      restoredRuleIds: ruleRecovery.restoredRuleIds,
+      user: await getUserById(userId) ?? user,
+    };
+  }
+
+  if (isExpiredAt((user as any).expiresAt) && !hasTrafficBillingResource) {
+    if ((user as any).canAddRules || pauseReason !== "expired") {
+      await setUserForwardAccess(userId, false, "expired");
+    }
+    return {
+      allowed: false,
+      restored: false,
+      user: await getUserById(userId) ?? user,
+      reason: "expired",
+      message: "账户已到期，请续费后再启用规则",
+    };
+  }
+
+  if (hasTrafficBillingResource) {
+    if (hasTrafficBillingBalance) {
+      let restored = !(user as any).canAddRules || !!pauseReason;
+      await updateUserTrafficSettings(userId, {
+        canAddRules: true,
+        allowForwardXTunnel: true,
+        expiresAt: null,
+        trafficLimit: 0,
+        forwardAccessPauseReason: null,
+      });
+      const ruleRecovery = await restoreUserForwardRulesIfEligible(userId);
+      restored = restored || ruleRecovery.affectedRuleIds.length > 0;
+      return {
+        allowed: true,
+        restored,
+        restoredRuleIds: ruleRecovery.restoredRuleIds,
+        user: await getUserById(userId) ?? user,
+      };
+    }
+    if ((user as any).canAddRules || pauseReason !== "traffic_billing_balance") {
+      await setUserForwardAccess(userId, false, "traffic_billing_balance");
+    }
+    return {
+      allowed: false,
+      restored: false,
+      user: await getUserById(userId) ?? user,
+      reason: "traffic_billing_balance",
+      message: "流量计费余额不足，请充值后再启用规则",
+    };
+  }
+
+  // canAddRules may have been granted temporarily by traffic billing. Once no
+  // usable billing resource remains, rebuild it from manual/subscription data.
+  const baseline = await syncUserSubscriptionEntitlementsUnlocked(userId);
+  const baselineUser = await getUserById(userId) ?? user;
+  if (baseline.canAddRules) {
+    return {
+      allowed: true,
+      restored: baseline.restoredRuleIds.length > 0,
+      restoredRuleIds: baseline.restoredRuleIds,
+      user: baselineUser,
+    };
+  }
+  return {
+    allowed: false,
+    restored: false,
+    user: baselineUser,
+    reason: "no_access",
+    message: "转发权限已暂停，请续费后再启用规则",
+  };
+}
+
+export async function recoverUserForwardAccessIfEligible(
+  userId: number,
+  options: { allowTrafficBillingRecovery?: boolean } = {},
+) {
+  const result = await withTrafficBillingUserTransaction(
+    userId,
+    () => recoverUserForwardAccessIfEligibleUnlocked(userId, options),
+  );
+  // Recovery notifications are deferred while the billing transaction still
+  // owns the per-user lock. Once the outer transaction has settled, run one
+  // serialized pass so callers immediately observe the new rule state instead
+  // of racing the queued after-commit task.
+  if (!isDatabaseTransactionActive() && result.allowed) {
+    const recovery = await withTrafficBillingUserLock(
+      userId,
+      () => restoreUserForwardRulesAfterAccessRecovery(userId),
+    );
+    if (recovery.enabledRuleIds.length > 0) {
+      return {
+        ...result,
+        restored: true,
+        restoredRuleIds: Array.from(new Set([
+          ...(result.restoredRuleIds || []),
+          ...recovery.enabledRuleIds,
+        ])),
+      };
+    }
+  }
+  return result;
+}
+
+export async function ensureUserForwardAccessReady(userId: number, options?: { allowTrafficBillingRecovery?: boolean }) {
+  return recoverUserForwardAccessIfEligible(userId, options);
+}
+
+async function syncUserSubscriptionEntitlementsUnlocked(
+  userId: number,
+  options: { deferRuleRecovery?: boolean } = {},
+) {
+  await expireDueTrafficAddons(userId);
+  const limits = await getEffectiveUserPlanLimits(userId);
+  const user = await getUserById(userId);
+  const pauseReason = normalizeForwardAccessPauseReason((user as any)?.forwardAccessPauseReason);
+  const effectiveLimits = mergeManualAndPlanLimits(user, limits);
+  const trafficExceeded = effectiveLimits.canAddRules && isTrafficLimitExceeded((user as any)?.trafficUsed, effectiveLimits.trafficLimit);
+  const manualPaused = pauseReason === "manual";
+  const nextLimits = {
+    ...effectiveLimits,
+    canAddRules: effectiveLimits.canAddRules && !manualPaused && !trafficExceeded,
+    allowForwardXTunnel: effectiveLimits.allowForwardXTunnel && !manualPaused && !trafficExceeded,
+    forwardAccessPauseReason: (effectiveLimits.canAddRules && !manualPaused && !trafficExceeded
+      ? null
+      : manualPaused
+      ? "manual"
+      : trafficExceeded
+      ? "traffic_limit"
+      : pauseReason) as ForwardAccessPauseReason,
+  };
+  await updateUserTrafficSettings(userId, nextLimits);
+  let restoredRuleIds: number[] = [];
+  if (!nextLimits.canAddRules) {
+    await disableAllUserRules(userId);
+  } else if (!options.deferRuleRecovery) {
+    const ruleRecovery = await restoreUserForwardRulesIfEligible(userId);
+    restoredRuleIds = ruleRecovery.restoredRuleIds;
+  }
+  return { ...nextLimits, restoredRuleIds };
+}
+
+export async function syncUserSubscriptionEntitlements(
+  userId: number,
+  options: { deferRuleRecovery?: boolean } = {},
+) {
+  return withTrafficBillingUserTransaction(
+    userId,
+    () => syncUserSubscriptionEntitlementsUnlocked(userId, options),
+  );
+}
+
+export async function updateUserManualEntitlements(userId: number, data: {
+  manualTrafficLimit?: number;
+  manualGostRateLimitIn?: number;
+  manualGostRateLimitOut?: number;
+  manualExpiresAt?: Date | null;
+  manualCanAddRules?: boolean;
+  manualMaxRules?: number;
+  manualMaxPorts?: number;
+  manualMaxConnections?: number;
+  manualMaxIPs?: number;
+  manualAllowForwardXTunnel?: boolean;
+  allowedForwardTypes?: string | null;
+  displayRemark?: string | null;
+  trafficAutoReset?: boolean;
+  trafficResetDay?: number;
+  forwardAccessPauseReason?: ForwardAccessPauseReason;
+}) {
+  return withTrafficBillingUserTransaction(userId, async () => {
+    await updateUserTrafficSettings(userId, data as any);
+    if (
+      Object.prototype.hasOwnProperty.call(data, "trafficAutoReset") ||
+      Object.prototype.hasOwnProperty.call(data, "trafficResetDay")
+    ) {
+      await alignSubscriptionTrafficCycles(nowDate(), { userId });
+    }
+    return syncUserSubscriptionEntitlementsUnlocked(userId);
+  });
+}
+
+export async function backfillManualEntitlementsFromEffectiveUsers() {
+  if (await getSetting("manual-entitlements-backfill-v1")) return;
+  const allUsers = await getAllUsers();
+  for (const user of allUsers as any[]) {
+    if (user.role === "admin") continue;
+    const planLimits = await getEffectiveUserPlanLimits(Number(user.id));
+    const hasPlan = !!planLimits.canAddRules;
+    const manualCanAddRules = !!user.canAddRules && !hasPlan;
+    const overPlan = (effective: unknown, plan: unknown) => {
+      const current = positiveInt(effective);
+      const planValue = positiveInt(plan);
+      if (!hasPlan) return current;
+      if (current === 0) return planValue === 0 ? 0 : 0;
+      if (planValue === 0) return 0;
+      return current > planValue ? current : 0;
+    };
+    const manualExpiresAt = hasPlan ? null : (user.expiresAt ? new Date(user.expiresAt) : null);
+    await updateUserTrafficSettings(Number(user.id), {
+      manualCanAddRules,
+      manualAllowForwardXTunnel: manualCanAddRules && !!user.allowForwardXTunnel,
+      manualMaxRules: overPlan(user.maxRules, planLimits.maxRules),
+      manualMaxPorts: overPlan(user.maxPorts, planLimits.maxPorts),
+      manualMaxConnections: overPlan(user.maxConnections, planLimits.maxConnections),
+      manualMaxIPs: overPlan(user.maxIPs, planLimits.maxIPs),
+      manualGostRateLimitIn: overPlan(user.gostRateLimitIn, planLimits.gostRateLimitIn),
+      manualGostRateLimitOut: overPlan(user.gostRateLimitOut, planLimits.gostRateLimitOut),
+      manualTrafficLimit: overPlan(user.trafficLimit, planLimits.trafficLimit),
+      manualExpiresAt,
+    } as any);
+    await syncUserSubscriptionEntitlements(Number(user.id));
+  }
+  await setSetting("manual-entitlements-backfill-v1", String(Math.floor(Date.now() / 1000)));
+}
+
+export async function repairSubscriptionBillingStateOnce() {
+  const marker = "subscription-billing-state-v3";
+  if (await getSetting(marker)) return { users: 0, resets: 0 };
+  const db = await getDb();
+  if (!db) return { users: 0, resets: 0 };
+  const now = nowDate();
+  const rows = await db.select({
+    userId: userSubscriptions.userId,
+    role: users.role,
+  }).from(userSubscriptions)
+    .innerJoin(users, eq(userSubscriptions.userId, users.id));
+  const userIds = Array.from(new Set((rows as any[])
+    .filter((row) => row.role !== "admin")
+    .map((row) => Number(row.userId || 0))
+    .filter((userId) => userId > 0)));
+  let resets = 0;
+  for (const userId of userIds) {
+    resets += await withTrafficBillingUserLock(userId, async () => {
+      const cycle = await rechargeSubscriptionTrafficCyclesForUserUnlocked(userId, now);
+      await syncUserSubscriptionEntitlements(userId);
+      return cycle.resetCount;
+    });
+  }
+  await setSetting(marker, String(Math.floor(now.getTime() / 1000)));
+  return { users: userIds.length, resets };
+}
+
+async function rechargeSubscriptionTrafficCyclesForUserUnlocked(userId: number, now: Date) {
+  const db = await getDb();
+  if (!db) return { resetCount: 0, settled: false };
+  await alignSubscriptionTrafficCycles(now, { userId, preserveDue: true });
+  const nowSec = Math.floor(now.getTime() / 1000);
+  const due = await db.select({
+    id: userSubscriptions.id,
+    userId: userSubscriptions.userId,
+    nextTrafficResetAt: userSubscriptions.nextTrafficResetAt,
+    lastTrafficResetAt: userSubscriptions.lastTrafficResetAt,
+    startedAt: userSubscriptions.startedAt,
+    expiresAt: userSubscriptions.expiresAt,
+    trafficAutoReset: users.trafficAutoReset,
+    trafficResetDay: users.trafficResetDay,
+  }).from(userSubscriptions).innerJoin(users, eq(userSubscriptions.userId, users.id)).where(and(
+    eq(userSubscriptions.userId, userId),
+    eq(userSubscriptions.status, "active"),
+    sql`${userSubscriptions.nextTrafficResetAt} IS NOT NULL`,
+    sql`${userSubscriptions.nextTrafficResetAt} <= ${nowSec}`,
+    sql`(${userSubscriptions.expiresAt} IS NULL OR ${userSubscriptions.expiresAt} > ${nowSec})`,
+  ));
+  let dueBoundary = Number.NEGATIVE_INFINITY;
+  const cycleUpdates: Array<{ id: number; dueBoundary: Date; nextTrafficResetAt: Date | null }> = [];
+  for (const sub of due as any[]) {
+    const expiresAt = sub.expiresAt ? new Date(sub.expiresAt) : null;
+    let next = sub.nextTrafficResetAt ? new Date(sub.nextTrafficResetAt) : null;
+    if (!next) continue;
+    const subscriptionDueBoundary = next.getTime();
+    if (sub.trafficAutoReset) {
+      next = nextConfiguredSubscriptionTrafficReset(
+        sub,
+        { ...sub, lastTrafficResetAt: now },
+        now,
+        expiresAt,
+      );
+    } else {
+      next = nextAnchoredSubscriptionTrafficReset(sub.startedAt, now, expiresAt);
+    }
+    const boundedNext = next && (!expiresAt || next.getTime() < expiresAt.getTime()) ? next : null;
+    cycleUpdates.push({
+      id: Number(sub.id),
+      dueBoundary: new Date(subscriptionDueBoundary),
+      nextTrafficResetAt: boundedNext,
+    });
+    dueBoundary = Math.max(dueBoundary, subscriptionDueBoundary);
+  }
+  if (cycleUpdates.length === 0) return { resetCount: 0, settled: false };
+  const reset = await resetUserTrafficForCycle(userId, new Date(dueBoundary), now);
+  await expireTrafficAddonsForSubscriptionCycles(cycleUpdates);
+  for (const cycle of cycleUpdates) {
+    await updateUserSubscription(cycle.id, {
+      nextTrafficResetAt: cycle.nextTrafficResetAt,
+      lastTrafficResetAt: now,
+    } as any);
+  }
+  return { resetCount: reset ? 1 : 0, settled: true };
+}
+
+export async function settleSubscriptionTrafficCyclesForUser(userId: number, now = nowDate()) {
+  const result = await withTrafficBillingUserLock(
+    userId,
+    () => rechargeSubscriptionTrafficCyclesForUserUnlocked(userId, now),
+  );
+  if (result.settled) {
+    await recoverUserForwardAccessIfEligible(userId);
+  }
+  return result.resetCount;
+}
+
+export async function rechargeSubscriptionTrafficCycles() {
+  const rows = await subscriptionCycleRows();
+  const userIds = Array.from(new Set((rows as any[])
+    .map((row) => Number(row.userId || 0))
+    .filter((userId) => userId > 0)));
+  const now = nowDate();
+  let resetCount = 0;
+  for (const userId of userIds) {
+    const result = await withTrafficBillingUserLock(
+      userId,
+      () => rechargeSubscriptionTrafficCyclesForUserUnlocked(userId, now),
+    );
+    resetCount += result.resetCount;
+    if (result.settled) {
+      await recoverUserForwardAccessIfEligible(userId);
+    }
+  }
+  return resetCount;
+}
+
+export type SubscriptionPortRange = {
+  start: number;
+  end: number;
+};
+
+export type UserPlanPortRange = SubscriptionPortRange & {
+  ranges: SubscriptionPortRange[];
+};
+
+function mergeSubscriptionPortRanges(ranges: SubscriptionPortRange[]) {
+  const sorted = ranges
+    .map((range) => ({ start: Math.max(1, Math.floor(Number(range.start))), end: Math.min(65535, Math.floor(Number(range.end))) }))
+    .filter((range) => range.start <= range.end)
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+  const merged: SubscriptionPortRange[] = [];
+  for (const range of sorted) {
+    const previous = merged[merged.length - 1];
+    if (previous && range.start <= previous.end + 1) {
+      previous.end = Math.max(previous.end, range.end);
+    } else {
+      merged.push({ ...range });
+    }
+  }
+  return merged;
+}
+
+function userPlanPortRangeResult(ranges: SubscriptionPortRange[]): UserPlanPortRange | null {
+  const merged = mergeSubscriptionPortRanges(ranges);
+  if (merged.length === 0) return null;
+  return {
+    start: merged[0].start,
+    end: merged[merged.length - 1].end,
+    ranges: merged,
+  };
+}
+
+export async function getUserPlanPortRanges(userId: number, hostId?: number, tunnelId?: number): Promise<SubscriptionPortRange[]> {
+  const active = await getActiveUserSubscriptions(userId);
+  const ranges: SubscriptionPortRange[] = [];
+  for (const sub of active as any[]) {
+    if (!sub.portRangeStart || !sub.portRangeEnd) continue;
+    const matches = tunnelId
+      ? (Array.isArray(sub.tunnelIds) && sub.tunnelIds.includes(tunnelId))
+        || (!!hostId && Array.isArray(sub.hostIds) && sub.hostIds.includes(hostId))
+      : !!hostId && Array.isArray(sub.hostIds) && sub.hostIds.includes(hostId);
+    if (matches) ranges.push({ start: Number(sub.portRangeStart), end: Number(sub.portRangeEnd) });
+  }
+  return mergeSubscriptionPortRanges(ranges);
+}
+
+export async function getUserPlanPortRange(userId: number, hostId?: number, tunnelId?: number): Promise<UserPlanPortRange | null> {
+  return userPlanPortRangeResult(await getUserPlanPortRanges(userId, hostId, tunnelId));
+}
+
+export async function getUserForwardGroupPlanPortRanges(userId: number, forwardGroupId: number): Promise<SubscriptionPortRange[]> {
+  const active = await getActiveUserSubscriptions(userId);
+  const ranges: SubscriptionPortRange[] = [];
+  for (const sub of active as any[]) {
+    if (!sub.portRangeStart || !sub.portRangeEnd) continue;
+    if (Array.isArray(sub.forwardGroupIds) && sub.forwardGroupIds.includes(forwardGroupId)) {
+      ranges.push({ start: Number(sub.portRangeStart), end: Number(sub.portRangeEnd) });
+    }
+  }
+  return mergeSubscriptionPortRanges(ranges);
+}
+
+export async function getUserForwardGroupPlanPortRange(userId: number, forwardGroupId: number): Promise<UserPlanPortRange | null> {
+  return userPlanPortRangeResult(await getUserForwardGroupPlanPortRanges(userId, forwardGroupId));
+}
+
+export function isPortAllowedByUserPlanRange(port: number, range: UserPlanPortRange | null | undefined) {
+  if (!range) return true;
+  const candidate = Number(port);
+  return range.ranges.some((item) => candidate >= item.start && candidate <= item.end);
+}
+
+export async function findAvailableSubscriptionPortBlock(portCount: number, hostIds: number[], tunnelIds: number[], forwardGroupIds: number[] = []) {
+  const db = await getDb();
+  if (!db) return null;
+  const count = Math.max(1, portCount);
+  const ranges: Array<{ start: number; end: number }> = [];
+  for (const hostId of hostIds) {
+    const host = await getHostById(hostId);
+    if (!host) continue;
+    const start = Number((host as any).portRangeStart || 10000);
+    const end = Number((host as any).portRangeEnd || 65535);
+    ranges.push({ start, end });
+  }
+  for (const tunnelId of tunnelIds) {
+    const tunnel = await getTunnelById(tunnelId);
+    if (!tunnel) continue;
+    const start = Number((tunnel as any).portRangeStart || 10000);
+    const end = Number((tunnel as any).portRangeEnd || 65535);
+    ranges.push({ start, end });
+  }
+  for (const forwardGroupId of forwardGroupIds) {
+    const range = await getForwardGroupEntryPortRange(forwardGroupId);
+    if (!range) continue;
+    ranges.push(range);
+  }
+  const start = ranges.length ? Math.max(...ranges.map((r) => r.start)) : 10000;
+  const end = ranges.length ? Math.min(...ranges.map((r) => r.end)) : 65535;
+  if (start <= 0 || end < start || end - start + 1 < count) return null;
+
+  const used = new Set<number>();
+  const ruleRows = await db.select({ port: forwardRules.sourcePort }).from(forwardRules).where(and(
+    eq(forwardRules.isEnabled, true),
+    eq(forwardRules.pendingDelete, false),
+  ));
+  (ruleRows as any[]).forEach((row: any) => used.add(Number(row.port)));
+  const subRows = await db.select({
+    portRangeStart: userSubscriptions.portRangeStart,
+    portRangeEnd: userSubscriptions.portRangeEnd,
+  }).from(userSubscriptions).where(and(
+    eq(userSubscriptions.status, "active"),
+    sql`(${userSubscriptions.expiresAt} IS NULL OR ${userSubscriptions.expiresAt} > ${Math.floor(Date.now() / 1000)})`,
+  ));
+  (subRows as any[]).forEach((row: any) => {
+    const s = Number(row.portRangeStart || 0);
+    const e = Number(row.portRangeEnd || 0);
+    for (let p = s; p > 0 && p <= e; p++) used.add(p);
+  });
+
+  for (let port = start; port <= end - count + 1; port++) {
+    let ok = true;
+    for (let p = port; p < port + count; p++) {
+      if (used.has(p)) {
+        ok = false;
+        port = p;
+        break;
+      }
+    }
+    if (ok) return { start: port, end: port + count - 1 };
+  }
+  return null;
+}
+
+export type SubscriptionSource = "admin" | "payment" | "redeem" | "balance";
+
+/** Store purchases may be renewed by the owner; administrative grants and
+ * redemption grants require a fresh assignment/administrative action. */
+export function isUserRenewableSubscriptionSource(source: unknown) {
+  return source === "payment" || source === "balance";
+}
+
+function addSubscriptionDays(base: Date, days: number) {
+  return new Date(base.getTime() + days * 24 * 3600 * 1000);
+}
+
+async function applySubscriptionToUserUnlocked(
+  userId: number,
+  planId: number,
+  source: SubscriptionSource,
+  paymentOrderNo?: string | null,
+  startsAt?: Date,
+  overrideDurationDays?: number | null,
+  targetSubscriptionId?: number | null,
+) {
+  const plan = await getSubscriptionPlanById(planId);
+  if (!plan) throw new Error("套餐不存在");
+  if (!plan.isActive) throw new Error("套餐已停用");
+  const hostIds = (plan as any).hostIds || [];
+  const tunnelIds = (plan as any).tunnelIds || [];
+  const forwardGroupIds = (plan as any).forwardGroupIds || [];
+  if (hostIds.length === 0 && tunnelIds.length === 0 && forwardGroupIds.length === 0) throw new Error("套餐未绑定任何端口转发、隧道、转发链或转发组");
+  const now = startsAt || new Date();
+  const durationDays = overrideDurationDays === null || overrideDurationDays === undefined
+    ? Number(plan.durationDays)
+    : Number(overrideDurationDays);
+  const activeSubscriptions = await getActiveUserSubscriptions(userId);
+  const user = await getUserById(userId);
+  const hadActiveSubscription = activeSubscriptions.length > 0;
+  // A purchase/assignment without an explicit target is always a new
+  // subscription. Renewal must name the exact subscription being extended.
+  let sameActiveSubscription = targetSubscriptionId
+    ? await getUserSubscriptionById(Number(targetSubscriptionId))
+    : null;
+  if (targetSubscriptionId) {
+    if (!sameActiveSubscription || Number(sameActiveSubscription.userId) !== Number(userId)) {
+      throw new Error("订阅不存在或无权操作");
+    }
+    if (Number(sameActiveSubscription.planId) !== Number(planId)) {
+      throw new Error("续费套餐与目标订阅不一致");
+    }
+    if (sameActiveSubscription.status === "cancelled") {
+      throw new Error("已取消的订阅不能续费");
+    }
+    if (!isUserRenewableSubscriptionSource(sameActiveSubscription.source)) {
+      throw new Error("管理员分配的套餐不能自行续费，请联系管理员处理");
+    }
+    if (!isUserRenewableSubscriptionSource(source)) {
+      throw new Error("当前来源不支持用户续费");
+    }
+  }
+  if (sameActiveSubscription) {
+    const currentExpiresAt = sameActiveSubscription.expiresAt ? new Date(sameActiveSubscription.expiresAt) : null;
+    const baseExpiresAt = currentExpiresAt && Number.isFinite(currentExpiresAt.getTime()) && currentExpiresAt.getTime() > now.getTime()
+      ? currentExpiresAt
+      : now;
+    const expiresAt = !currentExpiresAt
+      ? null
+      : durationDays > 0
+        ? addSubscriptionDays(baseExpiresAt, durationDays)
+        : null;
+    const existingNextTrafficResetAt = sameActiveSubscription.nextTrafficResetAt ? new Date(sameActiveSubscription.nextTrafficResetAt) : null;
+    let nextTrafficResetAt = existingNextTrafficResetAt && Number.isFinite(existingNextTrafficResetAt.getTime())
+      ? existingNextTrafficResetAt
+      : null;
+    if (Number(plan.trafficLimit || 0) > 0) {
+      if ((user as any)?.trafficAutoReset) {
+        nextTrafficResetAt = nextConfiguredSubscriptionTrafficReset(user as any, sameActiveSubscription, now, expiresAt);
+      } else if (!nextTrafficResetAt || !Number.isFinite(nextTrafficResetAt.getTime()) || nextTrafficResetAt.getTime() <= now.getTime()) {
+        nextTrafficResetAt = !existingNextTrafficResetAt && currentExpiresAt && expiresAt && currentExpiresAt.getTime() > now.getTime() && currentExpiresAt.getTime() < expiresAt.getTime()
+          ? currentExpiresAt
+          : nextBillingMonthlyTrafficReset(now, expiresAt);
+      }
+      if (expiresAt && nextTrafficResetAt && nextTrafficResetAt.getTime() >= expiresAt.getTime()) {
+        nextTrafficResetAt = null;
+      }
+    } else {
+      nextTrafficResetAt = null;
+    }
+
+    let portRangeStart = Number(sameActiveSubscription.portRangeStart || 0);
+    let portRangeEnd = Number(sameActiveSubscription.portRangeEnd || 0);
+    const updateData: Partial<InsertUserSubscription> = {
+      status: "active",
+      expiresAt,
+      nextTrafficResetAt,
+      planSnapshot: JSON.stringify(buildPlanSnapshot(plan)),
+    } as any;
+    if (paymentOrderNo) {
+      (updateData as any).paymentOrderNo = paymentOrderNo;
+    }
+    if (!portRangeStart || !portRangeEnd) {
+      const block = await findAvailableSubscriptionPortBlock(Number(plan.portCount) || 1, hostIds, tunnelIds, forwardGroupIds);
+      if (!block) throw new Error("套餐可用端口不足，无法分配连续端口段");
+      portRangeStart = block.start;
+      portRangeEnd = block.end;
+      (updateData as any).portRangeStart = block.start;
+      (updateData as any).portRangeEnd = block.end;
+    }
+    await updateUserSubscription(Number(sameActiveSubscription.id), updateData);
+    await updateActiveTrafficAddonCycleEnd(Number(sameActiveSubscription.id), nextTrafficResetAt, expiresAt);
+    await syncUserSubscriptionEntitlements(userId);
+    return {
+      subscriptionId: Number(sameActiveSubscription.id),
+      portRangeStart,
+      portRangeEnd,
+      expiresAt,
+      extended: true,
+    };
+  }
+
+  const block = await findAvailableSubscriptionPortBlock(Number(plan.portCount) || 1, hostIds, tunnelIds, forwardGroupIds);
+  if (!block) throw new Error("套餐可用端口不足，无法分配连续端口段");
+  const expiresAt = durationDays > 0 ? addSubscriptionDays(now, durationDays) : null;
+  const nextTrafficResetAt = Number(plan.trafficLimit || 0) > 0
+    ? (user as any)?.trafficAutoReset
+      ? nextConfiguredSubscriptionTrafficReset(user as any, { startedAt: now }, now, expiresAt)
+      : nextBillingMonthlyTrafficReset(now, expiresAt)
+    : null;
+  const subscriptionId = await createUserSubscription({
+    userId,
+    planId,
+    status: "active",
+    source,
+    paymentOrderNo: paymentOrderNo ?? null,
+    planSnapshot: JSON.stringify(buildPlanSnapshot(plan)),
+    portRangeStart: block.start,
+    portRangeEnd: block.end,
+    nextTrafficResetAt,
+    startedAt: now,
+    expiresAt,
+  } as any);
+  await syncUserSubscriptionEntitlements(userId);
+  if (!hadActiveSubscription && Number(user?.trafficUsed || 0) >= Number(user?.trafficLimit || 0) && Number(user?.trafficLimit || 0) > 0) {
+    await resetUserTraffic(userId);
+    await syncUserSubscriptionEntitlements(userId);
+  }
+  return { subscriptionId, portRangeStart: block.start, portRangeEnd: block.end, expiresAt };
+}
+
+export async function applySubscriptionToUser(
+  userId: number,
+  planId: number,
+  source: SubscriptionSource,
+  paymentOrderNo?: string | null,
+  startsAt?: Date,
+  overrideDurationDays?: number | null,
+  targetSubscriptionId?: number | null,
+) {
+  return withTrafficBillingUserLock(userId, () => withDatabaseTransaction(
+    // Port blocks are allocated by reading all active reservations and then
+    // inserting the selected range. Hold the shared database marker row for
+    // the entire transaction so separate panel instances cannot choose the
+    // same range concurrently.
+    () => withSubscriptionPortAllocationLock(() => applySubscriptionToUserUnlocked(
+      userId,
+      planId,
+      source,
+      paymentOrderNo,
+      startsAt,
+      overrideDurationDays,
+      targetSubscriptionId,
+    )),
+  ));
+}
+
+function getTrafficAddonCycleEnd(subscription: any) {
+  const now = new Date();
+  const nextTrafficResetAt = subscription?.nextTrafficResetAt ? new Date(subscription.nextTrafficResetAt) : null;
+  if (nextTrafficResetAt && nextTrafficResetAt.getTime() > now.getTime()) return nextTrafficResetAt;
+  const expiresAt = subscription?.expiresAt ? new Date(subscription.expiresAt) : null;
+  if (expiresAt && expiresAt.getTime() > now.getTime()) return expiresAt;
+  return billingStartOfCalendarDay(billingAddMonthsClamped(now, 1));
+}
+
+function formatAddonTraffic(bytes: number) {
+  const gb = bytes / 1024 / 1024 / 1024;
+  return `${Number.isInteger(gb) ? gb.toFixed(0) : gb.toFixed(2)}GB`;
+}
+
+async function getTrafficAddonById(addonId: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db
+    .select({
+      id: subscriptionPlanTrafficAddons.id,
+      planId: subscriptionPlanTrafficAddons.planId,
+      planName: subscriptionPlans.name,
+      planTrafficLimit: subscriptionPlans.trafficLimit,
+      trafficBytes: subscriptionPlanTrafficAddons.trafficBytes,
+      priceCents: subscriptionPlanTrafficAddons.priceCents,
+      isActive: subscriptionPlanTrafficAddons.isActive,
+      sortOrder: subscriptionPlanTrafficAddons.sortOrder,
+    })
+    .from(subscriptionPlanTrafficAddons)
+    .leftJoin(subscriptionPlans, eq(subscriptionPlanTrafficAddons.planId, subscriptionPlans.id))
+    .where(eq(subscriptionPlanTrafficAddons.id, addonId))
+    .limit(1);
+  return rows[0] as any;
+}
+
+function pickActiveFiniteTrafficSubscription(activeSubscriptions: any[], planId?: number, subscriptionId?: number) {
+  const matched = activeSubscriptions.filter((sub: any) => {
+    if (planId && Number(sub.planId) !== Number(planId)) return false;
+    if (subscriptionId && Number(sub.id) !== Number(subscriptionId)) return false;
+    return Number(sub.trafficLimit || 0) > 0;
+  });
+  return matched
+    .sort((a: any, b: any) => {
+      const aEnd = getTrafficAddonCycleEnd(a).getTime();
+      const bEnd = getTrafficAddonCycleEnd(b).getTime();
+      return aEnd - bEnd;
+    })[0];
+}
+
+export async function purchaseTrafficAddonWithBalance(userId: number, addonId: number, subscriptionId?: number | null) {
+  let cycleSettled = false;
+  let entitlementsSynced = false;
+  try {
+  return await withTrafficBillingUserLock(userId, async () => {
+  const cycle = await rechargeSubscriptionTrafficCyclesForUserUnlocked(userId, nowDate());
+  cycleSettled = cycle.settled;
+  return withDatabaseTransaction(async () => {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  await expireDueTrafficAddons(userId);
+  const addon = await getTrafficAddonById(addonId);
+  if (!addon || !addon.isActive || Number(addon.trafficBytes || 0) <= 0) throw new Error("流量包不可购买");
+  if (Number(addon.planTrafficLimit || 0) <= 0) throw new Error("不限流量套餐无需购买流量包");
+  const activeSubscriptions = await getActiveUserSubscriptions(userId);
+  const subscription = pickActiveFiniteTrafficSubscription(activeSubscriptions as any[], Number(addon.planId), subscriptionId || undefined);
+  if (!subscription) throw new Error("当前没有可购买流量包的生效套餐");
+  const amountCents = Number(addon.priceCents || 0);
+  const balance = await getUserBalance(userId);
+  if (balance < amountCents) throw new Error("余额不足");
+  const expiresAt = getTrafficAddonCycleEnd(subscription);
+  const description = `购买附加流量：${addon.planName || `套餐 #${addon.planId}`} ${formatAddonTraffic(Number(addon.trafficBytes || 0))}`;
+  if (amountCents > 0) {
+    await addUserBalance(userId, -amountCents, {
+      type: "traffic_addon_purchase",
+      description,
+    } as any);
+  }
+  const now = nowDate();
+  const id = await insertAndGetId("user_traffic_addons", {
+    userId,
+    subscriptionId: subscription.id,
+    planId: addon.planId,
+    addonId: addon.id,
+    trafficBytes: Number(addon.trafficBytes || 0),
+    priceCents: amountCents,
+    source: "user",
+    status: "active",
+    description,
+    cycleResetAt: expiresAt,
+    expiresAt,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const limits = await syncUserSubscriptionEntitlements(userId, { deferRuleRecovery: true });
+  entitlementsSynced = true;
+  return {
+    id,
+    subscriptionId: subscription.id,
+    trafficBytes: Number(addon.trafficBytes || 0),
+    priceCents: amountCents,
+    expiresAt,
+    trafficLimit: limits.trafficLimit,
+  };
+  });
+  });
+  } finally {
+    if (cycleSettled || entitlementsSynced) {
+      try {
+        await recoverUserForwardAccessIfEligible(userId);
+      } catch (error) {
+        console.warn(`[Billing] post-cycle access recovery failed user=${userId}:`, error instanceof Error ? error.message : String(error));
+      }
+    }
+  }
+}
+
+export async function adminAddUserTrafficAddon(input: {
+  userId: number;
+  trafficBytes: number;
+  subscriptionId?: number | null;
+  operatorUserId?: number | null;
+  description?: string | null;
+}) {
+  let cycleSettled = false;
+  let entitlementsSynced = false;
+  try {
+  return await withTrafficBillingUserLock(input.userId, async () => {
+  const cycle = await rechargeSubscriptionTrafficCyclesForUserUnlocked(input.userId, nowDate());
+  cycleSettled = cycle.settled;
+  return withDatabaseTransaction(async () => {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const trafficBytes = Math.floor(Number(input.trafficBytes || 0));
+  if (!Number.isFinite(trafficBytes) || trafficBytes <= 0) throw new Error("附加流量必须大于 0");
+  await expireDueTrafficAddons(input.userId);
+  const activeSubscriptions = await getActiveUserSubscriptions(input.userId);
+  const subscription = pickActiveFiniteTrafficSubscription(activeSubscriptions as any[], undefined, input.subscriptionId || undefined);
+  if (!subscription) throw new Error("该用户没有可附加流量的生效流量套餐");
+  const expiresAt = getTrafficAddonCycleEnd(subscription);
+  const description = input.description?.trim() || `管理员附加本周期流量：${formatAddonTraffic(trafficBytes)}`;
+  const now = nowDate();
+  const id = await insertAndGetId("user_traffic_addons", {
+    userId: input.userId,
+    subscriptionId: subscription.id,
+    planId: subscription.planId,
+    addonId: null,
+    trafficBytes,
+    priceCents: 0,
+    source: "admin",
+    status: "active",
+    operatorUserId: input.operatorUserId || null,
+    description,
+    cycleResetAt: expiresAt,
+    expiresAt,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const limits = await syncUserSubscriptionEntitlements(input.userId, { deferRuleRecovery: true });
+  entitlementsSynced = true;
+  return {
+    id,
+    subscriptionId: subscription.id,
+    trafficBytes,
+    expiresAt,
+    trafficLimit: limits.trafficLimit,
+  };
+  });
+  });
+  } finally {
+    if (cycleSettled || entitlementsSynced) {
+      try {
+        await recoverUserForwardAccessIfEligible(input.userId);
+      } catch (error) {
+        console.warn(`[Billing] post-cycle access recovery failed user=${input.userId}:`, error instanceof Error ? error.message : String(error));
+      }
+    }
+  }
+}
+
+// ==================== Balance ====================
+
+export async function getUserBalance(userId: number) {
+  const user = await getUserById(userId);
+  return Number((user as any)?.balanceCents || 0);
+}
+
+async function addUserBalanceInTransaction(userId: number, amountCents: number, meta: Omit<InsertBalanceTransaction, "userId" | "amountCents" | "balanceAfterCents">) {
+  const q = quoteDbIdentifier;
+  const lock = getDatabaseKind() === "sqlite" ? "" : " FOR UPDATE";
+  const rows = await queryRaw<{ balanceCents: number }>(
+    `SELECT ${q("balanceCents")} AS ${q("balanceCents")} FROM ${q("users")} WHERE ${q("id")} = ?${lock}`,
+    [userId],
+  );
+  const row = rows[0];
+  if (!row) throw new Error("用户不存在");
+  const current = Number(row.balanceCents || 0);
+  const delta = Math.round(amountCents);
+  const next = current + delta;
+  if (next < 0) throw new Error("余额不足");
+  const now = Math.floor(Date.now() / 1000);
+  await executeRaw(`UPDATE ${q("users")} SET ${q("balanceCents")} = ?, ${q("updatedAt")} = ? WHERE ${q("id")} = ?`, [next, now, userId]);
+  await executeRaw(
+    `INSERT INTO ${q("balance_transactions")} (${q("userId")}, ${q("type")}, ${q("amountCents")}, ${q("balanceAfterCents")}, ${q("description")}, ${q("operatorUserId")}, ${q("paymentOrderNo")}, ${q("redemptionCodeId")}, ${q("createdAt")}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [userId, meta.type, delta, next, meta.description ?? null, meta.operatorUserId ?? null, meta.paymentOrderNo ?? null, meta.redemptionCodeId ?? null, now],
+  );
+  return { balanceCents: next };
+}
+
+
+export async function getBillingAdminSummary() {
+  const db = await getDb();
+  if (!db) {
+    return {
+      userCount: 0,
+      totalBalanceCents: 0,
+      activeRedemptionCodes: 0,
+      activeDiscountCodes: 0,
+    };
+  }
+  const nowSec = Math.floor(Date.now() / 1000);
+  const [userRows, redemptionRows, discountRows] = await Promise.all([
+    db.select({
+      userCount: sql<number>`COUNT(*)`,
+      totalBalanceCents: sql<number>`COALESCE(SUM(${users.balanceCents}), 0)`,
+    }).from(users),
+    db.select({
+      count: sql<number>`COALESCE(SUM(CASE
+        WHEN ${redemptionCodes.isActive} = ${sqlBool(true)}
+          AND ${redemptionCodes.usedAt} IS NULL
+        THEN 1 ELSE 0 END), 0)`,
+    }).from(redemptionCodes),
+    db.select({
+      count: sql<number>`COALESCE(SUM(CASE
+        WHEN ${discountCodes.isActive} = ${sqlBool(true)}
+          AND (${discountCodes.startsAt} IS NULL OR ${discountCodes.startsAt} <= ${nowSec})
+          AND (${discountCodes.expiresAt} IS NULL OR ${discountCodes.expiresAt} > ${nowSec})
+          AND (${discountCodes.maxUses} = 0 OR ${discountCodes.usedCount} < ${discountCodes.maxUses})
+        THEN 1 ELSE 0 END), 0)`,
+    }).from(discountCodes),
+  ]);
+  return {
+    userCount: Number(userRows[0]?.userCount || 0),
+    totalBalanceCents: Number(userRows[0]?.totalBalanceCents || 0),
+    activeRedemptionCodes: Number(redemptionRows[0]?.count || 0),
+    activeDiscountCodes: Number(discountRows[0]?.count || 0),
+  };
+}
+
+export async function listBalanceTransactions(userId?: number, limit = 100) {
+  const db = await getDb();
+  if (!db) return [];
+  const base = db
+    .select({
+      id: balanceTransactions.id,
+      userId: balanceTransactions.userId,
+      username: users.username,
+      name: users.name,
+      type: balanceTransactions.type,
+      amountCents: balanceTransactions.amountCents,
+      balanceAfterCents: balanceTransactions.balanceAfterCents,
+      description: balanceTransactions.description,
+      operatorUserId: balanceTransactions.operatorUserId,
+      paymentOrderNo: balanceTransactions.paymentOrderNo,
+      redemptionCodeId: balanceTransactions.redemptionCodeId,
+      createdAt: balanceTransactions.createdAt,
+    })
+    .from(balanceTransactions)
+    .leftJoin(users, eq(balanceTransactions.userId, users.id));
+  const rows = userId !== undefined
+    ? await base.where(eq(balanceTransactions.userId, userId)).orderBy(desc(balanceTransactions.createdAt)).limit(limit)
+    : await base.orderBy(desc(balanceTransactions.createdAt)).limit(limit);
+  return (rows as any[]).map((row) => ({
+    ...row,
+    typeLabel: balanceTypeLabel(row.type),
+  }));
+}
+
+function normalizeBillingLimit(limit = 100) {
+  return Math.max(1, Math.min(500, Math.floor(Number(limit) || 100)));
+}
+
+function billingTime(value: unknown) {
+  if (!value) return 0;
+  const date = value instanceof Date ? value : new Date(value as any);
+  return Number.isNaN(date.getTime()) ? 0 : date.getTime();
+}
+
+function paymentStatusLabel(status: string) {
+  if (status === "pending") return "待支付";
+  if (status === "paid") return "已支付";
+  if (status === "processing") return "处理中";
+  if (status === "completed") return "已完成";
+  if (status === "expired") return "已过期";
+  if (status === "cancelled") return "已取消";
+  if (status === "failed") return "失败";
+  return status || "-";
+}
+
+function paymentOrderTypeLabel(type: string | null | undefined) {
+  if (type === "plan") return "套餐订单";
+  if (type === "test") return "测试订单";
+  return "余额充值";
+}
+
+function balanceTypeLabel(type: string) {
+  if (type === "admin_recharge") return "管理员充值";
+  if (type === "admin_adjust") return "管理员修改";
+  if (type === "payment") return "在线充值入账";
+  if (type === "purchase") return "余额消费";
+  if (type === "redeem") return "兑换入账";
+  if (type === "traffic_billing") return "流量计费";
+  if (type === "traffic_addon_purchase") return "购买附加流量";
+  return type || "余额变动";
+}
+
+function subscriptionSourceLabel(source: string) {
+  if (source === "admin") return "管理员分配";
+  if (source === "payment") return "在线购买";
+  if (source === "redeem") return "兑换套餐";
+  if (source === "balance") return "余额购买";
+  return source || "套餐变更";
+}
+
+
+async function listUserSubscriptionsForLedger(
+  userId: number | undefined,
+  limit: number,
+  options: { isAdmin: boolean; includeCancelledSubscriptions: boolean },
+) {
+  const db = await getDb();
+  if (!db) return [];
+  const query = userSubscriptionsListQuery(db);
+  const conditions = subscriptionVisibilityConditions(options.isAdmin ? "admin" : "user");
+  if (userId !== undefined) conditions.push(eq(userSubscriptions.userId, userId));
+  if (!options.includeCancelledSubscriptions) conditions.push(ne(userSubscriptions.status, "cancelled"));
+  return query
+    .where(and(...conditions))
+    .orderBy(desc(userSubscriptions.createdAt), desc(userSubscriptions.id))
+    .limit(limit);
+}
+
+export async function listBillingLedger(options?: {
+  viewerUserId?: number;
+  isAdmin?: boolean;
+  userId?: number;
+  limit?: number;
+  includeCancelledSubscriptions?: boolean;
+}) {
+  const limit = normalizeBillingLimit(options?.limit);
+  const targetUserId = options?.isAdmin ? options?.userId : options?.viewerUserId;
+  if (!options?.isAdmin && !targetUserId) return [];
+
+  const [transactions, orders, subscriptions] = await Promise.all([
+    listBalanceTransactions(targetUserId, limit),
+    listPaymentOrders(limit, targetUserId),
+    listUserSubscriptionsForLedger(targetUserId, limit, {
+      isAdmin: !!options?.isAdmin,
+      includeCancelledSubscriptions: !!options?.includeCancelledSubscriptions,
+    }),
+  ]);
+
+  const items = [
+    ...transactions.map((tx: any) => ({
+      id: `balance-${tx.id}`,
+      sourceId: tx.id,
+      kind: "balance",
+      category: balanceTypeLabel(tx.type),
+      title: balanceTypeLabel(tx.type),
+      description: tx.description || "-",
+      userId: tx.userId,
+      username: tx.username,
+      name: tx.name,
+      amountCents: Number(tx.amountCents || 0),
+      currency: "CNY",
+      balanceAfterCents: Number(tx.balanceAfterCents || 0),
+      status: "completed",
+      statusLabel: "已完成",
+      paymentOrderNo: tx.paymentOrderNo,
+      redemptionCodeId: tx.redemptionCodeId,
+      operatorUserId: tx.operatorUserId,
+      createdAt: tx.createdAt,
+    })),
+    ...orders.map((order: any) => ({
+      id: `payment-${order.id}`,
+      sourceId: order.id,
+      kind: "payment",
+      category: paymentOrderTypeLabel(order.orderType),
+      title: order.subject || paymentOrderTypeLabel(order.orderType),
+      description: order.outTradeNo,
+      userId: order.userId,
+      username: order.username,
+      name: order.name,
+      amountCents: Number(order.amountCents || 0),
+      currency: order.currency || "CNY",
+      status: order.status,
+      statusLabel: paymentStatusLabel(order.status),
+      paymentType: order.paymentType,
+      provider: order.provider,
+      paymentOrderNo: order.outTradeNo,
+      tradeNo: order.tradeNo,
+      planId: order.planId,
+      subscriptionId: order.subscriptionId,
+      discountAmountCents: Number(order.discountAmountCents || 0),
+      createdAt: order.createdAt,
+      paidAt: order.paidAt,
+    })),
+    ...subscriptions.map((sub: any) => ({
+      id: `subscription-${sub.id}`,
+      sourceId: sub.id,
+      kind: "subscription",
+      category: "套餐记录",
+      title: `${subscriptionSourceLabel(sub.source)}：${sub.planName || `套餐 #${sub.planId}`}`,
+      description: sub.portRangeStart && sub.portRangeEnd ? `端口段 ${sub.portRangeStart}-${sub.portRangeEnd}` : "-",
+      userId: sub.userId,
+      username: sub.username,
+      name: sub.name,
+      amountCents: sub.source === "admin" || sub.source === "redeem" ? 0 : Number(sub.priceCents || 0),
+      currency: "CNY",
+      status: sub.status,
+      statusLabel: sub.status === "active" ? "生效中" : sub.status === "expired" ? "已过期" : sub.status === "cancelled" ? "已取消" : sub.status,
+      planId: sub.planId,
+      planName: sub.planName,
+      paymentOrderNo: sub.paymentOrderNo,
+      portRangeStart: sub.portRangeStart,
+      portRangeEnd: sub.portRangeEnd,
+      startedAt: sub.startedAt,
+      expiresAt: sub.expiresAt,
+      createdAt: sub.createdAt,
+    })),
+  ];
+
+  return items
+    .sort((a, b) => billingTime(b.createdAt) - billingTime(a.createdAt))
+    .slice(0, limit);
+}
+
+export async function addUserBalance(userId: number, amountCents: number, meta: Omit<InsertBalanceTransaction, "userId" | "amountCents" | "balanceAfterCents">) {
+  if (!Number.isFinite(amountCents) || amountCents === 0) throw new Error("金额无效");
+  return withDatabaseTransaction(() => addUserBalanceInTransaction(userId, amountCents, meta));
+}
+
+export async function setUserBalance(userId: number, balanceCents: number, meta: Omit<InsertBalanceTransaction, "userId" | "amountCents" | "balanceAfterCents">) {
+  if (!Number.isFinite(balanceCents) || balanceCents < 0) throw new Error("金额无效");
+  return withDatabaseTransaction(async () => {
+  const q = quoteDbIdentifier;
+  const lock = getDatabaseKind() === "sqlite" ? "" : " FOR UPDATE";
+  const [user] = await queryRaw<any>(`SELECT ${q("balanceCents")} AS ${q("balanceCents")} FROM ${q("users")} WHERE ${q("id")} = ?${lock}`, [userId]);
+  if (!user) throw new Error("用户不存在");
+  const previous = Number((user as any).balanceCents || 0);
+  const next = Math.round(balanceCents);
+  const delta = next - previous;
+  if (delta === 0) {
+    return { balanceCents: next, previousBalanceCents: previous, amountCents: 0, changed: false };
+  }
+  const result = await addUserBalance(userId, delta, meta);
+  return { ...result, previousBalanceCents: previous, amountCents: delta, changed: true };
+  });
+}
+
+export async function purchasePlanWithBalance(
+  userId: number,
+  planId: number,
+  discountCodeId?: number | null,
+  subscriptionId?: number | null,
+) {
+  return withTrafficBillingUserLock(userId, () => withDatabaseTransaction(async () => {
+  const plan = await getSubscriptionPlanById(planId);
+  if (!plan || !plan.isActive || !plan.isStoreVisible) throw new Error("套餐不可购买");
+  const discount = discountCodeId ? await getDiscountCodeById(discountCodeId) : null;
+  if (discount) {
+    const allowedPlanIds = Array.isArray((discount as any).planIds) ? (discount as any).planIds.map(Number) : [];
+    if (allowedPlanIds.length > 0 && !allowedPlanIds.includes(Number(planId))) {
+      throw new Error("折扣码不适用于该套餐");
+    }
+  }
+  const amountCents = calculateDiscountedAmount(Number(plan.priceCents || 0), discount);
+  if (amountCents > 0) {
+    await addUserBalance(userId, -amountCents, {
+      type: "purchase",
+      description: `购买套餐：${plan.name}`,
+    } as any);
+  }
+  if (discount) await consumeDiscountCode(discount.id);
+  const result = await applySubscriptionToUser(
+    userId,
+    planId,
+    "balance",
+    null,
+    undefined,
+    null,
+    subscriptionId || null,
+  );
+  return result;
+  }));
+}
+
+// ==================== Redemption Codes ====================
+
+
+function redemptionCodesListQuery(db: any) {
+  return db
+    .select({
+      id: redemptionCodes.id,
+      code: redemptionCodes.code,
+      type: redemptionCodes.type,
+      planId: redemptionCodes.planId,
+      planName: subscriptionPlans.name,
+      durationDays: redemptionCodes.durationDays,
+      amountCents: redemptionCodes.amountCents,
+      startsAt: redemptionCodes.startsAt,
+      expiresAt: redemptionCodes.expiresAt,
+      isActive: redemptionCodes.isActive,
+      usedByUserId: redemptionCodes.usedByUserId,
+      usedByUsername: users.username,
+      usedAt: redemptionCodes.usedAt,
+      createdByUserId: redemptionCodes.createdByUserId,
+      createdAt: redemptionCodes.createdAt,
+      updatedAt: redemptionCodes.updatedAt,
+    })
+    .from(redemptionCodes)
+    .leftJoin(subscriptionPlans, eq(redemptionCodes.planId, subscriptionPlans.id))
+    .leftJoin(users, eq(redemptionCodes.usedByUserId, users.id));
+}
+
+export async function listRedemptionCodes() {
+  const db = await getDb();
+  if (!db) return [];
+  return redemptionCodesListQuery(db).orderBy(desc(redemptionCodes.createdAt), desc(redemptionCodes.id));
+}
+
+export async function listRedemptionCodesPage(input: PageRequest & {
+  usage?: "all" | "unused" | "used";
+}) {
+  const db = await getDb();
+  if (!db) return pageResult([], 0, input, 50);
+  const condition = input.usage === "unused"
+    ? and(isNull(redemptionCodes.usedAt), isNull(redemptionCodes.usedByUserId))
+    : input.usage === "used"
+      ? or(isNotNull(redemptionCodes.usedAt), isNotNull(redemptionCodes.usedByUserId))
+      : undefined;
+  const aggregate = db.select({ count: sql<number>`COUNT(*)` }).from(redemptionCodes);
+  const [totals] = condition ? await aggregate.where(condition) : await aggregate;
+  const totalItems = Number(totals?.count || 0);
+  const window = pageWindowForTotal(input, totalItems, 50);
+  const query = redemptionCodesListQuery(db);
+  const items = condition
+    ? await query
+      .where(condition)
+      .orderBy(desc(redemptionCodes.createdAt), desc(redemptionCodes.id))
+      .limit(window.pageSize)
+      .offset(window.offset)
+    : await query
+      .orderBy(desc(redemptionCodes.createdAt), desc(redemptionCodes.id))
+      .limit(window.pageSize)
+      .offset(window.offset);
+  return pageResult(items, totalItems, window, 50);
+}
+
+export async function createRedemptionCodes(data: Omit<InsertRedemptionCode, "code"> & { code?: string }, count = 1) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const created: string[] = [];
+  const total = Math.max(1, Math.min(500, Math.floor(count)));
+  for (let i = 0; i < total; i++) {
+    const code = normalizeCode(i === 0 && data.code ? data.code : generateBillingCode("FXR"));
+    await db.insert(redemptionCodes).values({ ...data, code } as any);
+    created.push(code);
+  }
+  return created;
+}
+
+export async function deleteRedemptionCode(id: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db.delete(redemptionCodes).where(eq(redemptionCodes.id, id));
+}
+
+export async function redeemCode(userId: number, code: string, attemptScope?: string | null) {
+  return withTrafficBillingUserLock(userId, () => withRedemptionScopeLock(userId, attemptScope, async () => {
+    const limited = redemptionAttemptRateLimitState(userId, attemptScope);
+    if (limited.limited) {
+      throw new Error(`兑换过于频繁，请 ${limited.retryAfterSeconds} 秒后再试`);
+    }
+    const normalized = normalizeCode(code);
+    try {
+      return await withRedemptionCodeLock(normalized, async () => {
+        return withDatabaseTransaction(async () => {
+        const db = await getDb();
+        if (!db) throw new Error("Database not available");
+        const q = quoteDbIdentifier;
+        const lock = getDatabaseKind() === "sqlite" ? "" : " FOR UPDATE";
+        const lockedRows = await queryRaw<{ id: number }>(
+          `SELECT ${q("id")} AS ${q("id")} FROM ${q("redemption_codes")} WHERE ${q("code")} = ? LIMIT 1${lock}`,
+          [normalized],
+        );
+        const rows = lockedRows[0]
+          ? await db.select().from(redemptionCodes).where(eq(redemptionCodes.id, Number(lockedRows[0].id))).limit(1)
+          : [];
+        const item = rows[0] as any;
+        if (!item || !item.isActive) throw new Error("兑换码无效");
+        if (item.usedAt || item.usedByUserId) throw new Error("兑换码已被使用");
+        const now = new Date();
+        if (item.startsAt && new Date(item.startsAt).getTime() > now.getTime()) throw new Error("兑换码尚未生效");
+        if (item.expiresAt && new Date(item.expiresAt).getTime() <= now.getTime()) throw new Error("兑换码已过期");
+        if (item.type === "balance") {
+          if (Number(item.amountCents) <= 0) throw new Error("兑换码金额无效");
+          const balance = await addUserBalance(userId, Number(item.amountCents), {
+            type: "redeem",
+            description: `兑换余额：${normalized}`,
+            redemptionCodeId: item.id,
+          } as any);
+          await db.update(redemptionCodes).set({ usedByUserId: userId, usedAt: nowDate(), updatedAt: nowDate() } as any).where(eq(redemptionCodes.id, item.id));
+          clearRedemptionAttemptFailures(userId, attemptScope);
+          return {
+            success: true,
+            type: item.type,
+            amountCents: Number(item.amountCents),
+            balanceCents: Number((balance as any)?.balanceCents || 0),
+          };
+        } else if (item.type === "plan") {
+          if (!item.planId) throw new Error("兑换码套餐无效");
+          const subscription = await applySubscriptionToUser(userId, Number(item.planId), "redeem", null, now, item.durationDays || null);
+          const plan = await getSubscriptionPlanById(Number(item.planId));
+          await db.update(redemptionCodes).set({ usedByUserId: userId, usedAt: nowDate(), updatedAt: nowDate() } as any).where(eq(redemptionCodes.id, item.id));
+          clearRedemptionAttemptFailures(userId, attemptScope);
+          return {
+            success: true,
+            type: item.type,
+            planId: Number(item.planId),
+            planName: (plan as any)?.name || null,
+            durationDays: Number(item.durationDays || 0),
+            expiresAt: subscription.expiresAt,
+            portRangeStart: subscription.portRangeStart,
+            portRangeEnd: subscription.portRangeEnd,
+          };
+        } else {
+          throw new Error("兑换码类型无效");
+        }
+        });
+      });
+    } catch (error) {
+      const message = String((error as any)?.message || error || "");
+      if (message !== "Database not available" && !message.includes("兑换过于频繁")) {
+        recordRedemptionAttemptFailure(userId, attemptScope);
+      }
+      throw error;
+    }
+  }));
+}
+
+// ==================== Discount Codes ====================
+
+
+export async function listDiscountCodes() {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db.select().from(discountCodes).orderBy(desc(discountCodes.createdAt), desc(discountCodes.id));
+  return attachDiscountPlans(rows);
+}
+
+export async function listDiscountCodesPage(input: PageRequest) {
+  const db = await getDb();
+  if (!db) return pageResult([], 0, input, 50);
+  const [totals] = await db.select({ count: sql<number>`COUNT(*)` }).from(discountCodes);
+  const totalItems = Number(totals?.count || 0);
+  const window = pageWindowForTotal(input, totalItems, 50);
+  const rows = await db
+    .select()
+    .from(discountCodes)
+    .orderBy(desc(discountCodes.createdAt), desc(discountCodes.id))
+    .limit(window.pageSize)
+    .offset(window.offset);
+  return pageResult(await attachDiscountPlans(rows), totalItems, window, 50);
+}
+
+async function getDiscountPlanIds(discountCodeId: number): Promise<number[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db.select({ planId: discountCodePlans.planId }).from(discountCodePlans).where(eq(discountCodePlans.discountCodeId, discountCodeId));
+  return rows.map((row: any) => Number(row.planId)).filter(Boolean);
+}
+
+async function attachDiscountPlans<T extends { id: number }>(codes: T[]) {
+  const db = await getDb();
+  if (!db || codes.length === 0) return codes.map((code) => ({ ...code, planIds: [] as number[] }));
+  const ids = codes.map((code) => Number(code.id)).filter((id) => id > 0);
+  const rows = await db
+    .select({
+      discountCodeId: discountCodePlans.discountCodeId,
+      planId: discountCodePlans.planId,
+    })
+    .from(discountCodePlans)
+    .where(inArray(discountCodePlans.discountCodeId, ids));
+  const planIdsByCode = new Map<number, number[]>();
+  for (const row of rows as any[]) {
+    const codeId = Number(row.discountCodeId);
+    const values = planIdsByCode.get(codeId) || [];
+    values.push(Number(row.planId));
+    planIdsByCode.set(codeId, values);
+  }
+  return codes.map((code) => ({
+    ...code,
+    planIds: planIdsByCode.get(Number(code.id)) || [],
+  }));
+}
+
+export async function setDiscountCodePlans(discountCodeId: number, planIds: number[]) {
+  const db = await getDb();
+  if (!db) return;
+  await db.delete(discountCodePlans).where(eq(discountCodePlans.discountCodeId, discountCodeId));
+  const uniquePlanIds = Array.from(new Set(planIds.filter(id => Number(id) > 0).map(Number)));
+  if (uniquePlanIds.length > 0) {
+    await db.insert(discountCodePlans).values(uniquePlanIds.map(planId => ({ discountCodeId, planId })));
+  }
+}
+
+export async function createDiscountCode(data: InsertDiscountCode, planIds: number[] = []) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  const code = normalizeCode(data.code || generateBillingCode("FXD"));
+  await db.insert(discountCodes).values({ ...data, code } as any);
+  const created = await getDiscountCodeByCode(code);
+  if (created) await setDiscountCodePlans(created.id, planIds);
+  return getDiscountCodeByCode(code);
+}
+
+export async function deleteDiscountCode(id: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db.delete(discountCodePlans).where(eq(discountCodePlans.discountCodeId, id));
+  await db.delete(discountCodes).where(eq(discountCodes.id, id));
+}
+
+export async function getDiscountCodeById(id: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(discountCodes).where(eq(discountCodes.id, id)).limit(1);
+  if (!rows[0]) return undefined;
+  return (await attachDiscountPlans([rows[0]]))[0];
+}
+
+export async function getDiscountCodeByCode(code: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(discountCodes).where(eq(discountCodes.code, normalizeCode(code))).limit(1);
+  if (!rows[0]) return undefined;
+  return (await attachDiscountPlans([rows[0]]))[0];
+}
+
+export function discountCodeStatus(code: any) {
+  const now = Date.now();
+  if (!code?.isActive) return "disabled";
+  if (code.startsAt && new Date(code.startsAt).getTime() > now) return "pending";
+  if (code.expiresAt && new Date(code.expiresAt).getTime() <= now) return "expired";
+  if (Number(code.maxUses || 0) > 0 && Number(code.usedCount || 0) >= Number(code.maxUses)) return "used_up";
+  return "active";
+}
+
+export function calculateDiscountedAmount(amountCents: number, code: any | null | undefined) {
+  const amount = Math.max(0, Math.round(amountCents));
+  if (!code) return amount;
+  if (discountCodeStatus(code) !== "active") throw new Error("折扣码不可用");
+  if (code.discountType === "percent") {
+    const pct = Math.max(0, Math.min(100, Number(code.discountValue || 0)));
+    return Math.max(0, Math.round(amount * (100 - pct) / 100));
+  }
+  const discount = Math.max(0, Number(code.discountValue || 0));
+  return Math.max(0, amount - discount);
+}
+
+export async function previewDiscount(code: string, amountCents: number, planId?: number | null) {
+  const item = await getDiscountCodeByCode(code);
+  if (!item) throw new Error("折扣码不存在");
+  const allowedPlanIds = Array.isArray((item as any).planIds) ? (item as any).planIds.map(Number) : [];
+  if (allowedPlanIds.length > 0 && (!planId || !allowedPlanIds.includes(Number(planId)))) {
+    throw new Error("折扣码不适用于该套餐");
+  }
+  const finalAmountCents = calculateDiscountedAmount(amountCents, item);
+  return {
+    discountCodeId: item.id,
+    code: item.code,
+    originalAmountCents: amountCents,
+    finalAmountCents,
+    discountAmountCents: Math.max(0, amountCents - finalAmountCents),
+    status: discountCodeStatus(item),
+  };
+}
+
+export async function consumeDiscountCode(id: number) {
+  const q = quoteDbIdentifier;
+  const now = Math.floor(Date.now() / 1000);
+  const result = await executeRaw(
+    `UPDATE ${q("discount_codes")}
+        SET ${q("usedCount")} = ${q("usedCount")} + 1, ${q("updatedAt")} = ?
+      WHERE ${q("id")} = ?
+        AND ${q("isActive")} = ?
+        AND (${q("startsAt")} IS NULL OR ${q("startsAt")} <= ?)
+        AND (${q("expiresAt")} IS NULL OR ${q("expiresAt")} > ?)
+        AND (${q("maxUses")} <= 0 OR ${q("usedCount")} < ${q("maxUses")})`,
+    [now, id, true, now, now],
+  );
+  if (rawAffectedRows(result) !== 1) throw new Error("折扣码已失效或使用次数已达上限");
+  return true;
+}
+
+export async function releaseDiscountCode(id: number) {
+  const q = quoteDbIdentifier;
+  const result = await executeRaw(
+    `UPDATE ${q("discount_codes")}
+        SET ${q("usedCount")} = ${q("usedCount")} - 1, ${q("updatedAt")} = ?
+      WHERE ${q("id")} = ? AND ${q("usedCount")} > 0`,
+    [Math.floor(Date.now() / 1000), id],
+  );
+  return rawAffectedRows(result) === 1;
+}
+
+export async function listPaymentOrders(limit = 100, userId?: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const base = db
+    .select({
+      id: paymentOrders.id,
+      outTradeNo: paymentOrders.outTradeNo,
+      userId: paymentOrders.userId,
+      username: users.username,
+      name: users.name,
+      provider: paymentOrders.provider,
+      paymentType: paymentOrders.paymentType,
+      status: paymentOrders.status,
+      subject: paymentOrders.subject,
+      amountCents: paymentOrders.amountCents,
+      currency: paymentOrders.currency,
+      tradeNo: paymentOrders.tradeNo,
+      payUrl: paymentOrders.payUrl,
+      qrCode: paymentOrders.qrCode,
+      orderType: paymentOrders.orderType,
+      planId: paymentOrders.planId,
+      subscriptionId: paymentOrders.subscriptionId,
+      discountCodeId: paymentOrders.discountCodeId,
+      discountConsumed: paymentOrders.discountConsumed,
+      discountAmountCents: paymentOrders.discountAmountCents,
+      expiresAt: paymentOrders.expiresAt,
+      paidAt: paymentOrders.paidAt,
+      createdAt: paymentOrders.createdAt,
+      updatedAt: paymentOrders.updatedAt,
+    })
+    .from(paymentOrders)
+    .leftJoin(users, eq(paymentOrders.userId, users.id));
+  if (userId !== undefined) {
+    return base.where(eq(paymentOrders.userId, userId)).orderBy(desc(paymentOrders.createdAt)).limit(limit);
+  }
+  return base.orderBy(desc(paymentOrders.createdAt)).limit(limit);
+}
+
+export async function updatePaymentOrder(outTradeNo: string, data: Partial<InsertPaymentOrder>) {
+  const db = await getDb();
+  if (!db) return undefined;
+  await db
+    .update(paymentOrders)
+    .set({ ...data, updatedAt: nowDate() } as Partial<InsertPaymentOrder>)
+    .where(eq(paymentOrders.outTradeNo, outTradeNo));
+  return getPaymentOrderByOutTradeNo(outTradeNo);
+}
+
+function affectedRows(result: any) {
+  return rawAffectedRows(result);
+}
+
+export async function claimPaidPaymentOrder(outTradeNo: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const now = Math.floor(Date.now() / 1000);
+  const result = await executeRaw(
+    `UPDATE ${quoteDbIdentifier("payment_orders")}
+     SET ${quoteDbIdentifier("status")} = ?, ${quoteDbIdentifier("updatedAt")} = ?
+     WHERE ${quoteDbIdentifier("outTradeNo")} = ? AND ${quoteDbIdentifier("status")} = ?`,
+    ["processing", now, outTradeNo, "paid"],
+  );
+  if (affectedRows(result) <= 0) return undefined;
+  return getPaymentOrderByOutTradeNo(outTradeNo);
+}
+
+export async function resetStaleProcessingPaymentOrder(outTradeNo: string, before: Date) {
+  const db = await getDb();
+  if (!db) return false;
+  const now = Math.floor(Date.now() / 1000);
+  const cutoff = Math.floor(before.getTime() / 1000);
+  const result = await executeRaw(
+    `UPDATE ${quoteDbIdentifier("payment_orders")}
+     SET ${quoteDbIdentifier("status")} = ?, ${quoteDbIdentifier("updatedAt")} = ?
+     WHERE ${quoteDbIdentifier("outTradeNo")} = ?
+       AND ${quoteDbIdentifier("status")} = ?
+       AND ${quoteDbIdentifier("updatedAt")} < ?`,
+    ["paid", now, outTradeNo, "processing", cutoff],
+  );
+  return affectedRows(result) > 0;
+}
+
+export async function markPaymentOrderPaid(outTradeNo: string, data: { tradeNo?: string | null; rawNotify?: string | null; amountCents?: number; currency?: string }) {
+  const now = nowDate();
+  const result = await executeRaw(
+    `UPDATE ${quoteDbIdentifier("payment_orders")}
+     SET ${quoteDbIdentifier("status")} = ?,
+         ${quoteDbIdentifier("tradeNo")} = COALESCE(?, ${quoteDbIdentifier("tradeNo")}),
+         ${quoteDbIdentifier("rawNotify")} = COALESCE(?, ${quoteDbIdentifier("rawNotify")}),
+         ${quoteDbIdentifier("currency")} = COALESCE(?, ${quoteDbIdentifier("currency")}),
+         ${quoteDbIdentifier("paidAt")} = ?,
+         ${quoteDbIdentifier("updatedAt")} = ?
+     WHERE ${quoteDbIdentifier("outTradeNo")} = ?
+       AND ${quoteDbIdentifier("status")} = ?`,
+    [
+      "paid",
+      data.tradeNo || null,
+      data.rawNotify || null,
+      data.currency || null,
+      now,
+      now,
+      outTradeNo,
+      "pending",
+    ],
+  );
+  if (affectedRows(result) > 0) return getPaymentOrderByOutTradeNo(outTradeNo);
+
+  // A duplicate callback for an already claimed/completed order is harmless,
+  // but terminal failed/expired/cancelled orders must never be reactivated.
+  const existing = await getPaymentOrderByOutTradeNo(outTradeNo);
+  if (!existing) return undefined;
+  if (existing.status === "paid" || existing.status === "processing" || existing.status === "completed") {
+    return updatePaymentOrder(outTradeNo, {
+      tradeNo: data.tradeNo || existing.tradeNo,
+      rawNotify: data.rawNotify || existing.rawNotify,
+    } as Partial<InsertPaymentOrder>);
+  }
+  return existing;
+}
+
+/** Return orders needing background maintenance without a recent-row limit. */
+export async function listPaymentOrdersForMaintenance(statuses: string[], limit = 1000) {
+  const db = await getDb();
+  if (!db || statuses.length === 0) return [];
+  return db
+    .select()
+    .from(paymentOrders)
+    .where(inArray(paymentOrders.status, statuses as any))
+    .orderBy(asc(paymentOrders.updatedAt))
+    .limit(Math.max(1, Math.min(10000, limit)));
+}
+
+export async function getBalanceTransactionByPaymentOrderNo(paymentOrderNo: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(balanceTransactions).where(eq(balanceTransactions.paymentOrderNo, paymentOrderNo)).limit(1);
+  return rows[0];
+}
+
+export async function getUserSubscriptionByPaymentOrderNo(paymentOrderNo: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(userSubscriptions).where(eq(userSubscriptions.paymentOrderNo, paymentOrderNo)).limit(1);
+  return rows[0];
+}
+
+export async function getPaymentOrderStats() {
+  const db = await getDb();
+  if (!db) return { totalOrders: 0, pendingOrders: 0, paidOrders: 0, paidAmountCents: 0 };
+  const rows = await db
+    .select({
+      totalOrders: sql<number>`COUNT(*)`,
+      pendingOrders: sql<number>`SUM(CASE WHEN ${paymentOrders.status} = 'pending' THEN 1 ELSE 0 END)`,
+      paidOrders: sql<number>`SUM(CASE WHEN ${paymentOrders.status} IN ('paid', 'processing', 'completed') THEN 1 ELSE 0 END)`,
+      paidAmountCents: sql<number>`COALESCE(SUM(CASE WHEN ${paymentOrders.status} IN ('paid', 'processing', 'completed') THEN ${paymentOrders.amountCents} ELSE 0 END), 0)`,
+    })
+    .from(paymentOrders);
+  const row = rows[0];
+  return {
+    totalOrders: Number(row?.totalOrders || 0),
+    pendingOrders: Number(row?.pendingOrders || 0),
+    paidOrders: Number(row?.paidOrders || 0),
+    paidAmountCents: Number(row?.paidAmountCents || 0),
+  };
+}
+
+

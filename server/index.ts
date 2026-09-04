@@ -1,0 +1,187 @@
+import "dotenv/config";
+import express from "express";
+import cookieParser from "cookie-parser";
+import { createServer as createHttpServer } from "http";
+import { createServer as createHttpsServer } from "https";
+import net from "net";
+import path from "path";
+import { fileURLToPath } from "url";
+import { createExpressMiddleware } from "@trpc/server/adapters/express";
+import { appRouter } from "./routers";
+import { createContext } from "./_core/context";
+import { agentRouter } from "./agentRoutes";
+import { paymentCallbackRouter } from "./payment";
+import { migrationRouter } from "./migration";
+import { mobileReleaseRouter } from "./mobileReleaseRoute";
+import { initDatabase } from "./db";
+import { installPanelLogger } from "./_core/panelLogger";
+import { loadPanelSslRuntimeConfig } from "./panelSsl";
+import { startBackgroundServices } from "./backgroundServices";
+import { initializePanelClock } from "./panelClock";
+import { ENV } from "./env";
+import { resolveTrustProxySetting } from "./trustProxy";
+import { authCapRouter } from "./authCaptcha";
+import {
+  XrayArtifactError,
+  XRAY_DEFAULT_VERSION,
+  prepareDefaultXrayArtifacts,
+} from "./xrayArtifacts";
+import { prepareDefaultManagedServiceArtifacts } from "./xrayManagedServiceArtifacts";
+
+installPanelLogger();
+
+const serverDir = typeof __dirname !== "undefined" ? __dirname : path.dirname(fileURLToPath(import.meta.url));
+
+function isPortAvailable(port: number, host?: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    const onListening = () => {
+      server.close(() => resolve(true));
+    };
+    if (host) server.listen(port, host, onListening);
+    else server.listen(port, onListening);
+    server.on("error", () => resolve(false));
+  });
+}
+
+async function findAvailablePort(startPort = 9810, host?: string): Promise<number> {
+  for (let port = startPort; port < startPort + 20; port++) {
+    if (await isPortAvailable(port, host)) return port;
+  }
+  throw new Error(`No available port found starting from ${startPort}`);
+}
+
+function serveStatic(app: express.Express) {
+  const clientDist = path.resolve(serverDir, "../client/dist");
+  app.use(express.static(clientDist));
+  app.get("*", (_req, res) => {
+    res.sendFile(path.join(clientDist, "index.html"));
+  });
+}
+
+function installMobileCors(app: express.Express) {
+  const allowedOrigins = new Set([
+    "capacitor://localhost",
+    "ionic://localhost",
+    "http://localhost",
+    "https://localhost",
+  ]);
+
+  app.use((req, res, next) => {
+    const origin = String(req.headers.origin || "");
+    const allowed = allowedOrigins.has(origin) || /^https?:\/\/localhost:\d+$/i.test(origin);
+    if (allowed) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,x-forwardx-mobile,trpc-accept,x-trpc-source");
+      res.setHeader("Vary", "Origin");
+    }
+    if (req.method === "OPTIONS" && allowed) {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+}
+
+function installSecurityHeaders(app: express.Express) {
+  app.disable("x-powered-by");
+  app.use((req, res, next) => {
+    const customSidebarEmbed = String(req.query?.__forwardx_embed || "") === "1";
+    const frameAncestors = customSidebarEmbed ? "'self'" : "'none'";
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    // Only a custom sidebar iframe may opt the panel's own pages into
+    // same-origin framing. External sites still control their own
+    // X-Frame-Options/CSP response headers.
+    res.setHeader("X-Frame-Options", customSidebarEmbed ? "SAMEORIGIN" : "DENY");
+    res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+    res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+    res.setHeader(
+      "Content-Security-Policy",
+      `default-src 'self'; base-uri 'self'; frame-ancestors ${frameAncestors}; object-src 'none'; img-src 'self' data: blob: https: http:; font-src 'self' data:; style-src 'self' 'unsafe-inline' https://fastly.jsdelivr.net; script-src 'self' 'unsafe-inline' https://fastly.jsdelivr.net https://cdn.jsdelivr.net https://cubism.live2d.com; connect-src 'self' https: http: wss: ws:; worker-src 'self' blob:; child-src 'self' blob:; frame-src 'self' data: https: http:; media-src 'self' data: blob: https: http:`,
+    );
+    if (req.secure) res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    next();
+  });
+}
+
+async function startServer() {
+  await initializePanelClock();
+  const databaseStatus = await initDatabase();
+
+  const app = express();
+  app.set("trust proxy", resolveTrustProxySetting(ENV.trustProxy));
+  const panelSsl = await loadPanelSslRuntimeConfig();
+  const protocol = panelSsl.enabled ? "https" : "http";
+  const server = panelSsl.enabled && panelSsl.options
+    ? createHttpsServer(panelSsl.options, app)
+    : createHttpServer(app);
+  installSecurityHeaders(app);
+
+  // Payment webhooks need the original request body for signature verification.
+  app.use(paymentCallbackRouter);
+  // Plugin archives are accepted as base64 JSON and can expand beyond the 5 MB binary limit.
+  app.use(express.json({ limit: "10mb" }));
+  app.use(express.urlencoded({ limit: "1mb", extended: true }));
+  app.use(cookieParser());
+  installMobileCors(app);
+  app.use(authCapRouter);
+  app.use(agentRouter);
+  app.use(mobileReleaseRouter);
+  app.use(migrationRouter);
+  app.use(
+    "/api/trpc",
+    createExpressMiddleware({
+      router: appRouter,
+      createContext,
+    }),
+  );
+  serveStatic(app);
+
+  const preferredPort = Number.parseInt(process.env.PORT || "9810", 10);
+  const isProduction = process.env.NODE_ENV === "production";
+  const isDevPanel = process.env.FORWARDX_DEV_PANEL === "1";
+  const listenHost = isDevPanel ? (process.env.FORWARDX_DEV_SERVER_HOST || "127.0.0.1") : undefined;
+  const port = isProduction ? preferredPort : await findAvailablePort(preferredPort, listenHost);
+
+  if (isProduction && !(await isPortAvailable(preferredPort, listenHost))) {
+    throw new Error(`Port ${preferredPort} is already in use`);
+  }
+
+  if (port !== preferredPort) {
+    console.warn(`[Server] Port ${preferredPort} is busy, using port ${port} instead`);
+  }
+
+  const onListening = () => {
+    console.info(`Server running on ${protocol}://localhost:${port}/`);
+    console.info(`[Server] ForwardX panel started on ${protocol.toUpperCase()} port ${port}`);
+  };
+  if (listenHost) server.listen(port, listenHost, onListening);
+  else server.listen(port, onListening);
+
+  if (databaseStatus.ready) {
+    if (isProduction) {
+      const artifactDataDirectory = path.dirname(ENV.databaseConfigPath || ENV.sqlitePath || "/data/database.json");
+      void prepareDefaultXrayArtifacts({ dataDirectory: artifactDataDirectory })
+        .then(() => {
+          console.info(`[XrayArtifact] Default ${XRAY_DEFAULT_VERSION} artifacts are ready for linux/amd64 and linux/arm64`);
+        })
+        .catch((error: unknown) => {
+          const code = error instanceof XrayArtifactError ? error.code : "INTERNAL_ERROR";
+          console.warn(`[XrayArtifact] Default artifact preparation failed (${code}); the panel remains available and will retry after restart`);
+        });
+      void prepareDefaultManagedServiceArtifacts({ dataDirectory: artifactDataDirectory })
+        .then(() => console.info("[ManagedServiceArtifact] MTProto v1.15.0 artifacts are ready for linux/amd64 and linux/arm64"))
+        .catch(() => console.warn("[ManagedServiceArtifact] MTProto artifact preparation failed; the panel remains available and will retry after restart"));
+    }
+    startBackgroundServices();
+  } else {
+    console.warn("[Server] Database is not ready; background tasks are paused until the database setup is fixed and the panel restarts");
+  }
+}
+
+startServer().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

@@ -1,0 +1,220 @@
+import { useEffect, useMemo, useState } from "react";
+import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip as RTooltip, XAxis, YAxis } from "recharts";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { LatencyPeakCutToggle } from "@/components/LatencyPeakCutToggle";
+import {
+  DEFAULT_LATENCY_TIME_RANGE_HOURS,
+  filterLatencySeriesByTimeRange,
+  latencyTimeRangeLabel,
+  LatencyTimeRangeSelect,
+  type LatencyTimeRangeHours,
+} from "@/components/LatencyTimeRangeSelect";
+import { LatencyStabilityStats } from "@/components/LatencyStabilityStats";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  applyLatencyPeakCut,
+  clipLatencyForChart,
+  getLatencyStabilityStats,
+  getLatencyYAxisMax,
+  getLatencyYAxisTicks,
+  isLatencySeriesCacheFresh,
+} from "@/lib/latencyChart";
+import { pollingInterval } from "@/lib/polling";
+import { trpc } from "@/lib/trpc";
+
+type TcpingChartPoint = {
+  label: string;
+  fullLabel: string;
+  latency: number;
+  chartLatency: number;
+  isTimeout: boolean;
+};
+
+type TcpingSeriesDatum = {
+  recordedAt: string | Date;
+  latencyMs?: number | null;
+  isTimeout?: boolean | null;
+};
+
+const tcpingSeriesCache = new Map<number, TcpingSeriesDatum[]>();
+const tcpingAnimatedKeys = new Set<number>();
+
+function formatTcpingTime(dateStr: string | Date): string {
+  const d = new Date(dateStr);
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const hour = String(d.getHours()).padStart(2, "0");
+  const minute = String(d.getMinutes()).padStart(2, "0");
+  return `${month}/${day} ${hour}:${minute}`;
+}
+
+function TcpingTooltipContent({ active, payload, label }: any) {
+  if (!active || !payload || payload.length === 0) return null;
+  const data = payload[0]?.payload;
+  if (!data) return null;
+  const latency = Number(data.latency || 0);
+  const isTimeout = !!data.isTimeout;
+  return (
+    <div className="pointer-events-none rounded-lg border border-border bg-card px-3 py-2 shadow-md">
+      <p className="mb-1 text-xs text-muted-foreground">{data.fullLabel || label}</p>
+      {isTimeout ? (
+        <p className="text-sm font-semibold text-destructive">超时</p>
+      ) : latency > 0 ? (
+        <p className="text-sm font-semibold tabular-nums">
+          <span className={latency < 50 ? "text-emerald-500" : latency < 100 ? "text-chart-3" : latency < 200 ? "text-amber-500" : "text-destructive"}>
+            {latency}ms
+          </span>
+        </p>
+      ) : (
+        <p className="text-sm text-muted-foreground">无数据</p>
+      )}
+    </div>
+  );
+}
+
+function TcpingDetailDialog({
+  ruleId,
+  ruleName,
+  isForwardChain = false,
+  probeMethod = "tcping",
+  open,
+  onOpenChange,
+}: {
+  ruleId: number;
+  ruleName: string;
+  isForwardChain?: boolean;
+  probeMethod?: "tcping" | "ping";
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+}) {
+  const [peakCutEnabled, setPeakCutEnabled] = useState(false);
+  const [timeRangeHours, setTimeRangeHours] = useState<LatencyTimeRangeHours>(DEFAULT_LATENCY_TIME_RANGE_HOURS);
+  const methodLabel = probeMethod === "ping" ? "Ping" : "TCPing";
+  const { data, isLoading, isFetching } = trpc.rules.tcpingSeries.useQuery(
+    { ruleId, hours: 24 },
+    { enabled: open, refetchInterval: pollingInterval("slow", open), refetchOnMount: "always" },
+  );
+  const cachedData = tcpingSeriesCache.get(ruleId);
+  const rawSeriesData = (data ?? cachedData) as TcpingSeriesDatum[] | undefined;
+  const waitForFreshSeries = open && isFetching && !isLatencySeriesCacheFresh(rawSeriesData);
+  const seriesData = waitForFreshSeries ? undefined : rawSeriesData;
+  const rangedSeriesData = useMemo(
+    () => filterLatencySeriesByTimeRange(seriesData, timeRangeHours),
+    [seriesData, timeRangeHours],
+  );
+  const showInitialLoading = (isLoading || waitForFreshSeries) && !seriesData;
+
+  useEffect(() => {
+    if (data) tcpingSeriesCache.set(ruleId, data as TcpingSeriesDatum[]);
+  }, [data, ruleId]);
+
+  const rawChartData = useMemo<TcpingChartPoint[]>(() => {
+    if (!rangedSeriesData.length) return [];
+    return rangedSeriesData.map((d: TcpingSeriesDatum): TcpingChartPoint => ({
+      label: formatTcpingTime(d.recordedAt),
+      fullLabel: formatTcpingTime(d.recordedAt),
+      latency: d.isTimeout ? 0 : (Number(d.latencyMs) || 0),
+      chartLatency: d.isTimeout ? 0 : clipLatencyForChart(Number(d.latencyMs) || 0),
+      isTimeout: !!d.isTimeout,
+    }));
+  }, [rangedSeriesData]);
+
+  const chartData = useMemo<TcpingChartPoint[]>(() => {
+    if (!peakCutEnabled) return rawChartData;
+    return applyLatencyPeakCut(rawChartData, [
+      { dataKey: "latency", timeoutKey: "isTimeout" },
+      { dataKey: "chartLatency", timeoutKey: "isTimeout" },
+    ]) as TcpingChartPoint[];
+  }, [peakCutEnabled, rawChartData]);
+
+  const yMax = useMemo(() => {
+    if (!chartData.length) return 120;
+    return getLatencyYAxisMax(Math.max(...chartData.map((d) => d.chartLatency)), 120);
+  }, [chartData]);
+  const yTicks = useMemo(() => getLatencyYAxisTicks(yMax), [yMax]);
+
+  const tcpingStats = useMemo(() => getLatencyStabilityStats(chartData), [chartData]);
+  const shouldAnimateChart = open && chartData.length > 0 && !tcpingAnimatedKeys.has(ruleId);
+
+  useEffect(() => {
+    if (shouldAnimateChart) tcpingAnimatedKeys.add(ruleId);
+  }, [shouldAnimateChart, ruleId]);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="flex max-h-[96svh] w-[calc(100vw-0.75rem)] max-w-[95vw] flex-col gap-3 overflow-hidden p-3 sm:max-w-3xl sm:p-6">
+        <DialogHeader>
+          <div className="flex flex-col gap-2 pr-9 sm:flex-row sm:items-start sm:justify-between sm:pr-10">
+            <div className="min-w-0">
+              <DialogTitle className="truncate text-base sm:text-lg">
+                {isForwardChain ? "转发链路延迟" : `转发链路延迟 (${methodLabel})`} - {ruleName}
+              </DialogTitle>
+              <DialogDescription className="text-xs sm:text-sm">
+                {isForwardChain ? `最近 ${latencyTimeRangeLabel(timeRangeHours)} 链路汇总延迟和丢包。` : `最近 ${latencyTimeRangeLabel(timeRangeHours)} 延迟和丢包。`}
+              </DialogDescription>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 self-start sm:justify-end">
+              <LatencyTimeRangeSelect value={timeRangeHours} onChange={setTimeRangeHours} />
+              <LatencyPeakCutToggle id={`tcping-peak-cut-${ruleId}`} checked={peakCutEnabled} onCheckedChange={setPeakCutEnabled} className="shrink-0" />
+            </div>
+          </div>
+        </DialogHeader>
+        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain pr-1">
+          <div className="h-[42svh] min-h-[220px] w-full sm:h-72">
+            {showInitialLoading ? (
+              <Skeleton className="h-full w-full" />
+            ) : chartData.length === 0 ? (
+              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                暂无 {methodLabel} 数据
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={chartData} margin={{ top: 8, right: 10, left: -8, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="tcpingGradientRule" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="var(--color-chart-2)" stopOpacity={0.3} />
+                      <stop offset="95%" stopColor="var(--color-chart-2)" stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" />
+                  <XAxis dataKey="label" tick={{ fontSize: 9 }} minTickGap={48} interval="preserveStartEnd" />
+                  <YAxis
+                    tick={{ fontSize: 9 }}
+                    tickFormatter={(v) => `${v}ms`}
+                    width={44}
+                    domain={[0, yMax]}
+                    allowDecimals={false}
+                    ticks={yTicks}
+                  />
+                  <RTooltip
+                    content={<TcpingTooltipContent />}
+                    cursor={{ stroke: "var(--color-muted-foreground)", strokeDasharray: "3 3" }}
+                    offset={12}
+                    wrapperStyle={{ pointerEvents: "none" }}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="chartLatency"
+                    name="延迟"
+                    stroke="var(--color-chart-2)"
+                    strokeWidth={1.6}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    fill="url(#tcpingGradientRule)"
+                    dot={false}
+                    activeDot={{ r: 4, fill: "var(--color-chart-2)", stroke: "var(--color-background)", strokeWidth: 2 }}
+                    isAnimationActive={shouldAnimateChart}
+                    animationDuration={shouldAnimateChart ? 500 : 0}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            )}
+          </div>
+          <LatencyStabilityStats stats={tcpingStats} />
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export { TcpingDetailDialog };

@@ -1,0 +1,429 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import test from "node:test";
+import zlib from "node:zlib";
+import {
+  buildPluginDirectorySwapCommand,
+  buildPluginTextFileCommands,
+  normalizePluginManifest,
+  normalizePluginStoreCatalog,
+  pluginManifestRequiresTrust,
+  pluginVersionHasUpdate,
+  resolvePluginSidebarEntry,
+  resolvePluginUsageHostIds,
+  resolveLive2dWidgetRuntimeConfig,
+  normalizePluginSettingValue,
+  shouldPreservePluginTrust,
+} from "./repositories/pluginRepository";
+
+test("plugin sync commands compress, chunk, and restore large text assets", () => {
+  const content = Array.from({ length: 12_000 }, (_, index) => `192.0.2.${index % 255}/32 region-${index % 32}`).join("\n");
+  const commands = buildPluginTextFileCommands("/var/lib/forwardx-agent/plugins/demo/data/regions.txt", content);
+  const encoded = commands.flatMap((command) => {
+    const match = command.match(/^printf '%s' '([^']*)' >> /);
+    return match ? [match[1]] : [];
+  }).join("");
+
+  assert.ok(encoded.length > 0);
+  assert.equal(zlib.gunzipSync(Buffer.from(encoded, "base64")).toString("utf8"), content);
+  assert.equal(commands.every((command) => Buffer.byteLength(command, "utf8") < 64 * 1024), true);
+  assert.ok(encoded.length < Buffer.byteLength(content, "utf8"));
+});
+
+test("plugin sync directory swap validates staged files and keeps a rollback path", () => {
+  const command = buildPluginDirectorySwapCommand({
+    targetDir: "/var/lib/forwardx-agent/plugins/demo",
+    stagingDir: "/var/lib/forwardx-agent/plugins/.sync-demo-abc",
+    backupDir: "/var/lib/forwardx-agent/plugins/.previous-demo",
+    expectedFiles: [{
+      path: "/var/lib/forwardx-agent/plugins/.sync-demo-abc/manifest.json",
+      sha256: "a".repeat(64),
+    }],
+  });
+
+  assert.match(command, /sha256sum/);
+  assert.match(command, /\.previous-demo/);
+  assert.match(command, /mv .*\.sync-demo-abc.*plugins\/demo/);
+  assert.match(command, /exit "\$status"/);
+});
+
+test("plugin resourceSchema shorthand expands into generic Agent sources", () => {
+  const manifest = normalizePluginManifest({
+    id: "service-manager-demo",
+    name: "Service manager demo",
+    version: "1.0.0",
+    permissions: ["read:hosts", "agent:read", "agent:write", "ui:interactive", "secret:reveal"],
+    usageViews: [{ id: "hosts", type: "host-asset-sync", title: "Hosts", assetMode: "all-plugin-assets" }],
+    actions: [
+      {
+        id: "list-services",
+        label: "List",
+        type: "agent.request",
+        intent: "read",
+        agent: { executor: "script", target: "selected-hosts", usageViewId: "hosts", entry: "manage.sh", arguments: ["list"], outputType: "json" },
+        resultSchema: {
+          type: "table",
+          itemsPath: "items",
+          fields: [
+            { key: "name", label: "Name", copyable: true },
+            { key: "status", label: "Status", type: "statusBadge" },
+            { key: "token", label: "Token", secret: true, revealable: true },
+            { key: "url", label: "URL", openable: true },
+          ],
+        },
+      },
+      {
+        id: "service-detail",
+        label: "Detail",
+        type: "agent.request",
+        intent: "read",
+        agent: { executor: "script", target: "selected-hosts", usageViewId: "hosts", entry: "manage.sh", arguments: ["detail", "{{input.serviceId}}"], outputType: "json" },
+      },
+      {
+        id: "save-service",
+        label: "Save",
+        type: "agent.request",
+        intent: "write",
+        agent: { executor: "script", target: "selected-hosts", usageViewId: "hosts", entry: "manage.sh", arguments: ["save", "{{input.payload}}"], outputType: "json" },
+      },
+      {
+        id: "delete-service",
+        label: "Delete",
+        type: "agent.request",
+        intent: "write",
+        agent: { executor: "script", target: "selected-hosts", usageViewId: "hosts", entry: "manage.sh", arguments: ["delete", "{{input.serviceId}}"], outputType: "json" },
+      },
+    ],
+    resourceSchema: {
+      id: "services",
+      type: "agent-resource",
+      title: "Services",
+      usageViewId: "hosts",
+      rowKey: "serviceId",
+      idInputKey: "serviceId",
+      onOpen: "list-services",
+      itemsPath: "items",
+      detailAction: { actionId: "service-detail", inputKey: "serviceId" },
+      columns: [
+        { key: "name", label: "Name" },
+        { key: "status", label: "Status", type: "status" },
+      ],
+      fields: [
+        { key: "protocol", label: "Protocol", type: "select", options: [{ value: "tcp", label: "TCP" }] },
+        { key: "port", label: "Port", type: "number", visibleWhen: [{ field: "protocol", operator: "eq", value: "tcp" }] },
+      ],
+      operations: {
+        update: { actionId: "save-service", refreshAfter: ["list"] },
+        delete: { actionId: "delete-service", refreshAfter: ["list"], confirmRequired: true },
+      },
+    },
+  });
+
+  assert.deepEqual(manifest.permissions, ["read:hosts", "agent:read", "agent:write", "ui:interactive", "secret:reveal"]);
+  assert.equal(manifest.actions?.[0]?.intent, "read");
+  assert.equal(manifest.actions?.[0]?.agent?.target, "selected-hosts");
+  assert.equal(manifest.actions?.[0]?.resultSchema?.type, "table");
+  assert.equal(manifest.actions?.[0]?.resultSchema?.fields[1]?.type, "statusBadge");
+  assert.equal(manifest.actions?.[0]?.resultSchema?.fields[2]?.revealable, true);
+  assert.equal(manifest.actions?.[0]?.resultSchema?.fields[3]?.openable, true);
+
+  const schema = manifest.resourceSchemas?.[0];
+  assert.ok(schema);
+  assert.equal(schema.rowKey, "serviceId");
+  assert.equal(schema.idInputKey, "serviceId");
+  assert.equal(schema.listSourceId, "list");
+  assert.equal(schema.detailSourceId, "detail");
+  assert.deepEqual(schema.sources.map((source) => [source.id, source.actionId]), [
+    ["list", "list-services"],
+    ["detail", "service-detail"],
+  ]);
+  assert.deepEqual(schema.operations?.update?.refreshAfter, ["list"]);
+  assert.deepEqual(schema.operations?.update?.refreshSources, ["list"]);
+  assert.equal(schema.fields?.[1]?.visibleWhen?.[0]?.field, "protocol");
+  assert.equal(manifest.resourceViews?.[0]?.id, "services");
+});
+
+test("invalid result and resource schema members are discarded", () => {
+  const manifest = normalizePluginManifest({
+    id: "schema-guard-demo",
+    name: "Schema guard",
+    version: "1",
+    permissions: ["agent:read", "not:a-permission"],
+    settingsSchema: [
+      { key: "__forwardxSidebarEnabled", label: "Reserved", type: "boolean" },
+      { key: "displayName", label: "Display name", type: "text" },
+    ],
+    actions: [{
+      id: "read",
+      label: "Read",
+      type: "agent.request",
+      intent: "read",
+      resultSchema: { type: "unsupported", fields: [{ key: "value", label: "Value" }] },
+      agent: { executor: "script", entry: "read.sh" },
+    }],
+    resourceSchema: { id: "broken", title: "Broken", onOpen: "", fields: [] },
+  });
+
+  assert.deepEqual(manifest.permissions, ["agent:read"]);
+  assert.deepEqual(manifest.settingsSchema?.map((field) => field.key), ["displayname"]);
+  assert.equal(manifest.actions?.[0]?.resultSchema, undefined);
+  assert.deepEqual(manifest.resourceSchemas, []);
+});
+
+test("plugin sidebar entries require permission, extension point, and a valid target", () => {
+  const manifest = normalizePluginManifest({
+    id: "sidebar-demo",
+    name: "Sidebar Demo",
+    version: "1.0.0",
+    permissions: ["ui:page"],
+    extensionPoints: ["sidebar.page"],
+    sidebar: { label: "Demo Page", target: "page", pageId: "home" },
+    pages: [{ id: "home", title: "Home", content: "Hello" }],
+  });
+  const plugin = {
+    pluginId: manifest.id,
+    name: manifest.name,
+    status: "enabled",
+    manifest,
+    permissions: manifest.permissions,
+    extensionPoints: manifest.extensionPoints,
+    sidebarEnabled: true,
+  };
+
+  assert.deepEqual(resolvePluginSidebarEntry(plugin), {
+    pluginId: "sidebar-demo",
+    label: "Demo Page",
+    icon: "",
+    target: "page",
+    pageId: "home",
+  });
+  assert.equal(resolvePluginSidebarEntry({ ...plugin, permissions: [] }), null);
+  assert.equal(resolvePluginSidebarEntry({ ...plugin, extensionPoints: [] }), null);
+  assert.equal(resolvePluginSidebarEntry({ ...plugin, status: "disabled" })?.pluginId, "sidebar-demo");
+  assert.equal(resolvePluginSidebarEntry({ ...plugin, sidebarEnabled: false }), null);
+
+  const missingPage = normalizePluginManifest({
+    ...manifest,
+    sidebar: { target: "page", pageId: "missing" },
+  });
+  assert.equal(resolvePluginSidebarEntry({ ...plugin, manifest: missingPage }), null);
+});
+
+test("official whitelist exposes per-host province configuration CRUD", () => {
+  const source = JSON.parse(fs.readFileSync(
+    path.resolve(process.cwd(), "plugins/china-region-whitelist/forwardx-plugin.json"),
+    "utf8",
+  ));
+  const manifest = normalizePluginManifest(source);
+  const schema = manifest.resourceSchemas?.find((view) => view.id === "whitelist-host-manager");
+
+  assert.equal(manifest.version, "0.7.1");
+  assert.equal(manifest.usageViews?.[0]?.hostScope, "all");
+  assert.ok(schema);
+  assert.equal(schema.columns?.some((column) => column.key === "regionSummary"), true);
+  assert.equal(schema.columns?.find((column) => column.key === "serviceEnabled")?.type, "status");
+  assert.equal(schema.columns?.find((column) => column.key === "serviceActive")?.type, "status");
+  assert.equal(schema.operations?.create?.actionId, "save-whitelist-config");
+  assert.equal(schema.operations?.update?.actionId, "save-whitelist-config");
+  assert.equal(schema.operations?.delete?.actionId, "delete-whitelist-config");
+  const regions = schema.fields?.find((field) => field.key === "regions");
+  const scopeMode = schema.fields?.find((field) => field.key === "scopeMode");
+  const portSpec = schema.fields?.find((field) => field.key === "portSpec");
+  assert.equal(regions?.options?.find((option) => option.value === "CN")?.exclusive, true);
+  assert.equal(regions?.options?.some((option) => option.value === "440000"), true);
+  assert.equal(scopeMode?.options?.some((option) => option.value === "port"), true);
+  assert.deepEqual(portSpec?.visibleWhen, [{ field: "scopeMode", operator: "eq", value: "port" }]);
+
+  const agentRunner = fs.readFileSync(
+    path.resolve(process.cwd(), "plugins/china-region-whitelist/forwardx-agent-run.sh"),
+    "utf8",
+  );
+  const firewallAdapter = fs.readFileSync(
+    path.resolve(process.cwd(), "plugins/china-region-whitelist/tools/forwardx_firewall.sh"),
+    "utf8",
+  );
+  const agentRuntime = `${agentRunner}\n${firewallAdapter}`;
+  assert.doesNotMatch(agentRunner, /\bpython3\b/);
+  assert.match(agentRunner, /command -v jq/);
+  assert.match(agentRuntime, /systemctl is-enabled --quiet/);
+  assert.match(agentRuntime, /systemctl is-active --quiet/);
+  assert.match(agentRunner, /\"serviceEnabled\":%s/);
+  assert.doesNotMatch(agentRuntime, /GHUNLIL|firewall_lib\.sh/);
+  // DNAT port selectors must constrain the L4 protocol before nft evaluates
+  // `ct original proto-dst`; otherwise nft reports a datatype mismatch and
+  // rejects the complete FORWARD chain atomically.
+  assert.match(firewallAdapter, /meta l4proto \{ tcp, udp \} ct status dnat ct original proto-dst @%s/);
+  const legacyFirewallLib = fs.readFileSync(
+    path.resolve(process.cwd(), "plugins/china-region-whitelist/tools/firewall_lib.sh"),
+    "utf8",
+  );
+  assert.match(legacyFirewallLib, /meta l4proto \{ tcp, udp \} ct status dnat ct original proto-dst @port_policy_%s_ports/);
+  assert.match(agentRunner, /if render_config_commands \| cn_run_rendered_commands; then/);
+  assert.match(agentRunner, /apply_status=\$\?/);
+});
+
+test("official Live2D widget exposes safe declarative settings and runtime defaults", () => {
+  const source = JSON.parse(fs.readFileSync(
+    path.resolve(process.cwd(), "plugins/live2d-widget/forwardx-plugin.json"),
+    "utf8",
+  ));
+  const manifest = normalizePluginManifest(source);
+  assert.equal(manifest.id, "live2d-widget");
+  assert.deepEqual(manifest.permissions, ["ui:widget", "ui:settings"]);
+  assert.deepEqual(manifest.extensionPoints, ["ui.widget", "settings.panel"]);
+  assert.equal(manifest.settingsSchema?.find((field) => field.key === "tools")?.type, "multi-select");
+  assert.equal(manifest.settingsSchema?.find((field) => field.key === "waifupath")?.defaultValue, "/plugins/live2d-widget/waifu-tips.json");
+  assert.equal(manifest.pages?.some((page) => page.assetPath === "THIRD_PARTY_NOTICES.md"), true);
+
+  const runtime = resolveLive2dWidgetRuntimeConfig({
+    pluginId: manifest.id,
+    status: "enabled",
+    permissions: manifest.permissions,
+    extensionPoints: manifest.extensionPoints,
+    manifest,
+  }, "admin");
+  assert.equal(runtime.enabled, true);
+  assert.match(String(runtime.scriptUrl), /live2d-widgets@1\.0\.1\/dist\/waifu-tips\.js/);
+  assert.equal(runtime.waifuPath, "/plugins/live2d-widget/waifu-tips.json");
+  assert.equal(runtime.dock, "right");
+  assert.equal(runtime.size, 280);
+  assert.equal(runtime.tools?.includes("quit"), true);
+
+  const authenticatedOnly = resolveLive2dWidgetRuntimeConfig({
+    pluginId: manifest.id,
+    status: "enabled",
+    permissions: manifest.permissions,
+    extensionPoints: manifest.extensionPoints,
+    manifest,
+  }, null);
+  assert.equal(authenticatedOnly.enabled, false);
+});
+
+test("plugin setting values enforce multi-select and URL boundaries", () => {
+  const toolsField = {
+    key: "tools",
+    label: "Tools",
+    type: "multi-select" as const,
+    required: true,
+    options: [{ value: "photo", label: "Photo" }, { value: "info", label: "Info" }],
+  };
+  assert.deepEqual(normalizePluginSettingValue(toolsField, ["photo", "photo", "unknown", "info"]), ["photo", "info"]);
+  assert.throws(() => normalizePluginSettingValue(toolsField, "photo"), /格式不合法/);
+  assert.throws(() => normalizePluginSettingValue(toolsField, []), /至少需要选择一项/);
+
+  const urlField = { key: "source", label: "Source", type: "url" as const };
+  assert.equal(normalizePluginSettingValue(urlField, "https://example.com/model"), "https://example.com/model");
+  assert.equal(normalizePluginSettingValue(urlField, "http://127.0.0.1/model"), "http://127.0.0.1/model");
+  assert.equal(normalizePluginSettingValue(urlField, "/plugins/live2d-widget/waifu-tips.json"), "/plugins/live2d-widget/waifu-tips.json");
+  assert.throws(() => normalizePluginSettingValue(urlField, "//example.com/model"), /必须填写/);
+  assert.throws(() => normalizePluginSettingValue(urlField, "ftp://example.com/model"), /必须填写/);
+});
+
+test("plugin all-host scope resolves current hosts without persisting selections", () => {
+  const allHostsView = normalizePluginManifest({
+    id: "all-hosts-demo",
+    name: "All hosts demo",
+    version: "1.0.0",
+    usageViews: [{ id: "hosts", type: "host-asset-sync", title: "Hosts", hostScope: "all" }],
+  }).usageViews?.[0];
+  const selectedView = normalizePluginManifest({
+    id: "selected-hosts-demo",
+    name: "Selected hosts demo",
+    version: "1.0.0",
+    usageViews: [{ id: "hosts", type: "host-asset-sync", title: "Hosts" }],
+  }).usageViews?.[0];
+
+  assert.deepEqual(resolvePluginUsageHostIds(allHostsView, { enabled: true, hostIds: [] }, [1, 2, 3]), [1, 2, 3]);
+  assert.deepEqual(resolvePluginUsageHostIds(allHostsView, { enabled: false, hostIds: [1] }, [1, 2]), []);
+  assert.deepEqual(resolvePluginUsageHostIds(selectedView, { enabled: true, hostIds: [2, 9] }, [1, 2, 3]), [2]);
+});
+
+test("trusted panel actions retain only fixed operations and declared permissions", () => {
+  const manifest = normalizePluginManifest({
+    id: "panel-api-demo",
+    name: "Panel API demo",
+    version: "1.0.0",
+    permissions: ["read:users", "write:rules", "telegram:send"],
+    actions: [
+      { id: "users", label: "Users", type: "panel.request", panel: { operation: "users.list" } },
+      { id: "send", label: "Send", type: "panel.request", panelRequest: { operation: "telegram.send" } },
+      { id: "unsafe", label: "Unsafe", type: "panel.request", panel: { operation: "database.query" } },
+    ],
+  });
+
+  assert.deepEqual(manifest.permissions, ["read:users", "write:rules", "telegram:send"]);
+  assert.deepEqual(manifest.actions?.map((action) => [action.id, action.panel?.operation]), [
+    ["users", "users.list"],
+    ["send", "telegram.send"],
+  ]);
+  assert.equal(pluginManifestRequiresTrust(manifest), true);
+
+  const regularPlugin = normalizePluginManifest({
+    id: "regular-plugin",
+    name: "Regular plugin",
+    version: "1.0.0",
+    permissions: ["agent:read", "ui:page"],
+    actions: [{ id: "status", label: "Status", type: "noop" }],
+  });
+  assert.equal(pluginManifestRequiresTrust(regularPlugin), false);
+  const agentPlugin = normalizePluginManifest({
+    id: "agent-plugin",
+    name: "Agent plugin",
+    version: "1.0.0",
+    permissions: ["agent:read"],
+    actions: [{
+      id: "inspect",
+      label: "Inspect",
+      type: "agent.request",
+      intent: "read",
+      agent: { executor: "script", entry: "inspect.sh" },
+    }],
+  });
+  assert.equal(pluginManifestRequiresTrust(agentPlugin), true);
+  assert.equal(shouldPreservePluginTrust(regularPlugin, manifest), false);
+  assert.equal(shouldPreservePluginTrust(manifest, { ...manifest }), true);
+
+  const expandedManifest = normalizePluginManifest({
+    ...manifest,
+    permissions: [...(manifest.permissions || []), "write:users"],
+    actions: [
+      ...(manifest.actions || []),
+      { id: "disable-user", label: "Disable user", type: "panel.request", panel: { operation: "users.setAccountEnabled" } },
+    ],
+  });
+  assert.equal(shouldPreservePluginTrust(manifest, expandedManifest), false);
+});
+
+test("third-party store catalog annotates source and defaults package repository", () => {
+  const catalog = normalizePluginStoreCatalog({
+    name: "Community Store",
+    plugins: [{
+      id: "community-demo",
+      name: "Community Demo",
+      description: "Demo",
+      version: "1.0.0",
+      packagePath: "dist/community-demo.zip",
+      permissions: ["read:hosts"],
+      extensionPoints: [],
+    }],
+  }, {
+    id: 7,
+    repository: "https://github.com/example/community-store",
+    branch: "main",
+    catalogPath: "forwardx-store.json",
+  });
+
+  assert.equal(catalog.name, "Community Store");
+  assert.equal(catalog.items[0]?.official, false);
+  assert.equal(catalog.items[0]?.storeSourceId, 7);
+  assert.equal(catalog.items[0]?.storeSourceName, "Community Store");
+  assert.equal(catalog.items[0]?.packageRepository, "https://github.com/example/community-store");
+});
+
+test("plugin update comparison only accepts a newer version", () => {
+  assert.equal(pluginVersionHasUpdate("1.9.0", "1.10.0"), true);
+  assert.equal(pluginVersionHasUpdate("v2.0.0", "2.0.0"), false);
+  assert.equal(pluginVersionHasUpdate("2.1.0", "2.0.9"), false);
+  assert.equal(pluginVersionHasUpdate("2.1.0", ""), false);
+});

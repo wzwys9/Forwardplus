@@ -1,0 +1,1165 @@
+import type { Pool } from "mysql2/promise";
+import type Database from "better-sqlite3";
+import type pg from "pg";
+import { getDatabaseKind, getPool, getPostgresPool, getSqlite } from "./dbRuntime";
+
+export type ColumnType = "id" | "text" | "longtext" | "varchar" | "int" | "bigint" | "bool" | "epoch";
+
+export type ColumnDef = {
+  name: string;
+  type: ColumnType;
+  notNull?: boolean;
+  default?: string | number | boolean | null | "now";
+  length?: number;
+};
+
+export type TableDef = {
+  name: string;
+  columns: ColumnDef[];
+  unique?: string[][];
+  indexes?: string[][];
+};
+
+const c = (name: string, type: ColumnType, opts: Omit<ColumnDef, "name" | "type"> = {}): ColumnDef => ({ name, type, ...opts });
+
+export const MIGRATION_TABLES = [
+  "users",
+  "hosts",
+  "xray_inbounds",
+  "xray_external_proxy_nodes",
+  "xray_external_proxy_secrets",
+  "dns_provider_accounts",
+  "dns_provider_account_secrets",
+  "dns_provider_global_bindings",
+  "dns_provider_zones",
+  "dns_provider_record_lines",
+  "xray_quick_configs",
+  "xray_quick_config_domain_claims",
+  "xray_quick_config_topology_revisions",
+  "xray_quick_config_routes",
+  "xray_quick_config_rule_bindings",
+  "xray_quick_config_dns_records",
+  "xray_quick_config_dns_record_backups",
+  "xray_quick_config_operations",
+  "xray_quick_config_operation_steps",
+  "global_port_allocations",
+  "global_port_allocation_references",
+  "global_port_probe_runs",
+  "global_port_probe_results",
+  "global_port_scan_leases",
+  "xray_clients",
+  "xray_access_entries",
+  "xray_access_secrets",
+  "xray_inbound_secrets",
+  "xray_tls_certificates",
+  "xray_host_deployments",
+  "xray_runtime_reports",
+  "xray_artifacts",
+  "xray_operations",
+  "xray_managed_services",
+  "xray_managed_service_instance_secrets",
+  "xray_managed_service_accounts",
+  "xray_managed_service_secrets",
+  "xray_managed_service_deployments",
+  "xray_managed_service_runtime_reports",
+  "xray_managed_service_artifacts",
+  "host_groups",
+  "host_group_members",
+  "tunnels",
+  "tunnel_exit_nodes",
+  "tunnel_hops",
+  "forward_rule_tunnel_exits",
+  "forward_rules",
+  "forward_groups",
+  "forward_group_members",
+  "forward_group_events",
+  "host_metrics",
+  "host_traffic_counters",
+  "user_traffic_counters",
+  "forward_rule_traffic_counters",
+  "traffic_stats",
+  "traffic_stat_buckets",
+  "agent_traffic_reports",
+  "tunnel_latency_stats",
+  "forward_group_latency_stats",
+  "host_probe_services",
+  "host_probe_service_stats",
+  "ip_geo_cache",
+  "agent_tokens",
+  "tcping_stats",
+  "forward_tests",
+  "user_host_permissions",
+  "user_tunnel_permissions",
+  "user_forward_group_permissions",
+  "system_settings",
+  "payment_orders",
+  "subscription_plans",
+  "subscription_plan_hosts",
+  "subscription_plan_tunnels",
+  "subscription_plan_forward_groups",
+  "subscription_plan_traffic_addons",
+  "user_subscriptions",
+  "user_traffic_addons",
+  "balance_transactions",
+  "traffic_billing_configs",
+  "traffic_billing_records",
+  "traffic_billing_usage",
+  "traffic_billing_rule_usage",
+  "user_traffic_billing_permissions",
+  "redemption_codes",
+  "discount_codes",
+  "discount_code_plans",
+  "announcements",
+  "announcement_reads",
+  "plugins",
+  "plugin_store_sources",
+  "plugin_assets",
+  "plugin_agent_states",
+  "config_audit_events",
+] as const;
+
+const LAST_AUTO_TRAFFIC_RESET_BACKFILL_MARKER = "last-auto-traffic-reset-backfill-v1";
+
+function backfillSqliteLastAutoTrafficReset(sqlite: Database.Database) {
+  const migrate = sqlite.transaction(() => {
+    const claimed = sqlite.prepare(
+      "INSERT OR IGNORE INTO system_settings (key, value, updatedAt) VALUES (?, '1', unixepoch())",
+    ).run(LAST_AUTO_TRAFFIC_RESET_BACKFILL_MARKER);
+    if (claimed.changes === 0) return;
+    sqlite.exec(
+      'UPDATE "users" SET "lastAutoTrafficReset" = "lastTrafficReset" WHERE "lastAutoTrafficReset" IS NULL AND "lastTrafficReset" IS NOT NULL',
+    );
+  });
+  migrate();
+}
+
+async function backfillMysqlLastAutoTrafficReset(pool: Pool) {
+  const [rows] = await pool.query<any[]>(
+    "SELECT `key` FROM `system_settings` WHERE `key` = ? LIMIT 1",
+    [LAST_AUTO_TRAFFIC_RESET_BACKFILL_MARKER],
+  );
+  if (rows.length > 0) return;
+  await pool.query(
+    'UPDATE `users` SET `lastAutoTrafficReset` = `lastTrafficReset` WHERE `lastAutoTrafficReset` IS NULL AND `lastTrafficReset` IS NOT NULL',
+  );
+  await pool.execute(
+    "INSERT INTO system_settings (`key`, value, updatedAt) VALUES (?, '1', UNIX_TIMESTAMP()) ON DUPLICATE KEY UPDATE `key` = `key`",
+    [LAST_AUTO_TRAFFIC_RESET_BACKFILL_MARKER],
+  );
+}
+
+async function backfillPostgresqlLastAutoTrafficReset(pool: pg.Pool) {
+  await pool.query(
+    `WITH claimed AS (
+       INSERT INTO "system_settings" ("key", value, "updatedAt")
+       VALUES ($1, '1', EXTRACT(EPOCH FROM NOW())::INT)
+       ON CONFLICT ("key") DO NOTHING
+       RETURNING "key"
+     )
+     UPDATE "users"
+     SET "lastAutoTrafficReset" = "lastTrafficReset"
+     WHERE "lastAutoTrafficReset" IS NULL
+       AND "lastTrafficReset" IS NOT NULL
+       AND EXISTS (SELECT 1 FROM claimed)`,
+    [LAST_AUTO_TRAFFIC_RESET_BACKFILL_MARKER],
+  );
+}
+
+const tables: TableDef[] = [
+  {
+    name: "users",
+    columns: [
+      c("id", "id"), c("username", "text", { notNull: true }), c("password", "text", { notNull: true }),
+      c("name", "text"), c("email", "text"), c("emailVerified", "bool", { notNull: true, default: false }), c("emailVerifiedAt", "epoch"), c("displayRemark", "text"), c("avatar", "text"),
+      c("avatarChangeDay", "varchar", { length: 16 }), c("avatarChangeCount", "int", { notNull: true, default: 0 }), c("role", "varchar", { length: 32, notNull: true, default: "user" }), c("accountEnabled", "bool", { notNull: true, default: true }),
+      c("canAddRules", "bool", { notNull: true, default: false }), c("forwardAccessPauseReason", "varchar", { length: 64 }), c("maxRules", "int", { notNull: true, default: 0 }),
+      c("maxPorts", "int", { notNull: true, default: 0 }), c("allowedForwardTypes", "text"),
+      c("allowForwardXTunnel", "bool", { notNull: true, default: false }), c("gostRateLimitIn", "int", { notNull: true, default: 0 }),
+      c("gostRateLimitOut", "int", { notNull: true, default: 0 }), c("maxConnections", "int", { notNull: true, default: 0 }),
+      c("maxIPs", "int", { notNull: true, default: 0 }), c("balanceCents", "bigint", { notNull: true, default: 0 }),
+      c("manualCanAddRules", "bool", { notNull: true, default: false }), c("manualMaxRules", "int", { notNull: true, default: 0 }),
+      c("manualMaxPorts", "int", { notNull: true, default: 0 }), c("manualMaxConnections", "int", { notNull: true, default: 0 }),
+      c("manualMaxIPs", "int", { notNull: true, default: 0 }), c("manualAllowForwardXTunnel", "bool", { notNull: true, default: false }),
+      c("manualGostRateLimitIn", "int", { notNull: true, default: 0 }), c("manualGostRateLimitOut", "int", { notNull: true, default: 0 }),
+      c("manualTrafficLimit", "bigint", { notNull: true, default: 0 }), c("manualExpiresAt", "epoch"),
+      c("trafficLimit", "bigint", { notNull: true, default: 0 }), c("trafficUsed", "bigint", { notNull: true, default: 0 }),
+      c("trafficBillingResetBytes", "bigint", { notNull: true, default: 0 }),
+      c("expiresAt", "epoch"), c("trafficAutoReset", "bool", { notNull: true, default: false }),
+      c("trafficResetDay", "int", { notNull: true, default: 1 }), c("lastTrafficReset", "epoch"), c("lastAutoTrafficReset", "epoch"),
+      c("telegramId", "text"), c("telegramUsername", "text"), c("telegramFirstName", "text"), c("telegramLastName", "text"),
+      c("telegramLinkedAt", "epoch"), c("telegramLastSeenAt", "epoch"), c("telegramAnnouncementSubscribed", "bool", { notNull: true, default: false }), c("telegramBindCode", "text"),
+      c("telegramBindCodeExpiresAt", "epoch"), c("telegramLoginCode", "text"), c("telegramLoginCodeExpiresAt", "epoch"),
+      c("twoFactorEnabled", "bool", { notNull: true, default: false }), c("twoFactorSecret", "text"), c("twoFactorEnabledAt", "epoch"),
+      c("browserSessionToken", "text"), c("mobileSessionToken", "text"), c("telegramSessionToken", "text"),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+      c("lastSignedIn", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["username"], ["telegramId"], ["telegramBindCode"], ["telegramLoginCode"]],
+  },
+  {
+    name: "auth_sessions",
+    columns: [
+      c("id", "id"), c("sid", "varchar", { length: 80, notNull: true }), c("userId", "int", { notNull: true }),
+      c("kind", "varchar", { length: 32, notNull: true, default: "browser" }), c("expiresAt", "epoch", { notNull: true }),
+      c("revokedAt", "epoch"), c("revokeReason", "varchar", { length: 64 }),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("lastSeenAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["sid"]],
+    indexes: [["userId"], ["userId", "kind"], ["expiresAt"]],
+  },
+  {
+    name: "hosts",
+    columns: [
+      c("id", "id"), c("name", "text", { notNull: true }), c("ip", "text", { notNull: true }),
+      c("ipv4", "text"), c("ipv6", "text"), c("hostType", "varchar", { length: 32, notNull: true, default: "slave" }),
+      c("agentToken", "text"), c("entryIp", "text"), c("tunnelEntryIp", "text"), c("osInfo", "text"), c("cpuInfo", "text"),
+      c("memoryTotal", "bigint"), c("agentVersion", "text"),
+      c("mimicAvailable", "bool"), c("mimicVersion", "text"), c("mimicStatus", "varchar", { length: 64 }),
+      c("mimicMessage", "text"), c("mimicCheckedAt", "epoch"),
+      c("mimicRuntimeStatus", "varchar", { length: 32 }), c("mimicRuntimeMessage", "text"), c("mimicRuntimeCheckedAt", "epoch"),
+      c("agentBootId", "varchar", { length: 128 }), c("agentBootedAt", "epoch"), c("agentProcessId", "int"), c("agentProcessStartedAt", "epoch"),
+      c("agentLastReceivedRevision", "bigint", { notNull: true, default: 0 }), c("agentLastAppliedRevision", "bigint", { notNull: true, default: 0 }),
+      c("agentLastReceivedHash", "varchar", { length: 64 }), c("agentLastAppliedHash", "varchar", { length: 64 }),
+      c("agentRecoveryStartedAt", "epoch"), c("agentRecoveryCompletedAt", "epoch"),
+      c("agentRecoveryExpected", "int", { notNull: true, default: 0 }), c("agentRecoveryReady", "int", { notNull: true, default: 0 }),
+      c("agentUpgradeRequested", "bool", { notNull: true, default: false }),
+      c("agentUpgradeTargetVersion", "text"), c("agentUpgradeReleaseVersion", "text"), c("agentUpgradeRequestedAt", "epoch"), c("purchasedAt", "epoch"), c("stoppedAt", "epoch"),
+      c("billingCycleMonths", "int", { notNull: true, default: 1 }), c("billingMonth", "int", { notNull: true, default: 1 }),
+      c("billingDay", "int", { notNull: true, default: 1 }), c("expiryHandling", "varchar", { length: 24, notNull: true, default: "none" }),
+      c("trafficLimit", "bigint", { notNull: true, default: 0 }), c("trafficMeasureMode", "varchar", { length: 16, notNull: true, default: "both" }),
+      c("telegramTrafficAlertEnabled", "bool", { notNull: true, default: false }), c("trafficAlertThresholdPercent", "int", { notNull: true, default: 20 }),
+      c("telegramRenewalReminderEnabled", "bool", { notNull: true, default: false }), c("renewalReminderDays", "int", { notNull: true, default: 3 }),
+      c("trafficAutoReset", "bool", { notNull: true, default: false }), c("trafficResetDay", "int", { notNull: true, default: 1 }),
+      c("lastTrafficReset", "epoch"), c("ddnsEnabled", "bool", { notNull: true, default: false }), c("ddnsDomain", "text"),
+      c("ddnsRecordType", "varchar", { length: 8, notNull: true, default: "A" }), c("ddnsIpVersion", "varchar", { length: 8, notNull: true, default: "ipv4" }),
+      c("lastDdnsValue", "text"), c("lastDdnsAt", "epoch"), c("lastDdnsError", "text"), c("networkInterface", "text"), c("sortOrder", "int", { notNull: true, default: 0 }),
+      c("geoCountryCode", "varchar", { length: 8 }), c("geoCountryName", "text"), c("geoRegion", "text"), c("geoEmoji", "varchar", { length: 16 }),
+      c("geoLatitudeMicro", "int"), c("geoLongitudeMicro", "int"), c("geoUpdatedAt", "epoch"),
+      c("portRangeStart", "int"), c("portRangeEnd", "int"), c("portAllowlist", "text"),
+      c("blockHttp", "bool", { notNull: true, default: false }), c("blockSocks", "bool", { notNull: true, default: false }),
+      c("blockTls", "bool", { notNull: true, default: false }), c("isOnline", "bool", { notNull: true, default: false }),
+      c("lastHeartbeat", "epoch"), c("userId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    indexes: [
+      ["userId"],
+      ["userId", "sortOrder"],
+      ["userId", "createdAt"],
+      ["agentToken"],
+      ["isOnline", "lastHeartbeat"],
+    ],
+  },
+  {
+    name: "host_groups",
+    columns: [
+      c("id", "id"), c("name", "text", { notNull: true }), c("isEnabled", "bool", { notNull: true, default: true }),
+      c("sortOrder", "int", { notNull: true, default: 0 }), c("userId", "int", { notNull: true }),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    indexes: [["userId", "sortOrder"], ["userId", "createdAt"], ["isEnabled"]],
+  },
+  {
+    name: "host_group_members",
+    columns: [
+      c("id", "id"), c("groupId", "int", { notNull: true }), c("hostId", "int", { notNull: true }),
+      c("sortOrder", "int", { notNull: true, default: 0 }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["groupId", "hostId"]],
+    indexes: [["groupId", "sortOrder"], ["hostId"]],
+  },
+  {
+    name: "forward_rules",
+    columns: [
+      c("id", "id"), c("hostId", "int", { notNull: true }), c("name", "text", { notNull: true }),
+      c("forwardType", "varchar", { length: 32, notNull: true, default: "iptables" }), c("protocol", "varchar", { length: 16, notNull: true, default: "both" }),
+      c("gostMode", "varchar", { length: 32, notNull: true, default: "direct" }), c("gostRelayHost", "text"), c("gostRelayPort", "int"),
+      c("tunnelId", "int"), c("tunnelExitPort", "int"),
+      c("forwardGroupId", "int"), c("forwardGroupRuleId", "int"), c("forwardGroupMemberId", "int"),
+      c("isForwardGroupTemplate", "bool", { notNull: true, default: false }),
+      c("sourcePort", "int", { notNull: true }), c("targetIp", "text", { notNull: true }),
+      c("targetPort", "int", { notNull: true }), c("targetExternalProxyNodeId", "int"), c("xrayQuickConfigId", "int"), c("portResourceGroupId", "int"),
+      c("telegramErrorNotifyEnabled", "bool", { notNull: true, default: false }),
+      c("blockHttp", "bool", { notNull: true, default: false }), c("blockSocks", "bool", { notNull: true, default: false }),
+      c("blockTls", "bool", { notNull: true, default: false }),
+      c("proxyProtocolReceive", "bool", { notNull: true, default: false }), c("proxyProtocolSend", "bool", { notNull: true, default: false }),
+      c("proxyProtocolExitReceive", "bool", { notNull: true, default: false }), c("proxyProtocolExitSend", "bool", { notNull: true, default: false }),
+      c("proxyProtocolVersion", "int", { notNull: true, default: 1 }),
+      c("tcpFastOpen", "bool", { notNull: true, default: false }), c("zeroCopy", "bool", { notNull: true, default: false }),
+      c("udpOverTcp", "bool", { notNull: true, default: false }),
+      c("udpOverTcpPort", "int"),
+      c("protocolBlockReason", "text"), c("isEnabled", "bool", { notNull: true, default: true }),
+      c("failoverEnabled", "bool", { notNull: true, default: false }), c("failoverTargets", "text"),
+      c("failoverStrategy", "varchar", { length: 32, notNull: true, default: "fallback" }),
+      c("failoverSeconds", "int", { notNull: true, default: 60 }), c("recoverSeconds", "int", { notNull: true, default: 120 }),
+      c("autoFailback", "bool", { notNull: true, default: true }),
+      c("disabledByTunnel", "bool", { notNull: true, default: false }), c("disabledByGroup", "bool", { notNull: true, default: false }),
+      c("disabledByUser", "bool", { notNull: true, default: false }),
+      c("isRunning", "bool", { notNull: true, default: false }), c("pendingDelete", "bool", { notNull: true, default: false }),
+      c("sortOrder", "int", { notNull: true, default: 0 }),
+      c("userId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    indexes: [["hostId"], ["hostId", "createdAt"], ["hostId", "sourcePort", "pendingDelete", "isEnabled"], ["userId"], ["userId", "sortOrder"], ["userId", "createdAt"], ["userId", "pendingDelete", "createdAt"], ["tunnelId"], ["forwardGroupId"], ["forwardGroupId", "isForwardGroupTemplate", "pendingDelete"], ["forwardGroupRuleId"], ["forwardGroupRuleId", "pendingDelete"], ["forwardGroupMemberId"], ["forwardGroupMemberId", "pendingDelete"], ["targetExternalProxyNodeId"], ["xrayQuickConfigId"], ["portResourceGroupId"]],
+  },
+  {
+    name: "forward_groups",
+    columns: [
+      c("id", "id"), c("name", "text", { notNull: true }), c("remark", "text"), c("groupType", "varchar", { length: 32, notNull: true, default: "host" }),
+      c("groupMode", "varchar", { length: 32, notNull: true, default: "failover" }), c("exitStrategy", "varchar", { length: 32, notNull: true, default: "round_robin" }), c("entryGroupId", "int"),
+      c("forwardType", "varchar", { length: 32, notNull: true, default: "iptables" }), c("domain", "text"),
+      c("recordType", "varchar", { length: 16, notNull: true, default: "A" }), c("sourcePort", "int", { notNull: true, default: 1 }),
+      c("protocol", "varchar", { length: 16, notNull: true, default: "both" }), c("targetIp", "text", { notNull: true }),
+      c("targetPort", "int", { notNull: true, default: 1 }), c("rateLimitMbps", "int", { notNull: true, default: 0 }),
+      c("trafficMultiplier", "int", { notNull: true, default: 100 }),
+      c("proxyProtocolReceive", "bool", { notNull: true, default: false }), c("proxyProtocolSend", "bool", { notNull: true, default: false }),
+      c("proxyProtocolExitReceive", "bool", { notNull: true, default: false }), c("proxyProtocolExitSend", "bool", { notNull: true, default: false }),
+      c("proxyProtocolVersion", "int", { notNull: true, default: 1 }),
+      c("tcpFastOpen", "bool", { notNull: true, default: false }), c("zeroCopy", "bool", { notNull: true, default: false }),
+      c("udpOverTcp", "bool", { notNull: true, default: false }), c("udpOverTcpPort", "int"),
+      c("failoverEnabled", "bool", { notNull: true, default: false }), c("failoverTargets", "text"),
+      c("failoverStrategy", "varchar", { length: 32, notNull: true, default: "fallback" }),
+      c("failoverSeconds", "int", { notNull: true, default: 60 }),
+      c("recoverSeconds", "int", { notNull: true, default: 120 }), c("chinaHealthCheckEnabled", "bool", { notNull: true, default: false }), c("chinaHealthCheckTarget", "text"),
+      c("telegramSwitchNotifyEnabled", "bool", { notNull: true, default: false }),
+      c("ddnsAutoResolveEnabled", "bool", { notNull: true, default: true }), c("autoFailback", "bool", { notNull: true, default: true }),
+      c("isEnabled", "bool", { notNull: true, default: true }), c("activeMemberId", "int"), c("lastDdnsValue", "text"),
+      c("lastDdnsAt", "epoch"), c("lastFailoverAt", "epoch"), c("lastStatus", "varchar", { length: 32, notNull: true, default: "unknown" }),
+      c("lastMessage", "text"), c("systemManagedKind", "varchar", { length: 32 }), c("systemManagedKey", "varchar", { length: 128 }),
+      c("sortOrder", "int", { notNull: true, default: 0 }), c("userId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["systemManagedKey"]],
+    indexes: [["userId"], ["userId", "sortOrder"], ["userId", "createdAt"], ["isEnabled"], ["activeMemberId"], ["entryGroupId"]],
+  },
+  {
+    name: "forward_group_members",
+    columns: [
+      c("id", "id"), c("groupId", "int", { notNull: true }), c("memberType", "varchar", { length: 32, notNull: true }),
+      c("hostId", "int"), c("tunnelId", "int"), c("connectHost", "text"), c("priority", "int", { notNull: true, default: 0 }), c("ruleId", "int"),
+      c("isEnabled", "bool", { notNull: true, default: true }), c("healthStatus", "varchar", { length: 32, notNull: true, default: "unknown" }),
+      c("lastLatencyMs", "int"), c("chinaHealthStatus", "varchar", { length: 32, notNull: true, default: "unknown" }), c("chinaHealthLatencyMs", "int"), c("chinaHealthCheckedAt", "epoch"), c("failureSince", "epoch"), c("healthySince", "epoch"), c("lastCheckedAt", "epoch"),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    indexes: [["groupId", "priority"], ["ruleId"], ["hostId"], ["tunnelId"]],
+  },
+  {
+    name: "forward_group_events",
+    columns: [
+      c("id", "id"), c("groupId", "int", { notNull: true }), c("memberId", "int"),
+      c("type", "varchar", { length: 32, notNull: true }), c("message", "text"),
+      c("createdAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    indexes: [["groupId", "createdAt"], ["createdAt", "groupId"], ["memberId"]],
+  },
+  {
+    name: "tunnels",
+    columns: [
+      c("id", "id"), c("name", "text", { notNull: true }), c("entryGroupId", "int"), c("exitGroupId", "int"), c("entryHostId", "int", { notNull: true }),
+      c("exitHostId", "int", { notNull: true }), c("mode", "varchar", { length: 32, notNull: true, default: "tls" }),
+      c("relayMode", "varchar", { length: 16, notNull: true, default: "chain" }),
+      c("forwardxVersion", "varchar", { length: 8, notNull: true, default: "v1" }), c("certDomain", "text"),
+      c("certPem", "text"), c("certKeyPem", "text"),
+      c("secret", "text"), c("listenPort", "int", { notNull: true }), c("mimicPort", "int", { notNull: true, default: 0 }),
+      c("rateLimitMbps", "int", { notNull: true, default: 0 }),
+      c("trafficMultiplier", "int", { notNull: true, default: 100 }),
+      // Legacy columns retained for migration compatibility; runtime ignores them.
+      c("trafficPaddingEnabled", "bool", { notNull: true, default: false }),
+      c("trafficPaddingRatio", "int", { notNull: true, default: 0 }),
+      c("trafficPaddingMaxMbps", "int", { notNull: true, default: 0 }),
+      c("portRangeStart", "int"), c("portRangeEnd", "int"),
+      c("networkType", "varchar", { length: 32, notNull: true, default: "public" }), c("connectHost", "text"),
+      c("proxyProtocolReceive", "bool", { notNull: true, default: false }), c("proxyProtocolSend", "bool", { notNull: true, default: false }),
+      c("proxyProtocolExitReceive", "bool", { notNull: true, default: false }), c("proxyProtocolExitSend", "bool", { notNull: true, default: false }),
+      c("proxyProtocolVersion", "int", { notNull: true, default: 1 }),
+      c("tcpFastOpen", "bool", { notNull: true, default: false }), c("udpOverTcp", "bool", { notNull: true, default: false }),
+      c("blockHttp", "bool", { notNull: true, default: false }), c("blockSocks", "bool", { notNull: true, default: false }),
+      c("blockTls", "bool", { notNull: true, default: false }), c("loadBalanceEnabled", "bool", { notNull: true, default: false }),
+      c("loadBalanceStrategy", "varchar", { length: 32, notNull: true, default: "round_robin" }),
+      c("isEnabled", "bool", { notNull: true, default: true }), c("disabledByGroup", "bool", { notNull: true, default: false }),
+      c("isRunning", "bool", { notNull: true, default: false }),
+      c("lastLatencyMs", "int"), c("lastTestStatus", "text"), c("lastTestMessage", "text"), c("lastTestAt", "epoch"),
+      c("sortOrder", "int", { notNull: true, default: 0 }), c("userId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    indexes: [["entryGroupId"], ["exitGroupId"], ["entryHostId"], ["exitHostId"], ["userId"], ["userId", "sortOrder"], ["userId", "createdAt"]],
+  },
+  { name: "tunnel_exit_nodes", columns: [c("id", "id"), c("tunnelId", "int", { notNull: true }), c("seq", "int", { notNull: true }), c("hostId", "int", { notNull: true }), c("listenPort", "int", { notNull: true }), c("mimicPort", "int", { notNull: true, default: 0 }), c("connectHost", "text"), c("isEnabled", "bool", { notNull: true, default: true }), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["tunnelId", "seq"]], indexes: [["tunnelId"], ["hostId"], ["hostId", "listenPort"]] },
+  { name: "tunnel_hops", columns: [c("id", "id"), c("tunnelId", "int", { notNull: true }), c("seq", "int", { notNull: true }), c("hostId", "int", { notNull: true }), c("listenPort", "int", { notNull: true, default: 0 }), c("mimicPort", "int", { notNull: true, default: 0 }), c("connectHost", "text")], unique: [["tunnelId", "seq"]], indexes: [["tunnelId"], ["hostId"]] },
+  { name: "forward_rule_tunnel_exits", columns: [c("id", "id"), c("ruleId", "int", { notNull: true }), c("tunnelId", "int", { notNull: true }), c("exitNodeId", "int", { notNull: true }), c("exitSeq", "int", { notNull: true }), c("exitHostId", "int", { notNull: true }), c("tunnelExitPort", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["ruleId", "exitNodeId"], ["ruleId", "exitSeq"]], indexes: [["ruleId"], ["tunnelId"], ["exitHostId"], ["exitHostId", "tunnelExitPort"]] },
+  { name: "host_metrics", columns: [c("id", "id"), c("hostId", "int", { notNull: true }), c("cpuUsage", "int"), c("memoryUsage", "int"), c("memoryUsed", "bigint"), c("swapUsage", "int"), c("swapUsed", "bigint"), c("swapTotal", "bigint"), c("networkIn", "bigint"), c("networkOut", "bigint"), c("diskUsage", "int"), c("diskUsed", "bigint"), c("diskTotal", "bigint"), c("uptime", "bigint"), c("recordedAt", "epoch", { notNull: true, default: "now" })], indexes: [["hostId", "recordedAt"], ["recordedAt", "hostId"]] },
+  { name: "host_traffic_counters", columns: [c("id", "id"), c("hostId", "int", { notNull: true }), c("bytesIn", "bigint", { notNull: true, default: 0 }), c("bytesOut", "bigint", { notNull: true, default: 0 }), c("lastSystemIn", "bigint"), c("lastSystemOut", "bigint"), c("lastDeltaIn", "bigint", { notNull: true, default: 0 }), c("lastDeltaOut", "bigint", { notNull: true, default: 0 }), c("lastReportedAt", "epoch"), c("resetAt", "epoch"), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["hostId"]], indexes: [["updatedAt"], ["lastReportedAt"]] },
+  { name: "user_traffic_counters", columns: [c("id", "id"), c("userId", "int", { notNull: true }), c("bytesIn", "bigint", { notNull: true, default: 0 }), c("bytesOut", "bigint", { notNull: true, default: 0 }), c("connections", "int", { notNull: true, default: 0 }), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["userId"]], indexes: [["updatedAt"]] },
+  { name: "forward_rule_traffic_counters", columns: [c("id", "id"), c("ruleId", "int", { notNull: true }), c("hostId", "int", { notNull: true }), c("userId", "int", { notNull: true }), c("bytesIn", "bigint", { notNull: true, default: 0 }), c("bytesOut", "bigint", { notNull: true, default: 0 }), c("connections", "int", { notNull: true, default: 0 }), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["ruleId", "hostId"]], indexes: [["userId"], ["ruleId"], ["hostId"], ["updatedAt"]] },
+  { name: "traffic_stats", columns: [c("id", "id"), c("ruleId", "int", { notNull: true }), c("hostId", "int", { notNull: true }), c("bytesIn", "bigint", { notNull: true, default: 0 }), c("bytesOut", "bigint", { notNull: true, default: 0 }), c("connections", "int", { notNull: true, default: 0 }), c("recordedAt", "epoch", { notNull: true, default: "now" })], indexes: [["ruleId", "recordedAt"], ["hostId", "recordedAt"], ["recordedAt", "ruleId"], ["recordedAt", "hostId"]] },
+  { name: "traffic_stat_buckets", columns: [c("id", "id"), c("bucketStart", "epoch", { notNull: true }), c("bucketMinutes", "int", { notNull: true, default: 30 }), c("userId", "int", { notNull: true }), c("ruleId", "int", { notNull: true }), c("hostId", "int", { notNull: true }), c("bytesIn", "bigint", { notNull: true, default: 0 }), c("bytesOut", "bigint", { notNull: true, default: 0 }), c("connections", "int", { notNull: true, default: 0 }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["bucketStart", "bucketMinutes", "ruleId", "hostId"]], indexes: [["userId", "bucketStart"], ["bucketStart", "userId"], ["bucketMinutes", "bucketStart"], ["bucketMinutes", "userId", "bucketStart"], ["bucketMinutes", "ruleId", "bucketStart"], ["bucketMinutes", "hostId", "bucketStart"], ["ruleId", "bucketStart"], ["hostId", "bucketStart"]] },
+  { name: "agent_traffic_reports", columns: [c("id", "id"), c("hostId", "int", { notNull: true }), c("producerId", "varchar", { length: 128 }), c("reportId", "varchar", { length: 128, notNull: true }), c("receivedAt", "epoch", { notNull: true, default: "now" })], unique: [["hostId", "reportId"], ["hostId", "producerId"]], indexes: [["receivedAt"]] },
+  { name: "tunnel_latency_stats", columns: [c("id", "id"), c("tunnelId", "int", { notNull: true }), c("seriesKey", "varchar", { length: 64 }), c("seriesLabel", "text"), c("latencyMs", "int"), c("isTimeout", "bool", { notNull: true, default: false }), c("recordedAt", "epoch", { notNull: true, default: "now" })], indexes: [["tunnelId", "recordedAt"], ["tunnelId", "seriesKey", "recordedAt"], ["recordedAt", "tunnelId"]] },
+  { name: "forward_group_latency_stats", columns: [c("id", "id"), c("groupId", "int", { notNull: true }), c("latencyMs", "int"), c("isTimeout", "bool", { notNull: true, default: false }), c("recordedAt", "epoch", { notNull: true, default: "now" })], indexes: [["groupId", "recordedAt"], ["recordedAt", "groupId"]] },
+  { name: "host_probe_services", columns: [c("id", "id"), c("name", "text", { notNull: true }), c("method", "varchar", { length: 16, notNull: true, default: "tcping" }), c("targetIp", "text", { notNull: true }), c("targetPort", "int"), c("hostScope", "varchar", { length: 16, notNull: true, default: "all" }), c("hostIds", "text"), c("excludeHostIds", "text"), c("intervalSeconds", "int", { notNull: true, default: 30 }), c("isEnabled", "bool", { notNull: true, default: true }), c("sortOrder", "int", { notNull: true, default: 0 }), c("userId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], indexes: [["userId", "sortOrder"], ["userId", "createdAt"], ["isEnabled"], ["hostScope"]] },
+  { name: "host_probe_service_stats", columns: [c("id", "id"), c("serviceId", "int", { notNull: true }), c("hostId", "int", { notNull: true }), c("latencyMs", "int"), c("isTimeout", "bool", { notNull: true, default: false }), c("recordedAt", "epoch", { notNull: true, default: "now" })], indexes: [["serviceId", "recordedAt"], ["hostId", "recordedAt"], ["recordedAt", "serviceId"]] },
+  { name: "ip_geo_cache", columns: [c("id", "id"), c("address", "varchar", { length: 253, notNull: true }), c("resolvedAddress", "varchar", { length: 64, notNull: true }), c("geoCountryCode", "varchar", { length: 8, notNull: true }), c("geoCountryName", "text"), c("geoRegion", "text"), c("geoEmoji", "varchar", { length: 16 }), c("geoLatitudeMicro", "int"), c("geoLongitudeMicro", "int"), c("provider", "varchar", { length: 32, notNull: true, default: "ipapi.co" }), c("fetchedAt", "epoch", { notNull: true, default: "now" }), c("expiresAt", "epoch", { notNull: true })], unique: [["address"]], indexes: [["resolvedAddress"], ["expiresAt"]] },
+  { name: "agent_tokens", columns: [c("id", "id"), c("token", "text", { notNull: true }), c("hostId", "int"), c("description", "text"), c("isUsed", "bool", { notNull: true, default: false }), c("sortOrder", "int", { notNull: true, default: 0 }), c("userId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" })], unique: [["token"]], indexes: [["userId"], ["userId", "sortOrder"]] },
+  { name: "tcping_stats", columns: [c("id", "id"), c("ruleId", "int", { notNull: true }), c("hostId", "int", { notNull: true }), c("latencyMs", "int"), c("isTimeout", "bool", { notNull: true, default: false }), c("healthStatus", "varchar", { length: 16 }), c("healthPending", "bool", { notNull: true, default: false }), c("recordedAt", "epoch", { notNull: true, default: "now" })], indexes: [["ruleId", "recordedAt"], ["hostId", "recordedAt"], ["recordedAt", "ruleId"], ["recordedAt", "hostId"]] },
+  { name: "forward_tests", columns: [c("id", "id"), c("ruleId", "int", { notNull: true }), c("hostId", "int", { notNull: true }), c("userId", "int", { notNull: true }), c("status", "varchar", { length: 32, notNull: true, default: "pending" }), c("listenOk", "bool", { notNull: true, default: false }), c("targetReachable", "bool", { notNull: true, default: false }), c("forwardOk", "bool", { notNull: true, default: false }), c("latencyMs", "int"), c("message", "text"), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], indexes: [["ruleId", "createdAt"], ["hostId", "status"], ["status", "createdAt"], ["status", "updatedAt"], ["updatedAt"]] },
+  { name: "user_host_permissions", columns: [c("id", "id"), c("userId", "int", { notNull: true }), c("hostId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" })], unique: [["userId", "hostId"]], indexes: [["hostId"]] },
+  { name: "user_tunnel_permissions", columns: [c("id", "id"), c("userId", "int", { notNull: true }), c("tunnelId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" })], unique: [["userId", "tunnelId"]], indexes: [["tunnelId"]] },
+  { name: "user_forward_group_permissions", columns: [c("id", "id"), c("userId", "int", { notNull: true }), c("forwardGroupId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" })], unique: [["userId", "forwardGroupId"]], indexes: [["forwardGroupId"]] },
+  { name: "system_settings", columns: [c("key", "varchar", { length: 191, notNull: true }), c("value", "longtext"), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["key"]] },
+  { name: "payment_orders", columns: [c("id", "id"), c("outTradeNo", "text", { notNull: true }), c("userId", "int", { notNull: true }), c("provider", "varchar", { length: 32, notNull: true }), c("paymentType", "varchar", { length: 32, notNull: true }), c("status", "varchar", { length: 32, notNull: true, default: "pending" }), c("subject", "text", { notNull: true }), c("amountCents", "bigint", { notNull: true }), c("currency", "varchar", { length: 16, notNull: true, default: "CNY" }), c("tradeNo", "text"), c("payUrl", "text"), c("qrCode", "text"), c("orderType", "varchar", { length: 32, notNull: true, default: "balance" }), c("planId", "int"), c("subscriptionId", "int"), c("discountCodeId", "int"), c("discountConsumed", "bool", { notNull: true, default: false }), c("discountAmountCents", "bigint", { notNull: true, default: 0 }), c("clientIp", "text"), c("rawNotify", "text"), c("expiresAt", "epoch"), c("paidAt", "epoch"), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["outTradeNo"]], indexes: [["userId", "createdAt"], ["status", "createdAt"]] },
+  { name: "subscription_plans", columns: [c("id", "id"), c("name", "text", { notNull: true }), c("description", "text"), c("priceCents", "bigint", { notNull: true, default: 0 }), c("currency", "varchar", { length: 16, notNull: true, default: "CNY" }), c("durationDays", "int", { notNull: true, default: 30 }), c("portCount", "int", { notNull: true, default: 20 }), c("trafficLimit", "bigint", { notNull: true, default: 0 }), c("rateLimitMbps", "int", { notNull: true, default: 0 }), c("maxRules", "int", { notNull: true, default: 20 }), c("maxConnections", "int", { notNull: true, default: 2000 }), c("maxIPs", "int", { notNull: true, default: 10 }), c("isActive", "bool", { notNull: true, default: true }), c("isStoreVisible", "bool", { notNull: true, default: true }), c("sortOrder", "int", { notNull: true, default: 0 }), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })] },
+  { name: "subscription_plan_hosts", columns: [c("id", "id"), c("planId", "int", { notNull: true }), c("hostId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" })], unique: [["planId", "hostId"]] },
+  { name: "subscription_plan_tunnels", columns: [c("id", "id"), c("planId", "int", { notNull: true }), c("tunnelId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" })], unique: [["planId", "tunnelId"]] },
+  { name: "subscription_plan_forward_groups", columns: [c("id", "id"), c("planId", "int", { notNull: true }), c("forwardGroupId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" })], unique: [["planId", "forwardGroupId"]], indexes: [["forwardGroupId"]] },
+  { name: "subscription_plan_traffic_addons", columns: [c("id", "id"), c("planId", "int", { notNull: true }), c("trafficBytes", "bigint", { notNull: true, default: 0 }), c("priceCents", "bigint", { notNull: true, default: 0 }), c("isActive", "bool", { notNull: true, default: true }), c("sortOrder", "int", { notNull: true, default: 0 }), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], indexes: [["planId", "isActive"], ["planId", "sortOrder"]] },
+  { name: "user_subscriptions", columns: [c("id", "id"), c("userId", "int", { notNull: true }), c("planId", "int", { notNull: true }), c("status", "varchar", { length: 32, notNull: true, default: "active" }), c("source", "varchar", { length: 32, notNull: true, default: "admin" }), c("paymentOrderNo", "text"), c("planSnapshot", "text"), c("portRangeStart", "int"), c("portRangeEnd", "int"), c("nextTrafficResetAt", "epoch"), c("lastTrafficResetAt", "epoch"), c("userDismissedAt", "epoch"), c("adminDismissedAt", "epoch"), c("startedAt", "epoch", { notNull: true, default: "now" }), c("expiresAt", "epoch"), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], indexes: [["userId", "status", "expiresAt"], ["planId"], ["paymentOrderNo"]] },
+  { name: "user_traffic_addons", columns: [c("id", "id"), c("userId", "int", { notNull: true }), c("subscriptionId", "int", { notNull: true }), c("planId", "int", { notNull: true }), c("addonId", "int"), c("trafficBytes", "bigint", { notNull: true, default: 0 }), c("priceCents", "bigint", { notNull: true, default: 0 }), c("source", "varchar", { length: 32, notNull: true, default: "user" }), c("status", "varchar", { length: 32, notNull: true, default: "active" }), c("operatorUserId", "int"), c("description", "text"), c("cycleResetAt", "epoch"), c("expiresAt", "epoch"), c("expiredAt", "epoch"), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], indexes: [["userId", "status", "expiresAt"], ["subscriptionId", "status"], ["addonId"]] },
+  { name: "balance_transactions", columns: [c("id", "id"), c("userId", "int", { notNull: true }), c("type", "varchar", { length: 32, notNull: true }), c("amountCents", "bigint", { notNull: true }), c("balanceAfterCents", "bigint", { notNull: true }), c("description", "text"), c("operatorUserId", "int"), c("paymentOrderNo", "text"), c("redemptionCodeId", "int"), c("createdAt", "epoch", { notNull: true, default: "now" })], indexes: [["userId", "createdAt"], ["paymentOrderNo"]] },
+  { name: "traffic_billing_configs", columns: [c("id", "id"), c("resourceType", "varchar", { length: 16, notNull: true }), c("resourceId", "int", { notNull: true }), c("enabled", "bool", { notNull: true, default: true }), c("requiresPermission", "bool", { notNull: true, default: false }), c("description", "text"), c("pricePerGbCents", "bigint", { notNull: true, default: 0 }), c("pricePerGbMilliCents", "bigint", { notNull: true, default: 0 }), c("multiplier", "int", { notNull: true, default: 100 }), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["resourceType", "resourceId"]], indexes: [["enabled"], ["requiresPermission"]] },
+  { name: "traffic_billing_records", columns: [c("id", "id"), c("userId", "int", { notNull: true }), c("ruleId", "int", { notNull: true }), c("resourceType", "varchar", { length: 16, notNull: true }), c("resourceId", "int", { notNull: true }), c("bytes", "bigint", { notNull: true, default: 0 }), c("billedGb", "int", { notNull: true, default: 0 }), c("pricePerGbCents", "bigint", { notNull: true, default: 0 }), c("pricePerGbMilliCents", "bigint", { notNull: true, default: 0 }), c("multiplier", "int", { notNull: true, default: 100 }), c("amountCents", "bigint", { notNull: true, default: 0 }), c("balanceAfterCents", "bigint", { notNull: true, default: 0 }), c("createdAt", "epoch", { notNull: true, default: "now" })], indexes: [["userId", "createdAt"], ["resourceType", "resourceId", "createdAt"], ["ruleId", "createdAt"]] },
+  { name: "traffic_billing_usage", columns: [c("id", "id"), c("userId", "int", { notNull: true }), c("resourceType", "varchar", { length: 16, notNull: true }), c("resourceId", "int", { notNull: true }), c("totalBytes", "bigint", { notNull: true, default: 0 }), c("billedGb", "int", { notNull: true, default: 0 }), c("pendingMilliCents", "bigint", { notNull: true, default: 0 }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["userId", "resourceType", "resourceId"]], indexes: [["resourceType", "resourceId"]] },
+  { name: "traffic_billing_rule_usage", columns: [c("id", "id"), c("userId", "int", { notNull: true }), c("ruleId", "int", { notNull: true }), c("resourceType", "varchar", { length: 16, notNull: true }), c("resourceId", "int", { notNull: true }), c("totalBytes", "bigint", { notNull: true, default: 0 }), c("billedGb", "int", { notNull: true, default: 0 }), c("pendingMilliCents", "bigint", { notNull: true, default: 0 }), c("settled", "bool", { notNull: true, default: false }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["ruleId", "resourceType", "resourceId"]], indexes: [["userId", "resourceType", "resourceId"], ["resourceType", "resourceId"]] },
+  { name: "user_traffic_billing_permissions", columns: [c("id", "id"), c("userId", "int", { notNull: true }), c("resourceType", "varchar", { length: 16, notNull: true }), c("resourceId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" })], unique: [["userId", "resourceType", "resourceId"]], indexes: [["userId"], ["resourceType", "resourceId"]] },
+  { name: "redemption_codes", columns: [c("id", "id"), c("code", "text", { notNull: true }), c("type", "varchar", { length: 32, notNull: true }), c("planId", "int"), c("durationDays", "int"), c("amountCents", "bigint", { notNull: true, default: 0 }), c("startsAt", "epoch"), c("expiresAt", "epoch"), c("isActive", "bool", { notNull: true, default: true }), c("usedByUserId", "int"), c("usedAt", "epoch"), c("createdByUserId", "int"), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["code"]], indexes: [["isActive", "startsAt", "expiresAt", "usedAt"]] },
+  { name: "discount_codes", columns: [c("id", "id"), c("code", "text", { notNull: true }), c("discountType", "varchar", { length: 32, notNull: true }), c("discountValue", "int", { notNull: true }), c("maxUses", "int", { notNull: true, default: 0 }), c("usedCount", "int", { notNull: true, default: 0 }), c("startsAt", "epoch"), c("expiresAt", "epoch"), c("isActive", "bool", { notNull: true, default: true }), c("createdByUserId", "int"), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["code"]], indexes: [["isActive", "startsAt", "expiresAt", "usedCount"]] },
+  { name: "discount_code_plans", columns: [c("id", "id"), c("discountCodeId", "int", { notNull: true }), c("planId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" })], unique: [["discountCodeId", "planId"]], indexes: [["planId"]] },
+  { name: "announcements", columns: [c("id", "id"), c("title", "text", { notNull: true }), c("content", "text", { notNull: true }), c("type", "varchar", { length: 32, notNull: true, default: "normal" }), c("targetVersion", "text"), c("isActive", "bool", { notNull: true, default: true }), c("startsAt", "epoch"), c("expiresAt", "epoch"), c("createdByUserId", "int"), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], indexes: [["type", "isActive", "updatedAt"], ["type", "targetVersion", "isActive"]] },
+  { name: "announcement_reads", columns: [c("id", "id"), c("announcementId", "int", { notNull: true }), c("userId", "int", { notNull: true }), c("dismissedAt", "epoch", { notNull: true, default: "now" })], unique: [["announcementId", "userId"]], indexes: [["userId", "announcementId"]] },
+  { name: "plugins", columns: [c("id", "id"), c("pluginId", "varchar", { length: 128, notNull: true }), c("name", "text", { notNull: true }), c("version", "varchar", { length: 64, notNull: true, default: "0.0.0" }), c("description", "text"), c("author", "text"), c("homepage", "text"), c("repository", "text"), c("sourceType", "varchar", { length: 32, notNull: true, default: "github" }), c("sourceUrl", "text"), c("branch", "varchar", { length: 128 }), c("manifestPath", "text"), c("manifestJson", "text", { notNull: true }), c("permissionsJson", "text"), c("extensionPointsJson", "text"), c("status", "varchar", { length: 32, notNull: true, default: "disabled" }), c("trusted", "bool", { notNull: true, default: false }), c("installedAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }), c("lastCheckedAt", "epoch"), c("latestVersion", "varchar", { length: 64 }), c("lastError", "text")], unique: [["pluginId"]], indexes: [["status"], ["sourceType"]] },
+  { name: "plugin_store_sources", columns: [c("id", "id"), c("name", "text", { notNull: true }), c("repository", "text", { notNull: true }), c("branch", "varchar", { length: 128, notNull: true, default: "main" }), c("catalogPath", "text", { notNull: true, default: "forwardx-store.json" }), c("itemsJson", "text"), c("lastSyncedAt", "epoch"), c("lastError", "text"), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["repository", "branch", "catalogPath"]], indexes: [["updatedAt"]] },
+  { name: "plugin_assets", columns: [c("id", "id"), c("pluginId", "varchar", { length: 128, notNull: true }), c("path", "text", { notNull: true }), c("contentType", "varchar", { length: 128 }), c("size", "int", { notNull: true, default: 0 }), c("sha256", "varchar", { length: 64 }), c("content", "text"), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["pluginId", "path"]], indexes: [["pluginId"]] },
+  { name: "plugin_agent_states", columns: [c("id", "id"), c("pluginId", "varchar", { length: 128, notNull: true }), c("resourceViewId", "varchar", { length: 128, notNull: true }), c("hostId", "int", { notNull: true }), c("pluginVersion", "varchar", { length: 64 }), c("actionId", "varchar", { length: 128 }), c("groupId", "varchar", { length: 64 }), c("taskId", "varchar", { length: 64 }), c("status", "varchar", { length: 32, notNull: true, default: "idle" }), c("dataJson", "text"), c("output", "text"), c("error", "text"), c("startedAt", "epoch"), c("finishedAt", "epoch"), c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" })], unique: [["pluginId", "resourceViewId", "hostId"]], indexes: [["hostId"], ["pluginId", "resourceViewId"], ["groupId"]] },
+  { name: "config_audit_events", columns: [c("id", "id"), c("resourceType", "varchar", { length: 32, notNull: true }), c("resourceId", "int", { notNull: true }), c("hostId", "int"), c("action", "varchar", { length: 32, notNull: true }), c("source", "varchar", { length: 64, notNull: true, default: "system" }), c("actorUserId", "int"), c("actorName", "text"), c("requestId", "varchar", { length: 64 }), c("requestPath", "text"), c("beforeJson", "text"), c("afterJson", "text"), c("diffJson", "text"), c("configHash", "varchar", { length: 64, notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" })], indexes: [["resourceType", "resourceId", "id"], ["hostId", "id"], ["actorUserId", "id"]] },
+  {
+    name: "xray_inbounds",
+    columns: [
+      c("id", "id"), c("hostId", "int", { notNull: true }), c("name", "text", { notNull: true }),
+      c("runtimeTag", "varchar", { length: 128, notNull: true }), c("publicAddress", "text", { notNull: true }),
+      c("listenAddress", "varchar", { length: 64, notNull: true, default: "0.0.0.0" }), c("listenPort", "int", { notNull: true }),
+      c("protocol", "varchar", { length: 32, notNull: true, default: "vless" }), c("transport", "varchar", { length: 32, notNull: true, default: "tcp" }),
+      c("security", "varchar", { length: 32, notNull: true, default: "reality" }), c("profileId", "varchar", { length: 128 }),
+      c("specVersion", "int"), c("specJson", "text"), c("tlsCertificateId", "int"), c("externalProxyNodeId", "int"),
+      c("realityTargetHost", "text", { notNull: true }),
+      c("realityTargetPort", "int", { notNull: true, default: 443 }), c("realityServerName", "text", { notNull: true }),
+      c("realityPublicKey", "text", { notNull: true }), c("realityPrivateKeyEncrypted", "text", { notNull: true }),
+      c("secretKeyVersion", "int", { notNull: true, default: 1 }), c("fingerprint", "varchar", { length: 32, notNull: true, default: "chrome" }),
+      c("spiderX", "varchar", { length: 256, notNull: true, default: "/" }), c("isEnabled", "bool", { notNull: true, default: true }),
+      c("pendingDelete", "bool", { notNull: true, default: false }), c("desiredGeneration", "bigint", { notNull: true, default: 0 }),
+      c("createdByUserId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["runtimeTag"], ["hostId", "transport", "listenPort"]],
+    indexes: [["hostId", "pendingDelete", "isEnabled"], ["hostId", "desiredGeneration"], ["createdByUserId", "createdAt"], ["externalProxyNodeId"]],
+  },
+  {
+    name: "xray_external_proxy_nodes",
+    columns: [
+      c("id", "id"), c("name", "text", { notNull: true }), c("nodeTag", "varchar", { length: 128, notNull: true }),
+      c("protocol", "varchar", { length: 32, notNull: true }), c("address", "text", { notNull: true }),
+      c("port", "int", { notNull: true }), c("specVersion", "int", { notNull: true, default: 1 }),
+      c("specJson", "text", { notNull: true }), c("createdByUserId", "int", { notNull: true }),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["nodeTag"]],
+    indexes: [["protocol", "updatedAt"], ["createdByUserId", "createdAt"]],
+  },
+  {
+    name: "xray_external_proxy_secrets",
+    columns: [
+      c("id", "id"), c("externalProxyNodeId", "int", { notNull: true }), c("kind", "varchar", { length: 32, notNull: true }),
+      c("encryptedValue", "text", { notNull: true }), c("fingerprint", "varchar", { length: 64, notNull: true }),
+      c("keyVersion", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["externalProxyNodeId", "kind"]],
+    indexes: [["kind", "fingerprint"]],
+  },
+  {
+    name: "dns_provider_accounts",
+    columns: [
+      c("id", "id"), c("accountTag", "varchar", { length: 128, notNull: true }),
+      c("provider", "varchar", { length: 32, notNull: true }), c("name", "text", { notNull: true }),
+      c("revision", "bigint", { notNull: true, default: 1 }), c("isDisabled", "bool", { notNull: true, default: false }),
+      c("verificationStatus", "varchar", { length: 32, notNull: true, default: "UNVERIFIED" }),
+      c("lastErrorCode", "varchar", { length: 64 }), c("lastValidationAttemptAt", "epoch"),
+      c("verifiedAt", "epoch"), c("verificationExpiresAt", "epoch"), c("createdByUserId", "int", { notNull: true }),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["accountTag"]],
+    indexes: [["provider"], ["verificationExpiresAt"]],
+  },
+  {
+    name: "dns_provider_account_secrets",
+    columns: [
+      c("id", "id"), c("accountId", "int", { notNull: true }), c("kind", "varchar", { length: 32, notNull: true }),
+      c("encryptedValue", "text", { notNull: true }), c("fingerprint", "varchar", { length: 64, notNull: true }),
+      c("keyVersion", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["accountId", "kind"]],
+    indexes: [["kind", "fingerprint"]],
+  },
+  {
+    name: "dns_provider_global_bindings",
+    columns: [
+      c("id", "id"), c("scopeKey", "varchar", { length: 64, notNull: true }), c("accountId", "int"),
+      c("revision", "bigint", { notNull: true, default: 1 }),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["scopeKey"]],
+    indexes: [["accountId"]],
+  },
+  {
+    name: "dns_provider_zones",
+    columns: [
+      c("id", "id"), c("accountId", "int", { notNull: true }),
+      c("providerZoneId", "varchar", { length: 128, notNull: true }), c("name", "varchar", { length: 255, notNull: true }),
+      c("status", "varchar", { length: 32, notNull: true }), c("catalogRevision", "varchar", { length: 64, notNull: true }),
+      c("refreshedAt", "epoch", { notNull: true }), c("expiresAt", "epoch", { notNull: true }),
+      c("lastSeenAt", "epoch", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["accountId", "providerZoneId"], ["accountId", "name"]],
+    indexes: [["accountId", "status", "expiresAt"]],
+  },
+  {
+    name: "dns_provider_record_lines",
+    columns: [
+      c("id", "id"), c("zoneId", "int", { notNull: true }),
+      c("providerLineId", "varchar", { length: 128, notNull: true }), c("name", "varchar", { length: 255, notNull: true }),
+      c("category", "varchar", { length: 32, notNull: true }), c("status", "varchar", { length: 32, notNull: true }),
+      c("catalogRevision", "varchar", { length: 64, notNull: true }), c("refreshedAt", "epoch", { notNull: true }),
+      c("expiresAt", "epoch", { notNull: true }), c("lastSeenAt", "epoch", { notNull: true }),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["zoneId", "providerLineId"]],
+    indexes: [["zoneId", "category", "status"]],
+  },
+  {
+    name: "xray_quick_configs",
+    columns: [
+      c("id", "id"), c("configTag", "varchar", { length: 128, notNull: true }),
+      c("targetType", "varchar", { length: 32, notNull: true }), c("xrayInboundId", "int"),
+      c("externalProxyNodeId", "int"), c("targetVersion", "varchar", { length: 64, notNull: true }),
+      c("dnsAccountId", "int", { notNull: true }), c("zoneId", "int", { notNull: true }),
+      c("relativeName", "text", { notNull: true }), c("fqdn", "text", { notNull: true }),
+      c("state", "varchar", { length: 32, notNull: true }), c("revision", "bigint", { notNull: true, default: 1 }),
+      c("activeTopologyRevisionId", "int"), c("desiredTopologyRevisionId", "int"), c("currentOperationId", "int"),
+      c("createdByUserId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["configTag"]],
+    indexes: [["xrayInboundId"], ["externalProxyNodeId"], ["dnsAccountId"], ["zoneId"], ["activeTopologyRevisionId"], ["desiredTopologyRevisionId"], ["currentOperationId"]],
+  },
+  {
+    name: "xray_quick_config_domain_claims",
+    columns: [
+      c("id", "id"), c("claimKey", "varchar", { length: 64, notNull: true }),
+      c("dnsAccountId", "int", { notNull: true }), c("zoneId", "int", { notNull: true }),
+      c("normalizedRelativeName", "text", { notNull: true }), c("quickConfigId", "int", { notNull: true }),
+      c("revision", "bigint", { notNull: true, default: 1 }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["claimKey"], ["quickConfigId"]],
+    indexes: [["dnsAccountId", "zoneId"]],
+  },
+  {
+    name: "xray_quick_config_topology_revisions",
+    columns: [
+      c("id", "id"), c("quickConfigId", "int", { notNull: true }),
+      c("revisionNumber", "bigint", { notNull: true }), c("engine", "varchar", { length: 32, notNull: true }),
+      c("targetAddress", "text", { notNull: true }), c("targetPort", "int", { notNull: true }),
+      c("publicPort", "int", { notNull: true }), c("portAllocationId", "int", { notNull: true }),
+      c("state", "varchar", { length: 32, notNull: true }), c("activeSlot", "int"),
+      c("createdByUserId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["quickConfigId", "revisionNumber"], ["quickConfigId", "activeSlot"]],
+    indexes: [["portAllocationId"], ["state"]],
+  },
+  {
+    name: "xray_quick_config_routes",
+    columns: [
+      c("id", "id"), c("routeTag", "varchar", { length: 128, notNull: true }),
+      c("quickConfigId", "int", { notNull: true }), c("topologyRevisionId", "int", { notNull: true }),
+      c("lineCategory", "varchar", { length: 32, notNull: true }),
+      c("providerLineId", "varchar", { length: 128, notNull: true }),
+      c("sourceType", "varchar", { length: 32, notNull: true }), c("hostId", "int"),
+      c("addressFamily", "varchar", { length: 16, notNull: true }), c("address", "text", { notNull: true }),
+      c("routeMode", "varchar", { length: 16, notNull: true }), c("sortOrder", "int", { notNull: true, default: 0 }),
+      c("state", "varchar", { length: 32, notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["routeTag"]],
+    indexes: [["quickConfigId", "state"], ["topologyRevisionId", "sortOrder"], ["hostId"]],
+  },
+  {
+    name: "xray_quick_config_rule_bindings",
+    columns: [
+      c("id", "id"), c("bindingTag", "varchar", { length: 128, notNull: true }),
+      c("quickConfigId", "int", { notNull: true }), c("topologyRevisionId", "int", { notNull: true }),
+      c("forwardRuleId", "int", { notNull: true }), c("state", "varchar", { length: 32, notNull: true }),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["bindingTag"], ["topologyRevisionId", "forwardRuleId"]],
+    indexes: [["quickConfigId", "state"], ["forwardRuleId"]],
+  },
+  {
+    name: "xray_quick_config_dns_records",
+    columns: [
+      c("id", "id"), c("quickConfigId", "int", { notNull: true }), c("routeId", "int", { notNull: true }),
+      c("dnsAccountId", "int", { notNull: true }), c("zoneId", "int", { notNull: true }),
+      c("recordTag", "varchar", { length: 128, notNull: true }), c("providerRecordId", "varchar", { length: 128 }),
+      c("providerLineId", "varchar", { length: 128, notNull: true }), c("fqdn", "text", { notNull: true }),
+      c("recordType", "varchar", { length: 16, notNull: true }), c("value", "text", { notNull: true }),
+      c("ttl", "int", { notNull: true }), c("status", "varchar", { length: 32, notNull: true }),
+      c("appliedRevision", "bigint", { notNull: true }), c("remoteTupleHash", "varchar", { length: 64, notNull: true }),
+      c("lastVerifiedAt", "epoch"), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["recordTag"], ["dnsAccountId", "providerRecordId"]],
+    indexes: [["quickConfigId", "status"], ["routeId"], ["zoneId"]],
+  },
+  {
+    name: "xray_quick_config_dns_record_backups",
+    columns: [
+      c("id", "id"), c("operationId", "int", { notNull: true }), c("dnsAccountId", "int", { notNull: true }),
+      c("zoneId", "int", { notNull: true }), c("providerRecordId", "varchar", { length: 128, notNull: true }),
+      c("fqdn", "text", { notNull: true }), c("recordType", "varchar", { length: 16, notNull: true }),
+      c("providerLineId", "varchar", { length: 128, notNull: true }), c("value", "text", { notNull: true }),
+      c("ttl", "int", { notNull: true }), c("remoteTupleHash", "varchar", { length: 64, notNull: true }),
+      c("snapshotOrder", "int", { notNull: true }), c("state", "varchar", { length: 32, notNull: true }),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["operationId", "dnsAccountId", "providerRecordId"], ["operationId", "snapshotOrder"]],
+    indexes: [["operationId", "state"]],
+  },
+  {
+    name: "xray_quick_config_operations",
+    columns: [
+      c("id", "id"), c("operationTag", "varchar", { length: 128, notNull: true }),
+      c("quickConfigId", "int", { notNull: true }), c("type", "varchar", { length: 32, notNull: true }),
+      c("status", "varchar", { length: 32, notNull: true }), c("phase", "varchar", { length: 32, notNull: true }),
+      c("activeSlot", "int"), c("revision", "bigint", { notNull: true, default: 1 }),
+      c("expectedRevision", "bigint", { notNull: true }), c("fromTopologyRevisionId", "int"),
+      c("toTopologyRevisionId", "int"), c("requestSummaryJson", "text", { notNull: true }),
+      c("retryOfOperationId", "int"), c("executionOwnerId", "varchar", { length: 128 }),
+      c("executionLeaseUntil", "epoch"), c("executionFence", "bigint", { notNull: true, default: 1 }),
+      c("errorCode", "varchar", { length: 64 }), c("errorMessage", "text"),
+      c("createdByUserId", "int", { notNull: true }), c("startedAt", "epoch"), c("finishedAt", "epoch"),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["operationTag"], ["quickConfigId", "activeSlot"]],
+    indexes: [["quickConfigId", "status", "createdAt"], ["retryOfOperationId"], ["executionLeaseUntil"], ["fromTopologyRevisionId"], ["toTopologyRevisionId"]],
+  },
+  {
+    name: "xray_quick_config_operation_steps",
+    columns: [
+      c("id", "id"), c("operationId", "int", { notNull: true }),
+      c("stepKey", "varchar", { length: 128, notNull: true }), c("kind", "varchar", { length: 32, notNull: true }),
+      c("subjectType", "varchar", { length: 32, notNull: true }), c("subjectId", "varchar", { length: 128 }),
+      c("status", "varchar", { length: 32, notNull: true }), c("attemptCount", "int", { notNull: true, default: 0 }),
+      c("idempotencyKey", "varchar", { length: 128, notNull: true }), c("requestSummaryJson", "text", { notNull: true }),
+      c("resultSummaryJson", "text"), c("errorCode", "varchar", { length: 64 }), c("startedAt", "epoch"),
+      c("finishedAt", "epoch"), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["operationId", "stepKey"], ["idempotencyKey"]],
+    indexes: [["operationId", "status"], ["subjectType", "subjectId"]],
+  },
+  {
+    name: "global_port_allocations",
+    columns: [
+      c("id", "id"), c("allocationTag", "varchar", { length: 128, notNull: true }), c("port", "int", { notNull: true }),
+      c("status", "varchar", { length: 32, notNull: true }), c("primaryOwnerType", "varchar", { length: 64 }),
+      c("primaryOwnerTag", "varchar", { length: 128 }), c("reservationTokenHash", "varchar", { length: 64 }),
+      c("reservedUntil", "epoch"), c("scanNotBefore", "epoch"), c("lastScanStartedAt", "epoch"),
+      c("lastScanFinishedAt", "epoch"), c("lastErrorCode", "varchar", { length: 64 }),
+      c("version", "bigint", { notNull: true, default: 1 }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["allocationTag"], ["port"]],
+    indexes: [["status", "scanNotBefore"], ["primaryOwnerType", "primaryOwnerTag"]],
+  },
+  {
+    name: "global_port_allocation_references",
+    columns: [
+      c("id", "id"), c("referenceKey", "varchar", { length: 255, notNull: true }),
+      c("allocationId", "int", { notNull: true }), c("resourceType", "varchar", { length: 64, notNull: true }),
+      c("resourceId", "int", { notNull: true }), c("ownerGroupTag", "varchar", { length: 128, notNull: true }),
+      c("hostId", "int"), c("network", "varchar", { length: 16, notNull: true }),
+      c("role", "varchar", { length: 32, notNull: true }), c("isOwning", "bool", { notNull: true, default: false }),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["referenceKey"]],
+    indexes: [["allocationId", "ownerGroupTag"], ["resourceType", "resourceId"], ["hostId"]],
+  },
+  {
+    name: "global_port_probe_runs",
+    columns: [
+      c("id", "id"), c("probeTag", "varchar", { length: 128, notNull: true }), c("allocationId", "int"),
+      c("allocationVersion", "bigint"), c("candidatePort", "int", { notNull: true }),
+      c("purpose", "varchar", { length: 32, notNull: true }), c("status", "varchar", { length: 32, notNull: true }),
+      c("hostSetHash", "varchar", { length: 64, notNull: true }), c("expectedHostCount", "int", { notNull: true }),
+      c("createdByUserId", "int"), c("startedAt", "epoch"), c("finishedAt", "epoch"),
+      c("expiresAt", "epoch", { notNull: true }), c("errorCode", "varchar", { length: 64 }),
+    ],
+    unique: [["probeTag"]],
+    indexes: [["allocationId"], ["purpose", "status", "expiresAt"]],
+  },
+  {
+    name: "global_port_probe_results",
+    columns: [
+      c("id", "id"), c("probeRunId", "int", { notNull: true }), c("hostId", "int", { notNull: true }),
+      c("network", "varchar", { length: 8, notNull: true }),
+      c("xrayOperationId", "varchar", { length: 64, notNull: true }),
+      c("status", "varchar", { length: 32, notNull: true }), c("probedAt", "epoch", { notNull: true }),
+      c("expiresAt", "epoch", { notNull: true }),
+    ],
+    unique: [["probeRunId", "hostId", "network"]],
+    indexes: [["xrayOperationId"], ["hostId", "expiresAt"]],
+  },
+  {
+    name: "global_port_scan_leases",
+    columns: [
+      c("id", "id"), c("scopeKey", "varchar", { length: 64, notNull: true }),
+      c("leaseOwnerHash", "varchar", { length: 64 }), c("leaseUntil", "epoch"), c("lastStartedAt", "epoch"),
+      c("lastFinishedAt", "epoch"), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["scopeKey"]],
+  },
+  {
+    name: "xray_clients",
+    columns: [
+      c("id", "id"), c("inboundId", "int", { notNull: true }), c("name", "text", { notNull: true }),
+      c("uuidEncrypted", "text", { notNull: true }), c("uuidFingerprint", "varchar", { length: 64, notNull: true }),
+      c("shortIdEncrypted", "text", { notNull: true }), c("shortIdFingerprint", "varchar", { length: 64, notNull: true }),
+      c("statsKey", "varchar", { length: 128, notNull: true }), c("flow", "varchar", { length: 64, notNull: true, default: "xtls-rprx-vision" }),
+      c("ownerUserId", "int"), c("isEnabled", "bool", { notNull: true, default: true }),
+      c("pendingDelete", "bool", { notNull: true, default: false }), c("desiredGeneration", "bigint", { notNull: true, default: 0 }),
+      c("sortOrder", "int", { notNull: true, default: 0 }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["uuidFingerprint"], ["statsKey"], ["inboundId", "shortIdFingerprint"]],
+    indexes: [["inboundId", "pendingDelete", "isEnabled", "sortOrder"], ["ownerUserId", "createdAt"]],
+  },
+  {
+    name: "xray_access_entries",
+    columns: [
+      c("id", "id"), c("inboundId", "int", { notNull: true }), c("legacyClientId", "int"),
+      c("name", "text", { notNull: true }), c("credentialType", "varchar", { length: 32, notNull: true }),
+      c("settingsJson", "text", { notNull: true }), c("statsKey", "varchar", { length: 128, notNull: true }),
+      c("ownerUserId", "int"), c("isEnabled", "bool", { notNull: true, default: true }),
+      c("pendingDelete", "bool", { notNull: true, default: false }), c("desiredGeneration", "bigint", { notNull: true, default: 0 }),
+      c("sortOrder", "int", { notNull: true, default: 0 }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["legacyClientId"], ["statsKey"]],
+    indexes: [["inboundId", "pendingDelete", "isEnabled", "sortOrder"], ["ownerUserId", "createdAt"]],
+  },
+  {
+    name: "xray_access_secrets",
+    columns: [
+      c("id", "id"), c("accessEntryId", "int", { notNull: true }), c("kind", "varchar", { length: 32, notNull: true }),
+      c("encryptedValue", "text", { notNull: true }), c("fingerprint", "varchar", { length: 64, notNull: true }),
+      c("keyVersion", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["accessEntryId", "kind"]],
+    indexes: [["kind", "fingerprint"]],
+  },
+  {
+    name: "xray_inbound_secrets",
+    columns: [
+      c("id", "id"), c("inboundId", "int", { notNull: true }), c("kind", "varchar", { length: 32, notNull: true }),
+      c("encryptedValue", "text", { notNull: true }), c("fingerprint", "varchar", { length: 64, notNull: true }),
+      c("keyVersion", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["inboundId", "kind"]],
+    indexes: [["kind", "fingerprint"]],
+  },
+  {
+    name: "xray_tls_certificates",
+    columns: [
+      c("id", "id"), c("hostId", "int", { notNull: true }), c("name", "text", { notNull: true }),
+      c("certificateTag", "varchar", { length: 128, notNull: true }), c("certificateChainPem", "text", { notNull: true }),
+      c("privateKeyEncrypted", "text", { notNull: true }), c("privateKeyFingerprint", "varchar", { length: 64, notNull: true }),
+      c("keyVersion", "int", { notNull: true }), c("leafFingerprintSha256", "varchar", { length: 64, notNull: true }),
+      c("dnsNamesJson", "text", { notNull: true }), c("subject", "text", { notNull: true }), c("issuer", "text", { notNull: true }),
+      c("serialNumber", "varchar", { length: 128, notNull: true }), c("notBefore", "epoch", { notNull: true }),
+      c("notAfter", "epoch", { notNull: true }), c("keyAlgorithm", "varchar", { length: 32, notNull: true }),
+      c("createdByUserId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["certificateTag"]],
+    indexes: [["hostId", "name"], ["hostId", "notAfter"], ["privateKeyFingerprint"], ["leafFingerprintSha256"]],
+  },
+  {
+    name: "xray_host_deployments",
+    columns: [
+      c("id", "id"), c("hostId", "int", { notNull: true }), c("targetVersion", "varchar", { length: 64 }),
+      c("desiredGeneration", "bigint", { notNull: true, default: 0 }), c("desiredConfigHash", "varchar", { length: 64 }),
+      c("lastOperationId", "varchar", { length: 64 }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["hostId"]],
+    indexes: [["lastOperationId"]],
+  },
+  {
+    name: "xray_runtime_reports",
+    columns: [
+      c("id", "id"), c("hostId", "int", { notNull: true }), c("capabilitySchemaVersion", "int", { notNull: true, default: 0 }),
+      c("supportedOS", "varchar", { length: 32 }), c("supportedArch", "varchar", { length: 32 }),
+      c("supportsArtifactInstall", "bool", { notNull: true, default: false }), c("supportsPortProbe", "bool", { notNull: true, default: false }),
+      c("supportsUdpPortProbe", "bool", { notNull: true, default: false }),
+      c("supportsUdpListenerReadiness", "bool", { notNull: true, default: false }),
+      c("supportsRealityScan", "bool", { notNull: true, default: false }), c("capabilityErrorCode", "varchar", { length: 64 }),
+      c("isInstalled", "bool", { notNull: true, default: false }), c("installedVersion", "varchar", { length: 64 }),
+      c("runningVersion", "varchar", { length: 64 }), c("serviceStatus", "varchar", { length: 32, notNull: true, default: "UNKNOWN" }),
+      c("processId", "int"), c("appliedGeneration", "bigint", { notNull: true, default: 0 }), c("appliedConfigHash", "varchar", { length: 64 }),
+      c("binarySha256", "varchar", { length: 64 }), c("listenersJson", "text"), c("reportSignature", "varchar", { length: 64 }),
+      c("lastErrorCode", "varchar", { length: 64 }), c("lastErrorMessage", "text"), c("reportedAt", "epoch"),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["hostId"]],
+    indexes: [["reportedAt"]],
+  },
+  {
+    name: "xray_artifacts",
+    columns: [
+      c("id", "id"), c("version", "varchar", { length: 64, notNull: true }), c("os", "varchar", { length: 32, notNull: true }),
+      c("arch", "varchar", { length: 32, notNull: true }), c("packageFormat", "varchar", { length: 16, notNull: true }),
+      c("storageKey", "text", { notNull: true }), c("sha256", "varchar", { length: 64, notNull: true }), c("fileSize", "bigint", { notNull: true }),
+      c("status", "varchar", { length: 32, notNull: true, default: "CACHED" }), c("source", "text"), c("verifiedAt", "epoch"),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["version", "os", "arch"]],
+    indexes: [["version", "status"], ["updatedAt"]],
+  },
+  {
+    name: "xray_operations",
+    columns: [
+      c("id", "id"), c("operationId", "varchar", { length: 64, notNull: true }), c("hostId", "int", { notNull: true }),
+      c("inboundId", "int"), c("type", "varchar", { length: 32, notNull: true }), c("requestedGeneration", "bigint"),
+      c("status", "varchar", { length: 32, notNull: true, default: "QUEUED" }), c("requestMetaJson", "text"), c("resultJson", "text"),
+      c("errorCode", "varchar", { length: 64 }), c("errorMessage", "text"), c("attemptCount", "int", { notNull: true, default: 0 }),
+      c("createdByUserId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }), c("startedAt", "epoch"),
+      c("finishedAt", "epoch"), c("expiresAt", "epoch"), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["operationId"]],
+    indexes: [["hostId", "status", "createdAt"], ["type", "status", "createdAt"], ["inboundId", "createdAt"], ["expiresAt"], ["updatedAt"]],
+  },
+  {
+    name: "xray_managed_services",
+    columns: [
+      c("id", "id"), c("hostId", "int", { notNull: true }), c("name", "text", { notNull: true }),
+      c("serviceTag", "varchar", { length: 128, notNull: true }), c("kind", "varchar", { length: 64, notNull: true }),
+      c("publicAddress", "text", { notNull: true }), c("listenAddress", "varchar", { length: 64, notNull: true, default: "0.0.0.0" }),
+      c("listenPort", "int", { notNull: true }), c("specVersion", "int", { notNull: true, default: 1 }), c("specJson", "text", { notNull: true }),
+      c("targetVersion", "varchar", { length: 64, notNull: true }), c("isEnabled", "bool", { notNull: true, default: true }),
+      c("pendingDelete", "bool", { notNull: true, default: false }), c("desiredGeneration", "bigint", { notNull: true, default: 0 }),
+      c("createdByUserId", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["serviceTag"], ["hostId", "kind", "listenPort"]],
+    indexes: [["hostId", "pendingDelete", "isEnabled"], ["createdByUserId", "createdAt"]],
+  },
+  {
+    name: "xray_managed_service_instance_secrets",
+    columns: [
+      c("id", "id"), c("serviceId", "int", { notNull: true }), c("kind", "varchar", { length: 32, notNull: true }),
+      c("encryptedValue", "text", { notNull: true }), c("fingerprint", "varchar", { length: 64, notNull: true }),
+      c("keyVersion", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["serviceId", "kind"]], indexes: [["kind", "fingerprint"]],
+  },
+  {
+    name: "xray_managed_service_accounts",
+    columns: [
+      c("id", "id"), c("serviceId", "int", { notNull: true }), c("name", "text", { notNull: true }),
+      c("accountTag", "varchar", { length: 128, notNull: true }), c("settingsVersion", "int", { notNull: true, default: 1 }),
+      c("settingsJson", "text", { notNull: true, default: "{}" }), c("isEnabled", "bool", { notNull: true, default: true }),
+      c("pendingDelete", "bool", { notNull: true, default: false }), c("desiredGeneration", "bigint", { notNull: true, default: 0 }),
+      c("sortOrder", "int", { notNull: true, default: 0 }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["accountTag"]],
+    indexes: [["serviceId", "pendingDelete", "isEnabled", "sortOrder"]],
+  },
+  {
+    name: "xray_managed_service_secrets",
+    columns: [
+      c("id", "id"), c("accountId", "int", { notNull: true }), c("kind", "varchar", { length: 32, notNull: true }),
+      c("encryptedValue", "text", { notNull: true }), c("fingerprint", "varchar", { length: 64, notNull: true }),
+      c("keyVersion", "int", { notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
+      c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ],
+    unique: [["accountId", "kind"]], indexes: [["kind", "fingerprint"]],
+  },
+  {
+    name: "xray_managed_service_deployments",
+    columns: [
+      c("id", "id"), c("hostId", "int", { notNull: true }), c("targetVersion", "varchar", { length: 64 }),
+      c("desiredGeneration", "bigint", { notNull: true, default: 0 }), c("desiredConfigHash", "varchar", { length: 64 }),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ], unique: [["hostId"]],
+  },
+  {
+    name: "xray_managed_service_runtime_reports",
+    columns: [
+      c("id", "id"), c("hostId", "int", { notNull: true }), c("capabilityJson", "text"), c("stateJson", "text"),
+      c("stateSignature", "varchar", { length: 64 }), c("reportedAt", "epoch"), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ], unique: [["hostId"]], indexes: [["reportedAt"]],
+  },
+  {
+    name: "xray_managed_service_artifacts",
+    columns: [
+      c("id", "id"), c("kind", "varchar", { length: 64, notNull: true }), c("version", "varchar", { length: 64, notNull: true }),
+      c("os", "varchar", { length: 32, notNull: true }), c("arch", "varchar", { length: 32, notNull: true }),
+      c("packageFormat", "varchar", { length: 16, notNull: true }), c("storageKey", "text", { notNull: true }),
+      c("sha256", "varchar", { length: 64, notNull: true }), c("fileSize", "bigint", { notNull: true }),
+      c("status", "varchar", { length: 32, notNull: true, default: "CACHED" }), c("source", "text"), c("verifiedAt", "epoch"),
+      c("createdAt", "epoch", { notNull: true, default: "now" }), c("updatedAt", "epoch", { notNull: true, default: "now" }),
+    ], unique: [["kind", "version", "os", "arch"]], indexes: [["kind", "version", "status"], ["updatedAt"]],
+  },
+];
+
+const seedSettings = [
+  ["storeEnabled", "false"],
+  ["registrationEnabled", "true"],
+  ["homepageEnabled", "true"],
+  ["homepageCustomEnabled", "false"],
+  ["personalizationTheme", "ink"],
+  ["lookingGlassUserEnabled", "true"],
+  ["allowMultiDeviceLogin", "false"],
+  ["publicHostMonitorEnabled", "false"],
+  ["publicHostMonitorPath", "dev"],
+  ["publicHostMonitorTitle", ""],
+  ["redemptionEnabled", "true"],
+  ["discountEnabled", "true"],
+  ["trafficBillingEnabled", "false"],
+  ["pluginsEnabled", "false"],
+  ["twoFactorEnabled", "false"],
+  ["ddnsTtl", "600"],
+] as const;
+
+const DNS_PROVIDER_GLOBAL_SCOPE = "XRAY_QUICK_CONFIG";
+const GLOBAL_PORT_RECLAIM_SCOPE = "GLOBAL_PORT_RECLAIM";
+
+export function getDatabaseTableDefs(): readonly TableDef[] {
+  return tables;
+}
+
+type SchemaKind = "mysql" | "sqlite" | "postgresql";
+
+function quote(kind: SchemaKind, id: string) {
+  if (kind === "mysql") return `\`${id.replace(/`/g, "``")}\``;
+  return `"${id.replace(/"/g, "\"\"")}"`;
+}
+
+function defaultSql(kind: SchemaKind, value: ColumnDef["default"], columnType?: ColumnType) {
+  if (value === undefined || value === null) return "";
+  if (kind === "mysql" && (columnType === "text" || columnType === "longtext")) return "";
+  if (value === "now") {
+    if (kind === "mysql") return " DEFAULT (UNIX_TIMESTAMP())";
+    if (kind === "postgresql") return " DEFAULT (EXTRACT(EPOCH FROM NOW())::INT)";
+    return " DEFAULT (unixepoch())";
+  }
+  if (typeof value === "boolean") {
+    return kind === "postgresql" ? ` DEFAULT ${value ? "TRUE" : "FALSE"}` : ` DEFAULT ${value ? 1 : 0}`;
+  }
+  if (typeof value === "number") return ` DEFAULT ${value}`;
+  return ` DEFAULT '${String(value).replace(/'/g, "''")}'`;
+}
+
+function columnSql(kind: SchemaKind, column: ColumnDef, forAlter = false) {
+  const name = quote(kind, column.name);
+  if (column.type === "id") {
+    if (forAlter) return "";
+    if (kind === "mysql") return `${name} BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY`;
+    if (kind === "postgresql") return `${name} BIGSERIAL PRIMARY KEY`;
+    return `${name} INTEGER PRIMARY KEY AUTOINCREMENT`;
+  }
+  const type = kind === "sqlite"
+    ? (column.type === "varchar" || column.type === "text" || column.type === "longtext" ? "TEXT" : "INTEGER")
+    : kind === "postgresql"
+      ? ({
+        text: "TEXT",
+        longtext: "TEXT",
+        varchar: `VARCHAR(${column.length || 191})`,
+        int: "INTEGER",
+        bigint: "BIGINT",
+        bool: "BOOLEAN",
+        epoch: "INTEGER",
+      } as Record<ColumnType, string>)[column.type]
+    : ({
+      text: "TEXT",
+      longtext: "LONGTEXT",
+      varchar: `VARCHAR(${column.length || 191})`,
+      int: "INT",
+      bigint: "BIGINT",
+      bool: "BOOLEAN",
+      epoch: "INT",
+    } as Record<ColumnType, string>)[column.type];
+  return `${name} ${type}${column.notNull ? " NOT NULL" : ""}${defaultSql(kind, column.default, column.type)}`;
+}
+
+function mysqlKey(table: string, prefix: string, cols: string[]) {
+  const name = quote("mysql", `${prefix}_${table}_${cols.join("_")}`.slice(0, 60));
+  const expr = cols.map((col) => {
+    const def = tables.find((t) => t.name === table)?.columns.find((c) => c.name === col);
+    const q = quote("mysql", col);
+    return def?.type === "text" || def?.type === "longtext" ? `${q}(191)` : q;
+  }).join(", ");
+  return { name, expr };
+}
+
+async function ensureMysqlSchema(pool: Pool) {
+  for (const table of tables) {
+    const columns = table.columns.map((column) => columnSql("mysql", column)).filter(Boolean);
+    const unique = (table.unique || []).map((cols) => {
+      const key = mysqlKey(table.name, "uniq", cols);
+      return `UNIQUE KEY ${key.name} (${key.expr})`;
+    });
+    const indexes = (table.indexes || []).map((cols) => {
+      const key = mysqlKey(table.name, "idx", cols);
+      return `KEY ${key.name} (${key.expr})`;
+    });
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS ${quote("mysql", table.name)} (${[...columns, ...unique, ...indexes].join(", ")}) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    );
+    for (const column of table.columns) {
+      if (column.type === "id") continue;
+      await pool.query(`ALTER TABLE ${quote("mysql", table.name)} ADD COLUMN ${columnSql("mysql", column, true)}`).catch(() => undefined);
+      if (column.type === "longtext" || (table.name === "xray_inbounds" && column.name === "spiderX")) {
+        const definition = columnSql("mysql", column, true);
+        await pool.query(`ALTER TABLE ${quote("mysql", table.name)} MODIFY COLUMN ${definition}${column.notNull ? "" : " NULL"}`);
+      }
+    }
+    for (const cols of [...(table.indexes || []), ...(table.unique || [])]) {
+      const uniquePrefix = (table.unique || []).some((u) => u.join("|") === cols.join("|")) ? "uniq" : "idx";
+      const key = mysqlKey(table.name, uniquePrefix, cols);
+      await pool.query(`ALTER TABLE ${quote("mysql", table.name)} ADD ${uniquePrefix === "uniq" ? "UNIQUE " : ""}INDEX ${key.name} (${key.expr})`).catch(() => undefined);
+    }
+  }
+  for (const [key, value] of seedSettings) {
+    await pool.execute(
+      "INSERT INTO system_settings (`key`, value, updatedAt) VALUES (?, ?, UNIX_TIMESTAMP()) ON DUPLICATE KEY UPDATE `key` = `key`",
+      [key, value],
+    );
+  }
+  await pool.execute(
+    "INSERT INTO dns_provider_global_bindings (scopeKey, accountId, revision, createdAt, updatedAt) VALUES (?, NULL, 1, UNIX_TIMESTAMP(), UNIX_TIMESTAMP()) ON DUPLICATE KEY UPDATE scopeKey = scopeKey",
+    [DNS_PROVIDER_GLOBAL_SCOPE],
+  );
+  await pool.execute(
+    "INSERT INTO global_port_scan_leases (scopeKey, leaseOwnerHash, leaseUntil, lastStartedAt, lastFinishedAt, updatedAt) VALUES (?, NULL, NULL, NULL, NULL, UNIX_TIMESTAMP()) ON DUPLICATE KEY UPDATE scopeKey = scopeKey",
+    [GLOBAL_PORT_RECLAIM_SCOPE],
+  );
+  await backfillMysqlLastAutoTrafficReset(pool);
+}
+
+function indexName(prefix: string, table: string, cols: string[]) {
+  return `${prefix}_${table}_${cols.join("_")}`.slice(0, 60);
+}
+
+async function ensurePostgresqlSchema(pool: pg.Pool) {
+  for (const table of tables) {
+    const columns = table.columns.map((column) => columnSql("postgresql", column)).filter(Boolean);
+    const unique = (table.unique || []).map((cols) => `UNIQUE (${cols.map((col) => quote("postgresql", col)).join(", ")})`);
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS ${quote("postgresql", table.name)} (${[...columns, ...unique].join(", ")})`,
+    );
+    for (const column of table.columns) {
+      if (column.type === "id") continue;
+      await pool.query(`ALTER TABLE ${quote("postgresql", table.name)} ADD COLUMN ${columnSql("postgresql", column, true)}`).catch(() => undefined);
+    }
+    for (const cols of table.indexes || []) {
+      const name = quote("postgresql", indexName("idx", table.name, cols));
+      await pool.query(`CREATE INDEX IF NOT EXISTS ${name} ON ${quote("postgresql", table.name)} (${cols.map((col) => quote("postgresql", col)).join(", ")})`).catch(() => undefined);
+    }
+    for (const cols of table.unique || []) {
+      const name = quote("postgresql", indexName("uniq", table.name, cols));
+      await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ${name} ON ${quote("postgresql", table.name)} (${cols.map((col) => quote("postgresql", col)).join(", ")})`).catch(() => undefined);
+    }
+  }
+  for (const [key, value] of seedSettings) {
+    await pool.query(
+      'INSERT INTO system_settings ("key", value, "updatedAt") VALUES ($1, $2, EXTRACT(EPOCH FROM NOW())::INT) ON CONFLICT ("key") DO NOTHING',
+      [key, value],
+    );
+  }
+  await pool.query(
+    'INSERT INTO "dns_provider_global_bindings" ("scopeKey", "accountId", revision, "createdAt", "updatedAt") VALUES ($1, NULL, 1, EXTRACT(EPOCH FROM NOW())::INT, EXTRACT(EPOCH FROM NOW())::INT) ON CONFLICT ("scopeKey") DO NOTHING',
+    [DNS_PROVIDER_GLOBAL_SCOPE],
+  );
+  await pool.query(
+    'INSERT INTO "global_port_scan_leases" ("scopeKey", "leaseOwnerHash", "leaseUntil", "lastStartedAt", "lastFinishedAt", "updatedAt") VALUES ($1, NULL, NULL, NULL, NULL, EXTRACT(EPOCH FROM NOW())::INT) ON CONFLICT ("scopeKey") DO NOTHING',
+    [GLOBAL_PORT_RECLAIM_SCOPE],
+  );
+  await backfillPostgresqlLastAutoTrafficReset(pool);
+}
+
+function ensureSqliteSchema(sqlite: Database.Database) {
+  for (const table of tables) {
+    const columns = table.columns.map((column) => columnSql("sqlite", column)).filter(Boolean);
+    const unique = (table.unique || []).map((cols) => `UNIQUE (${cols.map((col) => quote("sqlite", col)).join(", ")})`);
+    sqlite.exec(`CREATE TABLE IF NOT EXISTS ${quote("sqlite", table.name)} (${[...columns, ...unique].join(", ")})`);
+    for (const column of table.columns) {
+      if (column.type === "id") continue;
+      try {
+        sqlite.exec(`ALTER TABLE ${quote("sqlite", table.name)} ADD COLUMN ${columnSql("sqlite", column, true)}`);
+      } catch {
+        // Column already exists.
+      }
+    }
+    for (const cols of [...(table.indexes || []), ...(table.unique || [])]) {
+      const uniquePrefix = (table.unique || []).some((u) => u.join("|") === cols.join("|")) ? "UNIQUE " : "";
+      const indexName = quote("sqlite", `${uniquePrefix ? "uniq" : "idx"}_${table.name}_${cols.join("_")}`.slice(0, 60));
+      sqlite.exec(`CREATE ${uniquePrefix}INDEX IF NOT EXISTS ${indexName} ON ${quote("sqlite", table.name)} (${cols.map((col) => quote("sqlite", col)).join(", ")})`);
+    }
+  }
+  for (const [key, value] of seedSettings) {
+    sqlite.prepare(
+      "INSERT OR IGNORE INTO system_settings (key, value, updatedAt) VALUES (?, ?, unixepoch())",
+    ).run(key, value);
+  }
+  sqlite.prepare(
+    "INSERT OR IGNORE INTO dns_provider_global_bindings (scopeKey, accountId, revision, createdAt, updatedAt) VALUES (?, NULL, 1, unixepoch(), unixepoch())",
+  ).run(DNS_PROVIDER_GLOBAL_SCOPE);
+  sqlite.prepare(
+    "INSERT OR IGNORE INTO global_port_scan_leases (scopeKey, leaseOwnerHash, leaseUntil, lastStartedAt, lastFinishedAt, updatedAt) VALUES (?, NULL, NULL, NULL, NULL, unixepoch())",
+  ).run(GLOBAL_PORT_RECLAIM_SCOPE);
+  backfillSqliteLastAutoTrafficReset(sqlite);
+}
+
+export async function ensureDatabaseSchema(target?: Pool | pg.Pool | Database.Database) {
+  if (target && "prepare" in target) {
+    ensureSqliteSchema(target as Database.Database);
+    return;
+  }
+  if (target && "getConnection" in target) {
+    await ensureMysqlSchema(target as unknown as Pool);
+    return;
+  }
+  if (target) {
+    await ensurePostgresqlSchema(target as pg.Pool);
+    return;
+  }
+  const kind = getDatabaseKind();
+  if (kind === "sqlite") {
+    const sqlite = getSqlite();
+    if (!sqlite) throw new Error("SQLite database is not connected");
+    ensureSqliteSchema(sqlite);
+    return;
+  }
+  if (kind === "postgresql") {
+    const pool = getPostgresPool();
+    if (!pool) throw new Error("PostgreSQL database is not connected");
+    await ensurePostgresqlSchema(pool);
+    return;
+  }
+  const pool = getPool();
+  if (!pool) throw new Error("MySQL database is not connected");
+  await ensureMysqlSchema(pool);
+}

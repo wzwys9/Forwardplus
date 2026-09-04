@@ -1,0 +1,525 @@
+import { Router, Request, Response, NextFunction } from "express";
+import path from "path";
+import * as db from "./db";
+import { AGENT_VERSION } from "./_core/systemRouter";
+import { AGENT_ASSET_NAME_SET, getOrFetchAgentAssetPath } from "./agentAssets";
+import { appendPanelLog } from "./_core/panelLogger";
+import { generateInstallScript } from "./agentInstallScripts";
+import { isNginxForwardProtocolEnabled } from "../shared/forwardTypes";
+import { registerAgentEventClient, unregisterAgentEventClient } from "./agentEvents";
+import { agentEncryptionMiddleware, getAgentTunneledPath } from "./agentEncryptionMiddleware";
+import { AGENT_PANEL_MIGRATION_VERSION, hasAgentVersionChanged, isAgentUpgradeTargetSatisfied, isAgentVersionAtLeast } from "./agentRouteUtils";
+import { resolvePanelUrl } from "./agentPanelUrl";
+import { decryptPayload, decryptPayloadWithCandidates, encryptPayload, isEncryptedEnvelope, rememberEncryptedEnvelope } from "./agentCrypto";
+import {
+  AGENT_AUTH_RESULT_ACCEPTED,
+  AGENT_AUTH_RESULT_HEADER,
+  AGENT_AUTH_RESULT_REJECTED,
+  getAgentHostFromRequest,
+  hasClocklessAgentAuth,
+  hasSignedAgentAuthAttempt,
+  hasVerifiedAgentAuthProof,
+  resolveAgentTokenFromAuthorization,
+} from "./agentAuth";
+import { normalizeAgentText } from "./agentInputValidation";
+import { mergeAgentReportedAddress } from "./agentAddressState";
+import { registerAgentStatusRoutes } from "./agentStatusRoutes";
+import { registerAgentSelfTestRoutes } from "./agentSelfTestRoutes";
+import { registerAgentReportRoutes } from "./agentReportRoutes";
+import { invalidateAgentDesiredStateCache, registerAgentHeartbeatRoute } from "./agentHeartbeatRoute";
+import { handleHostAddressChanged, refreshAgentsAffectedByHostAddress } from "./hostAddressRuntime";
+import { isHostStatusOnline, notifyHostOnlineIfNeeded } from "./hostStatusNotifier";
+import { clearTunnelRuntimeStatusForHost } from "./tunnelRuntimeStatus";
+import { getMigratedToPanelUrl, getPanelMigrationAgentDirective } from "./panelMigrationAgentState";
+import { recordAuthenticatedAgentActivity } from "./agentActivity";
+import { issueAgentAuthChallenges } from "./agentAuthChallenge";
+import { panelCryptoNowMs } from "./panelClock";
+import { runAgentRuntimeRecovery } from "./agentRuntimeRecovery";
+import { observePresenceCapableHostActivity } from "./agentFastLiveness";
+import { registerAgentXrayArtifactRoute } from "./xrayArtifactRoute";
+import { registerAgentManagedServiceArtifactRoute } from "./xrayManagedServiceArtifactRoute";
+import { persistXrayCapabilityReport } from "./xrayHeartbeatState";
+import { processXrayManagedServicesHeartbeatReport } from "./xrayManagedServiceService";
+
+const agentRouter = Router();
+const agentApiRouter = Router();
+const VERBOSE_AGENT_EVENTS = /^(1|true|yes|on)$/i.test(String(process.env.FORWARDX_VERBOSE_AGENT_EVENTS || ""));
+
+function parseForwardProtocolSettings(value: string | null | undefined) {
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+const AGENT_FIREWALL_COUNTER_REFRESH_VERSION = "2.2.178";
+const AGENT_PROTOCOL_GUARD_BACKEND_VERSION = "2.2.127";
+
+agentRouter.use((req, res, next) => {
+  res.setHeader("X-ForwardX-Agent-Auth", "challenge-v2");
+  next();
+});
+
+agentRouter.get("/api/agent/auth-challenge", (req, res) => {
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  res.json({ v: 2, challenges: issueAgentAuthChallenges(req.query.count) });
+});
+
+const AGENT_STREAM_AUTH_LOG_INTERVAL_MS = 5 * 60 * 1000;
+const agentStreamAuthLogCache = new Map<string, number>();
+
+function agentErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error || "Unknown error");
+}
+
+function isAgentStreamAuthFailure(error: unknown, message = agentErrorMessage(error)) {
+  if (error instanceof SyntaxError) return true;
+  return /invalid agent auth proof|mac verification failed|request timestamp out of window|encrypted request replay detected|no token candidates available|invalid iv length/i.test(message);
+}
+
+function shouldLogAgentStreamAuthFailure(message: string) {
+  const key = message.toLowerCase();
+  const now = Date.now();
+  const last = agentStreamAuthLogCache.get(key) || 0;
+  if (now - last < AGENT_STREAM_AUTH_LOG_INTERVAL_MS) return false;
+  agentStreamAuthLogCache.set(key, now);
+  return true;
+}
+
+function migratedAgentPayload(panelUrl: string) {
+  return {
+    success: false,
+    error: "Panel migrated",
+    panelUrl,
+    agentUpgrade: { targetVersion: "9999.0.0", panelUrl },
+  };
+}
+
+async function rejectAgentWhenPanelMigrated(_req: Request, res: Response, next: NextFunction) {
+  const migratedTo = await getMigratedToPanelUrl();
+  if (migratedTo) {
+    res.status(410).json(migratedAgentPayload(migratedTo));
+    return;
+  }
+  next();
+}
+
+async function resetAgentRuntimeStateAfterReconnect(hostId: number, reason: string) {
+  await runAgentRuntimeRecovery(hostId, { preserveReportedRuntime: false }, async () => {
+    await db.resetAgentRuntimeStateForHost(hostId);
+    clearTunnelRuntimeStatusForHost(hostId);
+    invalidateAgentDesiredStateCache(hostId);
+    await refreshAgentsAffectedByHostAddress(hostId, reason);
+    appendPanelLog("info", `[AgentRecovery] host=${hostId} reason=${reason} runtime state marked for reapply`);
+  });
+}
+
+function prepareAgentDesiredStateResync(hostId: number) {
+  invalidateAgentDesiredStateCache(hostId);
+}
+
+function setAgentEventStreamHeaders(res: Response, connection: "keep-alive" | "close") {
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.setHeader("Connection", connection);
+  res.setHeader("X-ForwardX-Panel-Time", String(panelCryptoNowMs()));
+}
+
+async function openAgentEventStream(input: {
+  req: Request;
+  res: Response;
+  token: string;
+  agentVersion?: string | null;
+}) {
+  const { req, res, token } = input;
+  const migratedTo = await db.getSetting("migratedToPanelUrl");
+  if (migratedTo) {
+    res.status(200);
+    setAgentEventStreamHeaders(res, "close");
+    res.flushHeaders?.();
+    res.write(`event: message\n`);
+    if (isAgentVersionAtLeast(input.agentVersion, AGENT_PANEL_MIGRATION_VERSION)) {
+      const migration = await getPanelMigrationAgentDirective();
+      res.write(`data: ${JSON.stringify(encryptPayload({
+        type: "agent-panel-migration",
+        data: {
+          id: migration?.id || `panel-migrated:${migratedTo}`,
+          state: "committed",
+          targetPanelUrl: migratedTo,
+          startedAt: migration?.startedAt,
+        },
+      }, token))}\n\n`);
+    } else {
+      res.write(`data: ${JSON.stringify(encryptPayload({ type: "agent-upgrade", data: migratedAgentPayload(migratedTo).agentUpgrade }, token))}\n\n`);
+    }
+    res.end();
+    return;
+  }
+  const host = await db.getHostByAgentToken(token);
+  if (!host) {
+    const migratedTo = await db.getSetting("migratedToPanelUrl");
+    if (migratedTo) {
+      res.status(410).json({ error: "Panel migrated", panelUrl: migratedTo });
+      return;
+    }
+    res.status(401).json({ error: "Invalid token" });
+    return;
+  }
+  const agentVersion = normalizeAgentText(input.agentVersion, 64);
+  const agentVersionChanged = hasAgentVersionChanged((host as any).agentVersion, agentVersion);
+  const wasOnline = isHostStatusOnline(host);
+  recordAuthenticatedAgentActivity(host.id);
+  observePresenceCapableHostActivity(host.id);
+  if (agentVersion) {
+    const upgradedFirewallCounterAgent = isAgentVersionAtLeast(agentVersion, AGENT_FIREWALL_COUNTER_REFRESH_VERSION)
+      && !isAgentVersionAtLeast((host as any).agentVersion, AGENT_FIREWALL_COUNTER_REFRESH_VERSION);
+    const upgradedProtocolGuardBackendAgent = isAgentVersionAtLeast(agentVersion, AGENT_PROTOCOL_GUARD_BACKEND_VERSION)
+      && !isAgentVersionAtLeast((host as any).agentVersion, AGENT_PROTOCOL_GUARD_BACKEND_VERSION);
+    await db.updateHostHeartbeat(host.id, { agentVersion } as any);
+    if (agentVersionChanged) {
+      prepareAgentDesiredStateResync(host.id);
+      appendPanelLog(
+        "info",
+        `[AgentUpgrade] host=${host.id} version=${String((host as any).agentVersion || "-")} -> ${agentVersion}; desired state marked for resync`,
+      );
+    }
+    if (upgradedFirewallCounterAgent) {
+      await resetAgentRuntimeStateAfterReconnect(host.id, "agent-firewall-counter-upgrade");
+    }
+    if (upgradedProtocolGuardBackendAgent) {
+      await resetAgentRuntimeStateAfterReconnect(host.id, "agent-protocol-guard-backend-upgrade");
+    }
+    const requestedTargetVersion = (host as any).agentUpgradeTargetVersion || AGENT_VERSION;
+    const agentUpgradeCompleted = (host as any).agentUpgradeRequested
+      && isAgentUpgradeTargetSatisfied(agentVersion, requestedTargetVersion, AGENT_VERSION);
+    if (agentUpgradeCompleted) {
+      await db.clearHostAgentUpgradeRequest(host.id);
+    }
+    if (!wasOnline) {
+      await resetAgentRuntimeStateAfterReconnect(host.id, "agent-reconnected");
+      void notifyHostOnlineIfNeeded(host).catch((error) => {
+        console.warn(`[HostStatus] Online notify failed host=${host.id}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
+  }
+
+  res.status(200);
+  setAgentEventStreamHeaders(res, "keep-alive");
+  res.flushHeaders?.();
+
+  const writeEncryptedEvent = (type: string, data: any) => {
+    res.write(`event: message\n`);
+    res.write(`data: ${JSON.stringify(encryptPayload({ type, data }, token))}\n\n`);
+  };
+
+  registerAgentEventClient(host.id, token, res);
+  if (VERBOSE_AGENT_EVENTS) console.info(`[AgentEvent] host=${host.id} connected${agentVersion ? ` version=${agentVersion}` : ""}`);
+  writeEncryptedEvent("ready", { success: true });
+
+  const heartbeat = setInterval(() => {
+    // SSE comments keep proxies awake without an encryption + JSON allocation
+    // on every connection. Agents ignore comment lines by design.
+    res.write(": ping\n\n");
+  }, 25000);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    unregisterAgentEventClient(host.id, res);
+    if (VERBOSE_AGENT_EVENTS) console.info(`[AgentEvent] host=${host.id} disconnected`);
+  });
+}
+
+// 为所有 /api/agent/* POST 接口启用加密中间件（GET install.sh 等不需要）
+agentRouter.use("/api/agent", (req, res, next) => {
+  if (req.method !== "POST") return next();
+  return agentEncryptionMiddleware(req, res, next);
+});
+
+agentRouter.post("/api/sync", agentEncryptionMiddleware, (req: Request, res: Response, next) => {
+  const tunneledPath = getAgentTunneledPath(req);
+  if (!tunneledPath) {
+    res.status(400).json({ error: "Invalid encrypted request" });
+    return;
+  }
+  req.url = tunneledPath;
+  (agentApiRouter as any).handle(req, res, next);
+});
+
+agentApiRouter.use(rejectAgentWhenPanelMigrated);
+
+agentRouter.get("/api/stream", async (req: Request, res: Response) => {
+  try {
+    const protocolNowMs = panelCryptoNowMs();
+    const rawEnvelope = String(req.query.e || "");
+    const envelope = rawEnvelope ? JSON.parse(rawEnvelope) : null;
+    if (!isEncryptedEnvelope(envelope)) {
+      res.setHeader(AGENT_AUTH_RESULT_HEADER, AGENT_AUTH_RESULT_REJECTED);
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    const proofToken = await resolveAgentTokenFromAuthorization(req, "", protocolNowMs, rawEnvelope);
+    let token: string;
+    let payload: any;
+    if (proofToken) {
+      token = proofToken;
+      if (hasVerifiedAgentAuthProof(req)) {
+        res.setHeader(AGENT_AUTH_RESULT_HEADER, AGENT_AUTH_RESULT_ACCEPTED);
+      }
+      payload = decryptPayload(envelope, token, {
+        validateTimestamp: !hasClocklessAgentAuth(req),
+        nowMs: protocolNowMs,
+      });
+    } else if (hasSignedAgentAuthAttempt(req)) {
+      throw new Error("Invalid Agent auth proof");
+    } else {
+      let resolved;
+      try {
+        resolved = decryptPayloadWithCandidates(envelope, await db.getAgentAuthTokenCandidates(), { nowMs: protocolNowMs });
+      } catch {
+        resolved = decryptPayloadWithCandidates(envelope, await db.getAgentAuthTokenCandidates({ force: true }), { nowMs: protocolNowMs });
+      }
+      token = resolved.token;
+      payload = resolved.payload;
+      rememberEncryptedEnvelope(envelope);
+    }
+    res.setHeader(AGENT_AUTH_RESULT_HEADER, AGENT_AUTH_RESULT_ACCEPTED);
+    await openAgentEventStream({
+      req,
+      res,
+      token,
+      agentVersion: payload?.agentVersion,
+    });
+  } catch (error) {
+    const message = agentErrorMessage(error);
+    if (isAgentStreamAuthFailure(error, message)) {
+      const proofVerified = hasVerifiedAgentAuthProof(req);
+      if (shouldLogAgentStreamAuthFailure(message)) {
+        appendPanelLog(
+          "warn",
+          proofVerified
+            ? "[Agent Stream] rejected stream envelope after verified Agent proof: " + message
+            : "[Agent Stream] rejected encrypted stream request: " + message,
+        );
+      }
+      res.setHeader(
+        AGENT_AUTH_RESULT_HEADER,
+        proofVerified ? AGENT_AUTH_RESULT_ACCEPTED : AGENT_AUTH_RESULT_REJECTED,
+      );
+      res.status(401).json({ error: "Unauthorized", message });
+      return;
+    }
+    console.error("[Agent Stream] Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+agentRouter.get("/api/agent/events", async (req: Request, res: Response) => {
+  try {
+    let token: string | null = null;
+    try {
+      token = await resolveAgentTokenFromAuthorization(req, "", panelCryptoNowMs());
+    } catch {
+      token = null;
+    }
+    if (!token) {
+      res.setHeader(AGENT_AUTH_RESULT_HEADER, AGENT_AUTH_RESULT_REJECTED);
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    res.setHeader(AGENT_AUTH_RESULT_HEADER, AGENT_AUTH_RESULT_ACCEPTED);
+    await openAgentEventStream({ req, res, token, agentVersion: req.header("X-Agent-Version") });
+  } catch (error) {
+    console.error("[Agent Events] Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Agent 注册接口
+agentApiRouter.post("/api/agent/register", async (req: Request, res: Response) => {
+  try {
+    const { token, osInfo, cpuInfo, memoryTotal, agentVersion } = req.body;
+    if (!token) {
+      res.status(400).json({ error: "Token is required" });
+      return;
+    }
+
+    // 验证 token
+    const agentToken = await db.getAgentTokenByToken(token);
+    if (!agentToken) {
+      const migratedTo = await db.getSetting("migratedToPanelUrl");
+      if (migratedTo) {
+        res.status(410).json({ error: "Panel migrated", panelUrl: migratedTo });
+        return;
+      }
+      res.status(401).json({ error: "Invalid token" });
+      return;
+    }
+
+    // 检查是否已有主机使用此 token
+    const initialReportedAddress = mergeAgentReportedAddress(req.body);
+    const nextOsInfo = normalizeAgentText(osInfo, 256);
+    const nextCpuInfo = normalizeAgentText(cpuInfo, 256);
+    const nextAgentVersion = normalizeAgentText(agentVersion, 64);
+
+    const existingHost = await db.getHostByAgentToken(token);
+    if (existingHost) {
+      const wasOnline = isHostStatusOnline(existingHost);
+      const reportedAddress = mergeAgentReportedAddress(req.body, existingHost);
+      const entryChanged = [
+        ["ip", reportedAddress.ip],
+        ["ipv4", reportedAddress.ipv4],
+        ["ipv6", reportedAddress.ipv6],
+      ].some(([key, value]) => String(value || "") !== String((existingHost as any)[key as string] || ""));
+      await db.updateHost(existingHost.id, {
+        ip: reportedAddress.ip,
+        ipv4: reportedAddress.ipv4,
+        ipv6: reportedAddress.ipv6,
+        ...(entryChanged ? {
+          geoCountryCode: null,
+          geoCountryName: null,
+          geoRegion: null,
+          geoEmoji: null,
+          geoLatitudeMicro: null,
+          geoLongitudeMicro: null,
+          geoUpdatedAt: null,
+        } : {}),
+        osInfo: nextOsInfo || existingHost.osInfo,
+        cpuInfo: nextCpuInfo || existingHost.cpuInfo,
+        memoryTotal: memoryTotal || existingHost.memoryTotal,
+        agentVersion: nextAgentVersion || (existingHost as any).agentVersion,
+        isOnline: true,
+        lastHeartbeat: new Date(),
+      });
+      if (entryChanged) {
+        await handleHostAddressChanged(
+          existingHost.id,
+          { ...existingHost, ...reportedAddress },
+          existingHost,
+          "agent-address-changed",
+        );
+      }
+      if (!wasOnline) {
+        await resetAgentRuntimeStateAfterReconnect(existingHost.id, "agent-reconnected");
+        void notifyHostOnlineIfNeeded({ ...existingHost, ...reportedAddress }).catch((error) => {
+          console.warn(`[HostStatus] Online notify failed host=${existingHost.id}: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }
+      await persistXrayCapabilityReport(existingHost.id, req.body?.xrayCapability);
+      await processXrayManagedServicesHeartbeatReport({
+        hostId: existingHost.id,
+        managedServicesCapability: req.body?.managedServicesCapability ?? null,
+      });
+      prepareAgentDesiredStateResync(existingHost.id);
+      res.json({ success: true, hostId: existingHost.id, message: "Host updated" });
+      return;
+    }
+
+    const tokenDescription = String(agentToken.description || "").trim();
+
+    // 创建新主机
+    const hostId = await db.createHost({
+      name: tokenDescription || `Agent-${token.substring(0, 8)}`,
+      ip: initialReportedAddress.ip,
+      ipv4: initialReportedAddress.ipv4,
+      ipv6: initialReportedAddress.ipv6,
+      hostType: "slave",
+      agentToken: token,
+      osInfo: nextOsInfo || null,
+      cpuInfo: nextCpuInfo || null,
+      memoryTotal: memoryTotal || null,
+      agentVersion: nextAgentVersion || null,
+      isOnline: true,
+      lastHeartbeat: new Date(),
+      userId: agentToken.userId,
+    });
+
+    await db.markAgentTokenUsed(token, hostId);
+    await persistXrayCapabilityReport(hostId, req.body?.xrayCapability);
+    await processXrayManagedServicesHeartbeatReport({
+      hostId,
+      managedServicesCapability: req.body?.managedServicesCapability ?? null,
+    });
+    prepareAgentDesiredStateResync(hostId);
+    res.json({ success: true, hostId, message: "Host registered" });
+  } catch (error) {
+    console.error("[Agent Register] Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Agent 心跳接口
+registerAgentHeartbeatRoute(agentApiRouter);
+registerAgentStatusRoutes(agentApiRouter);
+registerAgentSelfTestRoutes(agentApiRouter);
+registerAgentReportRoutes(agentApiRouter);
+registerAgentXrayArtifactRoute(agentApiRouter);
+registerAgentManagedServiceArtifactRoute(agentApiRouter);
+
+agentApiRouter.post("/api/agent/migration-rollback", async (req: Request, res: Response) => {
+  try {
+    const host = await getAgentHostFromRequest(req);
+    if (!host) {
+      res.status(401).json({ error: "Invalid token" });
+      return;
+    }
+    await db.clearHostAgentUpgradeRequest(Number(host.id));
+    res.json({ success: true, hostId: Number(host.id) });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+agentRouter.use(agentApiRouter);
+
+agentRouter.get("/api/agent/install.sh", async (req: Request, res: Response) => {
+  const panelUrl = await resolvePanelUrl(req);
+  const settings = await db.getAllSettings();
+  const panelMigration = await getPanelMigrationAgentDirective();
+  const abortedFallbackActive = panelMigration?.state === "aborted"
+    && !!panelMigration.startedAt
+    && Math.floor(Date.now() / 1000) - panelMigration.startedAt <= 60 * 60;
+  const migrationFallbackEnabled = panelMigration?.state === "preparing"
+    || panelMigration?.state === "committing"
+    || abortedFallbackActive;
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.send(generateInstallScript(panelUrl, {
+    githubAcceleratorEnabled: settings.githubAcceleratorEnabled === "true",
+    githubAcceleratorUrl: settings.githubAcceleratorUrl || "",
+    preferPanelInstall: settings.agentPreferPanelInstall === "true",
+    installNginx: isNginxForwardProtocolEnabled(parseForwardProtocolSettings(settings.forwardProtocols)),
+    migrationFallbackPanelUrl: migrationFallbackEnabled ? panelMigration?.fallbackPanelUrl : undefined,
+    panelMigrationId: migrationFallbackEnabled ? panelMigration?.id : undefined,
+    panelMigrationStartedAt: migrationFallbackEnabled ? panelMigration?.startedAt : undefined,
+  }));
+});
+
+agentRouter.get("/api/agent/install-mimic.sh", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.sendFile(path.resolve(process.cwd(), "scripts/install-mimic.sh"), (error) => {
+    if (error && !res.headersSent) res.status(404).send("Installer not available");
+  });
+});
+
+agentRouter.get("/api/agent/assets/:version/:asset", async (req: Request, res: Response) => {
+  const version = String(req.params.version || "").trim().replace(/^v/i, "");
+  const asset = String(req.params.asset || "").trim();
+  if (!/^\d+\.\d+\.\d+$/.test(version) || !AGENT_ASSET_NAME_SET.has(asset)) {
+    res.status(404).send("Not found");
+    return;
+  }
+
+  const filePath = await getOrFetchAgentAssetPath(version, asset);
+  if (!filePath) {
+    res.status(503).send("Agent asset not available");
+    return;
+  }
+  res.setHeader("Content-Type", "application/octet-stream");
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Content-Disposition", `attachment; filename="${asset}"`);
+  res.sendFile(filePath);
+});
+
+export { agentRouter };

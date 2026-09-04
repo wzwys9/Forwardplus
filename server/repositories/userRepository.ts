@@ -1,0 +1,900 @@
+import { and, desc, eq, sql } from "drizzle-orm";
+import { InsertUser, users, forwardRules, trafficBillingUsage, userSubscriptions } from "../../drizzle/schema";
+import { executeRaw, getDatabaseKind, getDb, insertAndGetId, nowDate, queryRaw, quoteDbIdentifier, rawAffectedRows, withDatabaseTransaction } from "../dbRuntime";
+import { hashPassword, verifyPassword, verifyPasswordAgainstDummy } from "../password";
+import { getSessionKindField, type SessionKind } from "../session";
+import { revokeUserAuthSessions } from "./sessionRepository";
+import {
+  AVATAR_DAILY_CHANGE_LIMIT,
+  AVATAR_RANDOM_WINDOW_LIMIT,
+  AVATAR_RANDOM_WINDOW_MS,
+  migrateLegacyAvatarValue,
+  normalizeAvatarValue,
+  randomAvataaarsValue,
+} from "../../shared/avatar";
+import { pageResult, pageWindowForTotal, type PageRequest } from "../../shared/pagination";
+import { billingCalendarParts, billingMonthStart } from "../../shared/billingTime";
+
+export type ForwardAccessPauseReason = "manual" | "traffic_billing_balance" | "traffic_limit" | "expired" | null;
+
+// ==================== User Queries ====================
+
+export async function getUserByUsername(username: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const r = await db.select().from(users).where(eq(users.username, username)).limit(1);
+  if (r[0]) return r[0];
+
+  const normalized = username.trim().toLowerCase();
+  if (!normalized.includes("@")) return undefined;
+  const matches = await db
+    .select()
+    .from(users)
+    .where(sql`LOWER(${users.username}) = ${normalized} OR LOWER(${users.email}) = ${normalized}`)
+    .limit(2);
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+export async function getUserById(id: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const r = await db.select().from(users).where(eq(users.id, id)).limit(1);
+  return r[0];
+}
+
+export async function setUserSessionToken(
+  userId: number,
+  sessionKind: SessionKind,
+  sessionToken: string | null,
+  options: { touchUserUpdatedAt?: boolean } = {},
+) {
+  const db = await getDb();
+  if (!db) return;
+  const field = getSessionKindField(sessionKind);
+  const patch: Record<string, unknown> = {};
+  if (options.touchUserUpdatedAt !== false) {
+    patch.updatedAt = nowDate();
+  }
+  patch[field] = sessionToken || null;
+  await db.update(users).set(patch as any).where(eq(users.id, userId));
+}
+
+export async function clearUserSessionToken(userId: number, sessionKind: SessionKind) {
+  await setUserSessionToken(userId, sessionKind, null);
+}
+
+export async function getUserByTelegramId(telegramId: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const r = await db.select().from(users).where(eq(users.telegramId, telegramId)).limit(1);
+  return r[0];
+}
+
+export async function getUserByTelegramBindCode(code: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const r = await db.select().from(users).where(eq(users.telegramBindCode, code)).limit(1);
+  return r[0];
+}
+
+export async function getUserByTelegramLoginCode(code: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const r = await db.select().from(users).where(eq(users.telegramLoginCode, code)).limit(1);
+  return r[0];
+}
+
+export async function authenticateUser(username: string, password: string) {
+  const user = await getUserByUsername(username);
+  if (!user) {
+    verifyPasswordAgainstDummy(password);
+    return null;
+  }
+  if (!verifyPassword(password, user.password)) return null;
+  const db = await getDb();
+  if (db && (user as any).accountEnabled !== false) {
+    await db.update(users).set({ lastSignedIn: nowDate(), updatedAt: nowDate() }).where(eq(users.id, user.id));
+  }
+  return user;
+}
+
+export async function changeUserPassword(userId: number, oldPassword: string, newPassword: string): Promise<boolean> {
+  const user = await getUserById(userId);
+  if (!user) return false;
+  if (!verifyPassword(oldPassword, user.password)) return false;
+  const db = await getDb();
+  if (!db) return false;
+  await revokeUserAuthSessions(userId, { reason: "password_changed" });
+  await db.update(users).set({ password: hashPassword(newPassword), updatedAt: nowDate() }).where(eq(users.id, userId));
+  return true;
+}
+
+export async function verifyUserPassword(userId: number, password: string) {
+  const user = await getUserById(userId);
+  if (!user) return false;
+  return verifyPassword(password, user.password);
+}
+
+export async function updateUserProfile(userId: number, data: { name?: string; email?: string; displayRemark?: string | null; avatar?: string | null; telegramAnnouncementSubscribed?: boolean }) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(users).set({ ...data, updatedAt: nowDate() }).where(eq(users.id, userId));
+}
+
+export async function getTelegramAnnouncementSubscribers() {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select({
+      id: users.id,
+      username: users.username,
+      name: users.name,
+      telegramId: users.telegramId,
+      telegramUsername: users.telegramUsername,
+    })
+    .from(users)
+    .where(and(
+      eq(users.accountEnabled, true),
+      eq(users.telegramAnnouncementSubscribed, true),
+      sql`${users.telegramId} IS NOT NULL`,
+    ));
+}
+
+export async function getTelegramAdminRecipients() {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select({
+      id: users.id,
+      username: users.username,
+      name: users.name,
+      telegramId: users.telegramId,
+      telegramUsername: users.telegramUsername,
+    })
+    .from(users)
+    .where(and(
+      eq(users.accountEnabled, true),
+      eq(users.role, "admin"),
+      sql`${users.telegramId} IS NOT NULL`,
+    ));
+}
+
+export async function enableUserTwoFactor(userId: number, secret: string) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(users).set({
+    twoFactorEnabled: true,
+    twoFactorSecret: secret,
+    twoFactorEnabledAt: nowDate(),
+    updatedAt: nowDate(),
+  }).where(eq(users.id, userId));
+}
+
+export async function disableUserTwoFactor(userId: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(users).set({
+    twoFactorEnabled: false,
+    twoFactorSecret: null,
+    twoFactorEnabledAt: null,
+    updatedAt: nowDate(),
+  }).where(eq(users.id, userId));
+}
+
+export async function createTelegramBindCode(userId: number, code: string, expiresAt: Date) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(users).set({
+    telegramBindCode: code,
+    telegramBindCodeExpiresAt: expiresAt,
+    updatedAt: nowDate(),
+  }).where(eq(users.id, userId));
+}
+
+export async function clearTelegramBindCode(userId: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(users).set({
+    telegramBindCode: null,
+    telegramBindCodeExpiresAt: null,
+    updatedAt: nowDate(),
+  }).where(eq(users.id, userId));
+}
+
+export async function bindTelegramAccount(userId: number, telegram: {
+  id: string;
+  username?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+}) {
+  const db = await getDb();
+  if (!db) return;
+  const now = nowDate();
+  const existing = await getUserByTelegramId(telegram.id);
+  if (existing && existing.id !== userId) {
+    await db.update(users).set({
+      telegramId: null,
+      telegramUsername: null,
+      telegramFirstName: null,
+      telegramLastName: null,
+      telegramLinkedAt: null,
+      telegramLastSeenAt: null,
+      telegramLoginCode: null,
+      telegramLoginCodeExpiresAt: null,
+      updatedAt: now,
+    }).where(eq(users.id, existing.id));
+  }
+  await db.update(users).set({
+    telegramId: telegram.id,
+    telegramUsername: telegram.username || null,
+    telegramFirstName: telegram.firstName || null,
+    telegramLastName: telegram.lastName || null,
+    telegramLinkedAt: now,
+    telegramLastSeenAt: now,
+    telegramBindCode: null,
+    telegramBindCodeExpiresAt: null,
+    updatedAt: now,
+  }).where(eq(users.id, userId));
+}
+
+export async function updateTelegramLastSeen(telegramId: string, telegram?: {
+  username?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+}) {
+  const db = await getDb();
+  if (!db) return;
+  const patch: Record<string, unknown> = {
+    telegramLastSeenAt: nowDate(),
+    updatedAt: nowDate(),
+  };
+  if (telegram) {
+    patch.telegramUsername = telegram.username || null;
+    patch.telegramFirstName = telegram.firstName || null;
+    patch.telegramLastName = telegram.lastName || null;
+  }
+  await db.update(users).set(patch).where(eq(users.telegramId, telegramId));
+}
+
+export async function unbindTelegramAccount(userId: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(users).set({
+    telegramId: null,
+    telegramUsername: null,
+    telegramFirstName: null,
+    telegramLastName: null,
+    telegramLinkedAt: null,
+    telegramLastSeenAt: null,
+    telegramBindCode: null,
+    telegramBindCodeExpiresAt: null,
+    telegramLoginCode: null,
+    telegramLoginCodeExpiresAt: null,
+    updatedAt: nowDate(),
+  }).where(eq(users.id, userId));
+}
+
+export async function createTelegramLoginCode(userId: number, code: string, expiresAt: Date) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(users).set({
+    telegramLoginCode: code,
+    telegramLoginCodeExpiresAt: expiresAt,
+    telegramLastSeenAt: nowDate(),
+    updatedAt: nowDate(),
+  }).where(eq(users.id, userId));
+}
+
+export async function consumeTelegramLoginCode(code: string) {
+  const normalized = String(code || "").trim().toUpperCase();
+  if (!normalized) return null;
+  return withDatabaseTransaction(async () => {
+    const db = await getDb();
+    if (!db) return null;
+
+    // Keep the read and clear in one transaction. SQLite serializes this
+    // section through BEGIN IMMEDIATE; server databases need an explicit row
+    // lock so concurrent panel instances cannot consume the same code.
+    const q = quoteDbIdentifier;
+    const lock = getDatabaseKind() === "sqlite" ? "" : " FOR UPDATE";
+    const locked = await queryRaw<{ id: number }>(
+      `SELECT ${q("id")} AS ${q("id")} FROM ${q("users")} WHERE ${q("telegramLoginCode")} = ?${lock}`,
+      [normalized],
+    );
+    const userId = Number(locked[0]?.id || 0);
+    if (!userId) return null;
+
+    // Fetch through Drizzle so epoch/date and dialect mappings stay identical
+    // to getUserByTelegramLoginCode.
+    const rows = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+    const user = rows[0];
+    if (!user) return null;
+    const expiresAt = user.telegramLoginCodeExpiresAt ? new Date(user.telegramLoginCodeExpiresAt).getTime() : 0;
+    const clear = {
+      telegramLoginCode: null,
+      telegramLoginCodeExpiresAt: null,
+      updatedAt: nowDate(),
+    };
+    if (!expiresAt || expiresAt <= Date.now()) {
+      await db.update(users).set(clear).where(and(eq(users.id, user.id), eq(users.telegramLoginCode, normalized)));
+      return null;
+    }
+    await db.update(users).set({ ...clear, lastSignedIn: nowDate() }).where(and(eq(users.id, user.id), eq(users.telegramLoginCode, normalized)));
+    return user;
+  });
+}
+
+export async function createUser(data: { username: string; password: string; name?: string; email?: string; emailVerified?: boolean; emailVerifiedAt?: Date | null; role?: "user" | "admin"; canAddRules?: boolean }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  return insertAndGetId("users", {
+    username: data.username,
+    password: hashPassword(data.password),
+    name: data.name ?? data.username,
+    email: data.email ?? null,
+    emailVerified: data.emailVerified ?? false,
+    emailVerifiedAt: data.emailVerifiedAt ?? null,
+    avatar: randomAvataaarsValue(String(`user-${data.username}-${Date.now()}`)),
+    role: data.role ?? "user",
+    accountEnabled: true,
+    canAddRules: data.canAddRules ?? false,
+  });
+}
+
+/** 用户自行注册（默认 role=user, canAddRules=false） */
+export async function registerUser(data: { username: string; password: string; name?: string; email?: string; emailVerified?: boolean; emailVerifiedAt?: Date | null }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  return insertAndGetId("users", {
+    username: data.username,
+    password: hashPassword(data.password),
+    name: data.name ?? data.username,
+    email: data.email ?? null,
+    emailVerified: data.emailVerified ?? false,
+    emailVerifiedAt: data.emailVerifiedAt ?? null,
+    avatar: randomAvataaarsValue(String(`user-${data.username}-${Date.now()}`)),
+    role: "user",
+    accountEnabled: true,
+    canAddRules: false,
+  });
+}
+
+export async function resetUserPassword(userId: number, newPassword: string) {
+  const db = await getDb();
+  if (!db) return;
+  await revokeUserAuthSessions(userId, { reason: "password_reset" });
+  await db.update(users).set({ password: hashPassword(newPassword), updatedAt: nowDate() }).where(eq(users.id, userId));
+}
+
+export async function updateUserAccount(userId: number, data: { username?: string; name?: string | null; password?: string; avatar?: string | null }) {
+  const db = await getDb();
+  if (!db) return;
+  const current = await getUserById(userId);
+  if (!current) throw new Error("用户不存在");
+  const patch: Record<string, unknown> = { updatedAt: nowDate() };
+  const username = data.username?.trim();
+  if (username && username !== current.username) {
+    patch.username = username;
+    if (!current.email || current.email === current.username) patch.email = username;
+  }
+  if (data.name !== undefined) {
+    const name = String(data.name || "").trim();
+    patch.name = name || username || current.username;
+  }
+  const password = data.password?.trim();
+  if (password) {
+    await revokeUserAuthSessions(userId, { reason: "password_reset" });
+    patch.password = hashPassword(password);
+  }
+  if (data.avatar !== undefined) {
+    patch.avatar = normalizeAvatarValue(data.avatar) || randomAvataaarsValue(String(`user-${userId}`));
+  }
+  if (Object.keys(patch).length > 1) {
+    await db.update(users).set(patch).where(eq(users.id, userId));
+  }
+}
+
+function avatarChangeDayKey(date = new Date()) {
+  return date.toISOString().slice(0, 10);
+}
+
+export async function getUserAvatarQuota(userId: number) {
+  const user = await getUserById(userId);
+  const today = avatarChangeDayKey();
+  const isAdmin = user?.role === "admin";
+  const used = !isAdmin && user?.avatarChangeDay === today ? Number(user?.avatarChangeCount || 0) : 0;
+  return {
+    limit: AVATAR_DAILY_CHANGE_LIMIT,
+    used,
+    remaining: isAdmin ? AVATAR_DAILY_CHANGE_LIMIT : Math.max(0, AVATAR_DAILY_CHANGE_LIMIT - used),
+    day: today,
+    unlimited: isAdmin,
+  };
+}
+
+export async function updateUserAvatarWithQuota(userId: number, avatar: string, options: { actorRole?: string; countQuota?: boolean } = {}) {
+  const db = await getDb();
+  if (!db) return getUserAvatarQuota(userId);
+  const normalized = normalizeAvatarValue(avatar) || randomAvataaarsValue(String(`user-${userId}`));
+  const current = await getUserById(userId);
+  if (!current) throw new Error("用户不存在");
+  const isSelfServiceLimited = options.countQuota && options.actorRole !== "admin" && current.role !== "admin";
+
+  const patch: Record<string, unknown> = {
+    avatar: normalized,
+    updatedAt: nowDate(),
+  };
+
+  if (isSelfServiceLimited && normalized !== current.avatar) {
+    const today = avatarChangeDayKey();
+    const used = current.avatarChangeDay === today ? Number(current.avatarChangeCount || 0) : 0;
+    if (used >= AVATAR_DAILY_CHANGE_LIMIT) {
+      throw new Error(`头像每天最多修改 ${AVATAR_DAILY_CHANGE_LIMIT} 次`);
+    }
+    patch.avatarChangeDay = today;
+    patch.avatarChangeCount = used + 1;
+  }
+
+  await db.update(users).set(patch).where(eq(users.id, userId));
+  return getUserAvatarQuota(userId);
+}
+
+const randomAvatarWindows = new Map<number, { windowStart: number; count: number }>();
+
+export function checkAvatarRandomRateLimit(userId: number) {
+  const now = Date.now();
+  const current = randomAvatarWindows.get(userId);
+  if (!current || now - current.windowStart >= AVATAR_RANDOM_WINDOW_MS) {
+    randomAvatarWindows.set(userId, { windowStart: now, count: 1 });
+    return {
+      limit: AVATAR_RANDOM_WINDOW_LIMIT,
+      remaining: AVATAR_RANDOM_WINDOW_LIMIT - 1,
+      resetAt: new Date(now + AVATAR_RANDOM_WINDOW_MS),
+    };
+  }
+  if (current.count >= AVATAR_RANDOM_WINDOW_LIMIT) {
+    const retryAfterSeconds = Math.max(1, Math.ceil((AVATAR_RANDOM_WINDOW_MS - (now - current.windowStart)) / 1000));
+    throw new Error(`随机头像生成过于频繁，请 ${retryAfterSeconds} 秒后再试`);
+  }
+  current.count += 1;
+  return {
+    limit: AVATAR_RANDOM_WINDOW_LIMIT,
+    remaining: Math.max(0, AVATAR_RANDOM_WINDOW_LIMIT - current.count),
+    resetAt: new Date(current.windowStart + AVATAR_RANDOM_WINDOW_MS),
+  };
+}
+
+export async function updateUserAvatarRandomWithQuota(userId: number, options: { actorRole?: string; countQuota?: boolean } = {}) {
+  const rateLimit = checkAvatarRandomRateLimit(userId);
+  const avatar = randomAvataaarsValue(String(`user-${userId}-${Date.now()}-${rateLimit.remaining}`));
+  const quota = await updateUserAvatarWithQuota(userId, avatar, options);
+  return { avatar, quota, rateLimit };
+}
+
+export async function migrateLegacyUserAvatars() {
+  const db = await getDb();
+  if (!db) return 0;
+  const rows = await db.select({ id: users.id, avatar: users.avatar }).from(users);
+  let migrated = 0;
+  for (const row of rows) {
+    if (!String(row.avatar || "").startsWith("preset:")) continue;
+    await db.update(users).set({ avatar: migrateLegacyAvatarValue(row.avatar, `user-${row.id}`), updatedAt: nowDate() }).where(eq(users.id, row.id));
+    migrated += 1;
+  }
+  return migrated;
+}
+
+function usersForListQuery(db: any) {
+  // Aggregate billing usage totals once for the whole list query.
+  // The reset column is only a presentation baseline; billing thresholds and
+  // historical charge rows remain untouched when an administrator resets stats.
+  const billingUsageByUser = db
+    .select({
+      userId: trafficBillingUsage.userId,
+      totalBytes: sql<number>`COALESCE(SUM(${trafficBillingUsage.totalBytes}), 0)`.as("totalBytes"),
+    })
+    .from(trafficBillingUsage)
+    .groupBy(trafficBillingUsage.userId)
+    .as("traffic_billing_usage_by_user");
+
+  return db
+    .select({
+      id: users.id,
+      username: users.username,
+      name: users.name,
+      email: users.email,
+      emailVerified: users.emailVerified,
+      emailVerifiedAt: users.emailVerifiedAt,
+      displayRemark: users.displayRemark,
+      avatar: users.avatar,
+      avatarChangeDay: users.avatarChangeDay,
+      avatarChangeCount: users.avatarChangeCount,
+      role: users.role,
+      accountEnabled: users.accountEnabled,
+      canAddRules: users.canAddRules,
+      forwardAccessPauseReason: users.forwardAccessPauseReason,
+      maxRules: users.maxRules,
+      maxPorts: users.maxPorts,
+      maxConnections: users.maxConnections,
+      maxIPs: users.maxIPs,
+      manualCanAddRules: users.manualCanAddRules,
+      manualMaxRules: users.manualMaxRules,
+      manualMaxPorts: users.manualMaxPorts,
+      manualMaxConnections: users.manualMaxConnections,
+      manualMaxIPs: users.manualMaxIPs,
+      manualAllowForwardXTunnel: users.manualAllowForwardXTunnel,
+      manualGostRateLimitIn: users.manualGostRateLimitIn,
+      manualGostRateLimitOut: users.manualGostRateLimitOut,
+      manualTrafficLimit: users.manualTrafficLimit,
+      manualExpiresAt: users.manualExpiresAt,
+      balanceCents: users.balanceCents,
+      allowedForwardTypes: users.allowedForwardTypes,
+      allowForwardXTunnel: users.allowForwardXTunnel,
+      trafficLimit: users.trafficLimit,
+      trafficUsed: users.trafficUsed,
+      trafficBillingUsed: sql<number>`CASE
+        WHEN COALESCE(${billingUsageByUser.totalBytes}, 0) > ${users.trafficBillingResetBytes}
+          THEN COALESCE(${billingUsageByUser.totalBytes}, 0) - ${users.trafficBillingResetBytes}
+        ELSE 0
+      END`.as("trafficBillingUsed"),
+      gostRateLimitIn: users.gostRateLimitIn,
+      gostRateLimitOut: users.gostRateLimitOut,
+      expiresAt: users.expiresAt,
+      trafficAutoReset: users.trafficAutoReset,
+      trafficResetDay: users.trafficResetDay,
+      lastTrafficReset: users.lastTrafficReset,
+      telegramId: users.telegramId,
+      telegramUsername: users.telegramUsername,
+      telegramFirstName: users.telegramFirstName,
+      telegramLastName: users.telegramLastName,
+      telegramLinkedAt: users.telegramLinkedAt,
+      telegramLastSeenAt: users.telegramLastSeenAt,
+      telegramAnnouncementSubscribed: users.telegramAnnouncementSubscribed,
+      twoFactorEnabled: users.twoFactorEnabled,
+      twoFactorEnabledAt: users.twoFactorEnabledAt,
+      createdAt: users.createdAt,
+      lastSignedIn: users.lastSignedIn,
+    })
+    .from(users)
+    .leftJoin(billingUsageByUser, eq(users.id, billingUsageByUser.userId));
+}
+
+export async function getAllUsers() {
+  const db = await getDb();
+  if (!db) return [];
+  return usersForListQuery(db)
+    .orderBy(desc(users.createdAt));
+}
+
+export async function getUserOptions() {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select({
+      id: users.id,
+      username: users.username,
+      name: users.name,
+      email: users.email,
+      avatar: users.avatar,
+      role: users.role,
+      accountEnabled: users.accountEnabled,
+    })
+    .from(users)
+    .orderBy(desc(users.createdAt));
+}
+
+
+export async function getUserManagementCounts() {
+  const db = await getDb();
+  if (!db) return { totalUsers: 0, adminUsers: 0, activeSubscriptions: 0 };
+  const nowSec = Math.floor(Date.now() / 1000);
+  const [userRows, subscriptionRows] = await Promise.all([
+    db.select({
+      totalUsers: sql<number>`COUNT(*)`,
+      adminUsers: sql<number>`COALESCE(SUM(CASE WHEN ${users.role} = 'admin' THEN 1 ELSE 0 END), 0)`,
+    }).from(users),
+    db.select({
+      activeSubscriptions: sql<number>`COALESCE(SUM(CASE
+        WHEN ${userSubscriptions.status} = 'active'
+          AND (${userSubscriptions.expiresAt} IS NULL OR ${userSubscriptions.expiresAt} > ${nowSec})
+        THEN 1 ELSE 0 END), 0)`,
+    }).from(userSubscriptions),
+  ]);
+  return {
+    totalUsers: Number(userRows[0]?.totalUsers || 0),
+    adminUsers: Number(userRows[0]?.adminUsers || 0),
+    activeSubscriptions: Number(subscriptionRows[0]?.activeSubscriptions || 0),
+  };
+}
+
+export async function getUsersPage(input: PageRequest) {
+  const db = await getDb();
+  if (!db) return { ...pageResult([], 0, input), adminItems: 0 };
+  const [totalRows, adminRows] = await Promise.all([
+    db.select({ count: sql<number>`COUNT(*)` }).from(users),
+    db.select({
+      count: sql<number>`COALESCE(SUM(CASE WHEN ${users.role} = 'admin' THEN 1 ELSE 0 END), 0)`,
+    }).from(users),
+  ]);
+  const totalItems = Number(totalRows[0]?.count || 0);
+  const adminItems = Number(adminRows[0]?.count || 0);
+  const window = pageWindowForTotal(input, totalItems);
+  const items = await usersForListQuery(db)
+    .orderBy(desc(users.createdAt))
+    .limit(window.pageSize)
+    .offset(window.offset);
+  return {
+    ...pageResult(items, totalItems, window),
+    adminItems,
+  };
+}
+
+export async function updateUserRole(userId: number, role: "user" | "admin") {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(users).set({ role, updatedAt: nowDate() }).where(eq(users.id, userId));
+}
+
+export async function deleteUser(userId: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db.delete(users).where(eq(users.id, userId));
+}
+
+/** 更新用户流量管理设置（管理员操作） */
+export async function updateUserTrafficSettings(userId: number, data: {
+  trafficLimit?: number;
+  gostRateLimitIn?: number;
+  gostRateLimitOut?: number;
+  expiresAt?: Date | null;
+  trafficAutoReset?: boolean;
+  trafficResetDay?: number;
+  canAddRules?: boolean;
+  forwardAccessPauseReason?: ForwardAccessPauseReason;
+  maxRules?: number;
+  maxPorts?: number;
+  maxConnections?: number;
+  maxIPs?: number;
+  manualCanAddRules?: boolean;
+  manualMaxRules?: number;
+  manualMaxPorts?: number;
+  manualMaxConnections?: number;
+  manualMaxIPs?: number;
+  manualAllowForwardXTunnel?: boolean;
+  manualGostRateLimitIn?: number;
+  manualGostRateLimitOut?: number;
+  manualTrafficLimit?: number;
+  manualExpiresAt?: Date | null;
+  allowedForwardTypes?: string | null;
+  allowForwardXTunnel?: boolean;
+  displayRemark?: string | null;
+}) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(users).set({ ...data, updatedAt: nowDate() } as any).where(eq(users.id, userId));
+}
+
+export async function setUserForwardAccess(userId: number, enabled: boolean, reason?: ForwardAccessPauseReason) {
+  const db = await getDb();
+  if (!db) return;
+  const now = nowDate();
+  await db.update(users).set({
+    canAddRules: enabled,
+    allowForwardXTunnel: enabled,
+    forwardAccessPauseReason: enabled ? null : (reason ?? "manual"),
+    updatedAt: now,
+  }).where(eq(users.id, userId));
+  if (!enabled) {
+    await db.update(forwardRules).set({
+      isEnabled: false,
+      disabledByUser: true,
+      updatedAt: now,
+    }).where(and(
+      eq(forwardRules.userId, userId),
+      eq(forwardRules.isEnabled, true),
+      eq(forwardRules.pendingDelete, false),
+    ));
+  }
+}
+
+export async function setUserAccountEnabled(userId: number, enabled: boolean) {
+  return withDatabaseTransaction(async () => {
+    const db = await getDb();
+    if (!db) return;
+    const now = nowDate();
+    if (!enabled) {
+      // Disable is an authentication boundary as well as an access-control
+      // change: revoke browser/mobile/Telegram sessions before publishing the
+      // disabled state. Keep the session-table -> user-row lock order shared
+      // with password/session revocation paths to reduce deadlock risk.
+      await revokeUserAuthSessions(userId, { reason: "account_disabled" });
+    }
+    await db.update(users).set({
+      accountEnabled: enabled,
+      updatedAt: now,
+    }).where(eq(users.id, userId));
+    if (!enabled) {
+      await db.update(forwardRules).set({
+        isEnabled: false,
+        disabledByUser: true,
+        updatedAt: now,
+      }).where(and(
+        eq(forwardRules.userId, userId),
+        eq(forwardRules.isEnabled, true),
+        eq(forwardRules.pendingDelete, false),
+      ));
+    }
+  });
+}
+
+/** 手动重置用户流量 */
+export async function resetUserTraffic(userId: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(users).set({
+    trafficUsed: 0,
+    lastTrafficReset: nowDate(),
+    updatedAt: nowDate(),
+  }).where(eq(users.id, userId));
+}
+
+/** Reset once for a concrete traffic-cycle boundary, including across panel instances. */
+export async function resetUserTrafficForCycle(userId: number, boundary: Date, resetAt = nowDate()) {
+  const boundarySec = Math.floor(boundary.getTime() / 1000);
+  const resetSec = Math.floor(resetAt.getTime() / 1000);
+  if (!Number.isFinite(boundarySec) || !Number.isFinite(resetSec)) return false;
+  const q = quoteDbIdentifier;
+  const result = await executeRaw(
+    `UPDATE ${q("users")}
+     SET ${q("trafficUsed")} = 0,
+         ${q("lastTrafficReset")} = ?,
+         ${q("lastAutoTrafficReset")} = ?,
+         ${q("updatedAt")} = ?
+     WHERE ${q("id")} = ?
+       AND (${q("lastAutoTrafficReset")} IS NULL OR ${q("lastAutoTrafficReset")} < ?)`,
+    [resetSec, resetSec, resetSec, userId, boundarySec],
+  );
+  return rawAffectedRows(result) > 0;
+}
+
+/**
+ * Reset the package quota and the account's displayed pay-as-you-go usage.
+ *
+ * `traffic_billing_usage` is also the billing threshold ledger, so it must not
+ * be cleared here. We snapshot its current total into a per-user baseline and
+ * subtract that baseline in list queries instead.
+ */
+export async function resetUserTrafficAndBillingUsage(userId: number) {
+  return withDatabaseTransaction(async () => {
+    const db = await getDb();
+    if (!db) return;
+    // The billing reporter updates the same usage ledger in a separate
+    // transaction. Lock the owning user row before taking the snapshot so a
+    // manual reset cannot race a report from another panel instance and
+    // publish a stale baseline.
+    if (getDatabaseKind() !== "sqlite") {
+      const q = quoteDbIdentifier;
+      const locked = await queryRaw<{ id: number }>(
+        `SELECT ${q("id")} AS ${q("id")} FROM ${q("users")} WHERE ${q("id")} = ? FOR UPDATE`,
+        [userId],
+      );
+      if (!locked[0]) throw new Error("用户不存在");
+    } else {
+      const rows = await db.select({ id: users.id }).from(users).where(eq(users.id, userId)).limit(1);
+      if (!rows[0]) throw new Error("用户不存在");
+    }
+    const rows = await db.select({
+      totalBytes: sql<number>`COALESCE(SUM(${trafficBillingUsage.totalBytes}), 0)`,
+    }).from(trafficBillingUsage).where(eq(trafficBillingUsage.userId, userId));
+    const totalBytes = Math.max(0, Number(rows[0]?.totalBytes || 0));
+    const now = nowDate();
+    await db.update(users).set({
+      trafficUsed: 0,
+      trafficBillingResetBytes: totalBytes,
+      lastTrafficReset: now,
+      updatedAt: now,
+    } as any).where(eq(users.id, userId));
+  });
+}
+
+/** 累加用户已用流量 */
+export async function addUserTraffic(userId: number, bytes: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const update = db.update(users).set({
+    trafficUsed: sql`${users.trafficUsed} + ${bytes}`,
+    updatedAt: nowDate(),
+  }).where(eq(users.id, userId));
+  if (getDatabaseKind() === "mysql") {
+    await update;
+    return getUserById(userId);
+  }
+  const rows = await update.returning();
+  return rows[0];
+}
+
+/** 获取所有需要月度自动重置的用户 */
+export async function getUsersForAutoReset(reference = nowDate()) {
+  const db = await getDb();
+  if (!db) return [];
+  const { day } = billingCalendarParts(reference);
+  const monthStart = billingMonthStart(reference);
+  const monthStartSec = Math.floor(monthStart.getTime() / 1000);
+  return db.select().from(users).where(and(
+    eq(users.trafficAutoReset, true),
+    sql`${users.trafficResetDay} <= ${day}`,
+    sql`(${users.lastAutoTrafficReset} IS NULL OR ${users.lastAutoTrafficReset} < ${monthStartSec})`,
+  ));
+}
+
+/** 获取所有已到期的用户 */
+export async function getExpiredUsers() {
+  const db = await getDb();
+  if (!db) return [];
+  const nowSec = Math.floor(Date.now() / 1000);
+  return db.select().from(users).where(
+    and(
+      sql`${users.expiresAt} IS NOT NULL`,
+      sql`${users.expiresAt} <= ${nowSec}`,
+      eq(users.canAddRules, true)
+    )
+  );
+}
+
+/** 禁用某用户的所有转发规则（到期/超额时调用） */
+export async function disableAllUserRules(userId: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(forwardRules).set({
+    isEnabled: false,
+    disabledByUser: true,
+    updatedAt: nowDate(),
+  }).where(and(
+    eq(forwardRules.userId, userId),
+    eq(forwardRules.isEnabled, true),
+    eq(forwardRules.pendingDelete, false),
+  ));
+}
+
+/** 获取用户流量汇总信息（用于仪表盘展示） */
+export async function getUserTrafficSummaries() {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select({
+    id: users.id,
+    username: users.username,
+    name: users.name,
+    email: users.email,
+    displayRemark: users.displayRemark,
+    avatar: users.avatar,
+    role: users.role,
+    accountEnabled: users.accountEnabled,
+    trafficLimit: users.trafficLimit,
+    trafficUsed: users.trafficUsed,
+    canAddRules: users.canAddRules,
+    forwardAccessPauseReason: users.forwardAccessPauseReason,
+    manualCanAddRules: users.manualCanAddRules,
+    manualMaxRules: users.manualMaxRules,
+    manualMaxPorts: users.manualMaxPorts,
+    manualMaxConnections: users.manualMaxConnections,
+    manualMaxIPs: users.manualMaxIPs,
+    manualAllowForwardXTunnel: users.manualAllowForwardXTunnel,
+    manualGostRateLimitIn: users.manualGostRateLimitIn,
+    manualGostRateLimitOut: users.manualGostRateLimitOut,
+    manualTrafficLimit: users.manualTrafficLimit,
+    manualExpiresAt: users.manualExpiresAt,
+    gostRateLimitIn: users.gostRateLimitIn,
+    gostRateLimitOut: users.gostRateLimitOut,
+    allowForwardXTunnel: users.allowForwardXTunnel,
+    expiresAt: users.expiresAt,
+    trafficAutoReset: users.trafficAutoReset,
+    trafficResetDay: users.trafficResetDay,
+    maxConnections: users.maxConnections,
+    maxIPs: users.maxIPs,
+    balanceCents: users.balanceCents,
+    telegramId: users.telegramId,
+    telegramUsername: users.telegramUsername,
+    telegramFirstName: users.telegramFirstName,
+    telegramLastName: users.telegramLastName,
+  }).from(users).orderBy(desc(users.trafficUsed));
+}

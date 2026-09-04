@@ -1,0 +1,734 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { pageResult, pageWindowForTotal } from "../shared/pagination";
+import { gateForwardRulesForUserSurface } from "./forwardRuleVisibility";
+
+test("page helpers clamp stale pages after the last item is removed", () => {
+  assert.deepEqual(pageWindowForTotal({ page: 8, pageSize: 12 }, 13), {
+    page: 2,
+    pageSize: 12,
+    offset: 12,
+  });
+  assert.deepEqual(pageResult(["last"], 13, { page: 8, pageSize: 12 }), {
+    items: ["last"],
+    page: 2,
+    pageSize: 12,
+    totalItems: 13,
+    totalPages: 2,
+  });
+});
+
+test("user rule surfaces retain revoked roots and hide managed group children", () => {
+  const direct = { id: 1 };
+  const revokedRoot = { id: 2, forwardGroupId: 10, isForwardGroupTemplate: true, isEnabled: true };
+  const managedChild = { id: 3, forwardGroupId: 10, forwardGroupRuleId: 2, forwardGroupMemberId: 100 };
+  assert.deepEqual(gateForwardRulesForUserSurface(
+    [direct, revokedRoot, managedChild],
+    (rule) => !Number((rule as any).forwardGroupId || 0),
+  ), [
+    direct,
+    {
+      ...revokedRoot,
+      isEnabled: false,
+      resourceAccessAllowed: false,
+      resourceAccessDenied: true,
+    },
+  ]);
+});
+test("database-backed list queries page, search, scope, and hydrate only requested rows", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forwardx-pagination-"));
+  const databasePath = path.join(directory, "pagination.db");
+  const script = String.raw`
+    import assert from "node:assert/strict";
+    import path from "node:path";
+    import { pathToFileURL } from "node:url";
+
+    const moduleUrl = (file) => pathToFileURL(path.join(process.cwd(), file)).href;
+    const runtime = await import(moduleUrl("server/dbRuntime.ts"));
+    const schema = await import(moduleUrl("server/dbSchema.ts"));
+
+    try {
+      await runtime.connectDatabase({ type: "sqlite", sqlite: { path: process.env.FORWARDX_TEST_DB } });
+      await schema.ensureDatabaseSchema();
+
+      const users = await import(moduleUrl("server/repositories/userRepository.ts"));
+      const hosts = await import(moduleUrl("server/repositories/hostRepository.ts"));
+      const tunnels = await import(moduleUrl("server/repositories/tunnelRepository.ts"));
+      const groups = await import(moduleUrl("server/repositories/forwardGroupRepository.ts"));
+      const rules = await import(moduleUrl("server/repositories/forwardRuleRepository.ts"));
+      const billing = await import(moduleUrl("server/repositories/billingRepository.ts"));
+      const { tunnelsRouter } = await import(moduleUrl("server/routers/tunnels.ts"));
+      const { forwardGroupsRouter } = await import(moduleUrl("server/routers/forwardGroups.ts"));
+      const { rulesRouter } = await import(moduleUrl("server/routers/rules.ts"));
+
+      const quote = (name) => '"' + name + '"';
+      const insert = async (table, columns, values) => {
+        await runtime.executeRaw(
+          "INSERT INTO " + quote(table) + " (" + columns.map(quote).join(", ") + ") VALUES (" + values.map(() => "?").join(", ") + ")",
+          values,
+        );
+      };
+      const now = Math.floor(Date.now() / 1000);
+      const hiddenTunnelTestMessage = "TUNNEL_TEST_TARGET_INVALID target=hidden.example.test port=65432";
+
+      await insert("users", ["id", "username", "password", "name", "role", "balanceCents"], [1, "admin", "x", "Admin", "admin", 100]);
+      await insert("users", ["id", "username", "password", "name", "role", "balanceCents"], [2, "alice", "x", "Alice Edge", "user", 200]);
+
+      await insert(
+        "hosts",
+        [
+          "id", "name", "ip", "ipv4", "userId", "isOnline", "lastHeartbeat", "sortOrder", "agentVersion",
+          "geoCountryCode", "geoCountryName", "geoRegion", "geoEmoji", "geoLatitudeMicro", "geoLongitudeMicro", "geoUpdatedAt",
+        ],
+        [
+          1, "Tokyo Entry", "192.0.2.10", "192.0.2.10", 1, 1, now, 0, "2.2.157",
+          "JP", "Japan", "Tokyo", "JP", 35676000, 139650000, now,
+        ],
+      );
+      await insert(
+        "hosts",
+        ["id", "name", "ip", "ipv4", "userId", "isOnline", "lastHeartbeat", "sortOrder", "agentVersion"],
+        [2, "Singapore Exit", "192.0.2.20", "192.0.2.20", 1, 1, now, 1, "2.2.158"],
+      );
+      await insert(
+        "hosts",
+        ["id", "name", "ip", "ipv4", "userId", "isOnline", "lastHeartbeat", "sortOrder", "agentVersion"],
+        [3, "Unused Node", "192.0.2.30", "192.0.2.30", 2, 0, now - 3600, 2, "2.2.157"],
+      );
+
+      await insert(
+        "forward_groups",
+        ["id", "name", "groupType", "groupMode", "targetIp", "userId", "isEnabled", "sortOrder"],
+        [10, "Saved Port", "host", "port", "127.0.0.1", 1, 1, 0],
+      );
+      await insert(
+        "forward_groups",
+        ["id", "name", "groupType", "groupMode", "targetIp", "userId", "isEnabled", "sortOrder"],
+        [11, "Private Chain", "host", "chain", "127.0.0.1", 1, 1, 1],
+      );
+      await insert(
+        "forward_groups",
+        ["id", "name", "groupType", "groupMode", "targetIp", "userId", "isEnabled", "sortOrder", "exitStrategy"],
+        [12, "Singapore Exits", "host", "exit", "127.0.0.1", 1, 1, 2, "none"],
+      );
+      await insert(
+        "forward_group_members",
+        ["id", "groupId", "memberType", "hostId", "priority", "isEnabled"],
+        [1001, 10, "host", 1, 0, 1],
+      );
+      await insert(
+        "forward_group_members",
+        ["id", "groupId", "memberType", "hostId", "priority", "isEnabled"],
+        [1101, 11, "host", 2, 0, 1],
+      );
+      await insert(
+        "forward_group_members",
+        ["id", "groupId", "memberType", "hostId", "priority", "isEnabled"],
+        [1201, 12, "host", 2, 0, 1],
+      );
+
+      await insert(
+        "tunnels",
+        ["id", "name", "entryHostId", "exitHostId", "exitGroupId", "mode", "listenPort", "userId", "isEnabled", "sortOrder", "lastTestMessage"],
+        [20, "Singapore Path", 1, 2, 12, "tls", 62000, 1, 1, 0, hiddenTunnelTestMessage],
+      );
+      await insert(
+        "tunnels",
+        ["id", "name", "entryHostId", "exitHostId", "mode", "listenPort", "userId", "isEnabled", "sortOrder"],
+        [21, "Unused Path", 2, 3, "forwardx", 62001, 2, 1, 1],
+      );
+      await insert("user_tunnel_permissions", ["userId", "tunnelId"], [2, 20]);
+      await insert("user_forward_group_permissions", ["userId", "forwardGroupId"], [2, 10]);
+      await insert(
+        "forward_groups",
+        ["id", "name", "groupType", "groupMode", "targetIp", "domain", "userId", "isEnabled", "sortOrder"],
+        [13, "Shared Tunnel Failover", "tunnel", "failover", "127.0.0.1", "shared.example.com", 1, 1, 3],
+      );
+      await insert(
+        "forward_group_members",
+        ["id", "groupId", "memberType", "tunnelId", "priority", "isEnabled"],
+        [1301, 13, "tunnel", 20, 0, 1],
+      );
+      await insert("user_forward_group_permissions", ["userId", "forwardGroupId"], [2, 13]);
+      await insert(
+        "forward_groups",
+        ["id", "name", "groupType", "groupMode", "targetIp", "userId", "isEnabled", "sortOrder"],
+        [14, "Alice Owned Port", "host", "port", "127.0.0.1", 2, 1, 4],
+      );
+      await insert(
+        "forward_group_members",
+        ["id", "groupId", "memberType", "hostId", "priority", "isEnabled"],
+        [1401, 14, "host", 3, 0, 1],
+      );
+      await insert(
+        "forward_groups",
+        ["id", "name", "groupType", "groupMode", "targetIp", "domain", "userId", "isEnabled", "sortOrder"],
+        [15, "Shared Chain Entry", "host", "entry", "127.0.0.1", "entry.example.com", 1, 1, 5],
+      );
+      await insert(
+        "forward_group_members",
+        ["id", "groupId", "memberType", "hostId", "priority", "isEnabled"],
+        [1501, 15, "host", 1, 0, 1],
+      );
+      await insert(
+        "forward_group_members",
+        ["id", "groupId", "memberType", "hostId", "priority", "isEnabled"],
+        [1502, 15, "host", 3, 1, 0],
+      );
+      await insert(
+        "forward_groups",
+        ["id", "name", "groupType", "groupMode", "targetIp", "userId", "isEnabled", "sortOrder", "entryGroupId"],
+        [16, "Shared Chain", "host", "chain", "127.0.0.1", 1, 1, 6, 15],
+      );
+      await insert(
+        "forward_group_members",
+        ["id", "groupId", "memberType", "hostId", "priority", "isEnabled"],
+        [1601, 16, "host", 2, 0, 1],
+      );
+      await insert("user_forward_group_permissions", ["userId", "forwardGroupId"], [2, 16]);
+
+      const tunnelCaller = tunnelsRouter.createCaller({
+        req: { headers: {} },
+        res: { clearCookie() {} },
+        user: { id: 2, username: "alice", role: "user", accountEnabled: true },
+        authSession: null,
+        authFailureReason: null,
+      });
+
+      const assertSharedTunnelDiagnosticsHidden = (tunnel, endpoint) => {
+        assert.ok(tunnel, endpoint + " should return the shared tunnel");
+        assert.equal("lastTestMessage" in tunnel, false, endpoint + " must hide lastTestMessage");
+        assert.equal("latestLatencySeries" in tunnel, false, endpoint + " must hide latestLatencySeries");
+        assert.equal(JSON.stringify(tunnel).includes(hiddenTunnelTestMessage), false, endpoint + " must hide probe details");
+      };
+
+      const sharedTunnel = (await tunnelCaller.options()).find((item) => Number(item.id) === 20);
+      assertSharedTunnelDiagnosticsHidden(sharedTunnel, "tunnels.options");
+      assert.equal(sharedTunnel.availability.status, "available");
+      assert.equal(sharedTunnel.availability.available, true);
+      assert.equal(sharedTunnel.entryHost.id, 1);
+      assert.equal(sharedTunnel.exitHost.id, 2);
+      assert.equal(sharedTunnel.entryHostId, 1);
+      assert.equal(sharedTunnel.exitHostId, 2);
+      assert.equal(sharedTunnel.connectHost, null);
+      assert.equal(sharedTunnel.entryGroup, undefined);
+      assert.equal(sharedTunnel.exitGroup, undefined);
+
+      const sharedTunnelFromList = (await tunnelCaller.list()).find((item) => Number(item.id) === 20);
+      assertSharedTunnelDiagnosticsHidden(sharedTunnelFromList, "tunnels.list");
+
+      const sharedTunnelPage = await tunnelCaller.listPage({
+        page: 1,
+        pageSize: 10,
+        search: "Singapore Path",
+      });
+      assertSharedTunnelDiagnosticsHidden(sharedTunnelPage.items.find((item) => Number(item.id) === 20), "tunnels.listPage");
+
+      const sharedTunnelMap = await tunnelCaller.mapItems({
+        cursor: 0,
+        limit: 20,
+        search: "Singapore Path",
+      });
+      assertSharedTunnelDiagnosticsHidden(sharedTunnelMap.items.find((item) => Number(item.id) === 20), "tunnels.mapItems");
+
+      const sharedTunnelById = await tunnelCaller.getById({ id: 20 });
+      assertSharedTunnelDiagnosticsHidden(sharedTunnelById, "tunnels.getById");
+
+      const adminTunnelCaller = tunnelsRouter.createCaller({
+        req: { headers: {} },
+        res: { clearCookie() {} },
+        user: { id: 1, username: "admin", role: "admin", accountEnabled: true },
+        authSession: null,
+        authFailureReason: null,
+      });
+      const adminSharedTunnel = (await adminTunnelCaller.list()).find((item) => Number(item.id) === 20);
+      assert.equal(adminSharedTunnel.lastTestMessage, hiddenTunnelTestMessage);
+      assert.equal("latestLatencySeries" in adminSharedTunnel, true);
+
+      const groupCaller = forwardGroupsRouter.createCaller({
+        req: { headers: {} },
+        res: { clearCookie() {} },
+        user: { id: 2, username: "alice", role: "user", accountEnabled: true },
+        authSession: null,
+        authFailureReason: null,
+      });
+      const rulesCaller = rulesRouter.createCaller({
+        req: { headers: {} },
+        res: { clearCookie() {} },
+        user: { id: 2, username: "alice", role: "user", accountEnabled: true },
+        authSession: null,
+        authFailureReason: null,
+      });
+      const adminRulesCaller = rulesRouter.createCaller({
+        req: { headers: {} },
+        res: { clearCookie() {} },
+        user: { id: 1, username: "admin", role: "admin", accountEnabled: true },
+        authSession: null,
+        authFailureReason: null,
+      });
+
+      const ownedGroupPage = await groupCaller.listPage({
+        page: 1,
+        pageSize: 10,
+        groupMode: "port",
+        search: "Alice Owned Port",
+      });
+      assert.deepEqual(ownedGroupPage.items.map((item) => Number(item.id)), [14]);
+      const ownedGroupOptions = await groupCaller.options();
+      assert.ok(ownedGroupOptions.some((item) => Number(item.id) === 14));
+      const sharedChainOption = ownedGroupOptions.find((item) => Number(item.id) === 16);
+      assert.ok(sharedChainOption);
+      assert.equal(ownedGroupOptions.some((item) => Number(item.id) === 15), false);
+      assert.equal(sharedChainOption.entryGroup.domain, "entry.example.com");
+      assert.deepEqual(sharedChainOption.entryGroup.members.map((member) => Number(member.id)), [1501]);
+      assert.equal(sharedChainOption.entryGroup.members[0].host.id, 1);
+      assert.equal("portRangeStart" in sharedChainOption.entryGroup.members[0].host, false);
+      const sharedGroupPage = await groupCaller.listPage({
+        page: 1,
+        pageSize: 10,
+        groupMode: "port",
+        search: "Saved Port",
+      });
+      assert.equal(sharedGroupPage.items.length, 1);
+      assert.equal(sharedGroupPage.items[0].availability.status, "available");
+      assert.equal(sharedGroupPage.items[0].availability.available, true);
+      assert.deepEqual(sharedGroupPage.items[0].members.map((member) => Number(member.id)), [1001]);
+      assert.equal(sharedGroupPage.items[0].members[0].host.id, 1);
+      assert.equal(sharedGroupPage.items[0].members[0].entryAddress, "192.0.2.10");
+
+      const tunnelGroupPage = await groupCaller.listPage({
+        page: 1,
+        pageSize: 10,
+        groupMode: "failover",
+        search: "Shared Tunnel Failover",
+      });
+      assert.equal(tunnelGroupPage.items[0].availability.available, true);
+      assert.equal(tunnelGroupPage.items[0].members[0].host.id, 1);
+      assert.equal(tunnelGroupPage.items[0].members[0].entryAddress, "192.0.2.10");
+      await runtime.executeRaw(
+        'UPDATE "hosts" SET "isOnline" = ?, "lastHeartbeat" = ? WHERE "id" = ?',
+        [0, now - 3600, 2],
+      );
+      const offlineTunnelGroupPage = await groupCaller.listPage({
+        page: 1,
+        pageSize: 10,
+        groupMode: "failover",
+        search: "Shared Tunnel Failover",
+      });
+      assert.equal(offlineTunnelGroupPage.items[0].availability.available, false);
+      await runtime.executeRaw(
+        'UPDATE "hosts" SET "isOnline" = ?, "lastHeartbeat" = ? WHERE "id" = ?',
+        [1, now, 2],
+      );
+
+      const ruleColumns = [
+        "id", "hostId", "name", "forwardType", "protocol", "tunnelId", "forwardGroupId",
+        "forwardGroupRuleId", "forwardGroupMemberId", "isForwardGroupTemplate", "sourcePort",
+        "targetIp", "targetPort", "userId", "isEnabled", "pendingDelete", "sortOrder",
+      ];
+      await insert("forward_rules", ruleColumns, [100, 1, "Direct Alpha", "iptables", "tcp", null, null, null, null, 0, 10000, "example.com", 443, 2, 1, 0, 0]);
+      await insert("forward_rules", ruleColumns, [101, 1, "Tunnel Beta", "gost", "both", 20, null, null, null, 0, 10001, "game.example", 9000, 2, 1, 0, 1]);
+      await insert("forward_rules", ruleColumns, [102, 1, "Port Template", "iptables", "tcp", null, 10, null, null, 1, 10002, "port.example", 80, 2, 1, 0, 2]);
+      await insert("forward_rules", ruleColumns, [103, 1, "Managed Child", "iptables", "tcp", null, 10, 102, 1001, 0, 10002, "port.example", 80, 2, 1, 0, 3]);
+      await insert("forward_rules", ruleColumns, [104, 2, "Chain Template", "iptables", "tcp", null, 11, null, null, 1, 10003, "chain.example", 80, 2, 1, 0, 3]);
+      await insert("forward_rules", ruleColumns, [105, 3, "Alice Owned Template", "iptables", "tcp", null, 14, null, null, 1, 10004, "owned.example", 80, 2, 1, 0, 4]);
+      await insert("forward_rules", ruleColumns, [106, 2, "Quick Config on Server B", "realm", "tcp", null, null, null, null, 0, 19188, "landing.example", 8443, 1, 1, 0, 0]);
+      await insert("forward_rules", ruleColumns, [107, 2, "Second Rule on Server B", "gost", "tcp", null, null, null, null, 0, 19189, "landing.example", 8443, 1, 0, 0, 1]);
+      await runtime.executeRaw('UPDATE "forward_rules" SET "isRunning" = ? WHERE "id" = ?', [1, 106]);
+
+      const ownedRulePage = await rulesCaller.listPage({
+        page: 1,
+        pageSize: 10,
+        category: "all",
+        search: "Alice Owned Template",
+      });
+      assert.deepEqual(ownedRulePage.items.map((item) => Number(item.id)), [105]);
+      const revokedGroupRulePage = await rulesCaller.listPage({
+        page: 1,
+        pageSize: 10,
+        category: "all",
+        search: "Chain Template",
+      });
+      assert.deepEqual(revokedGroupRulePage.items.map((item) => Number(item.id)), [104]);
+      assert.equal(Number((await rulesCaller.getById({ id: 104 }))?.id), 104);
+      assert.equal(await rulesCaller.getById({ id: 103 }), null);
+      assert.ok((await rulesCaller.list()).some((item) => Number(item.id) === 104));
+      const revokedGroupResourceSearch = await rulesCaller.listPage({
+        page: 1,
+        pageSize: 10,
+        category: "all",
+        search: "Private Chain",
+      });
+      assert.deepEqual(revokedGroupResourceSearch.items, []);
+      const mixedVisibleResourceSearch = await rulesCaller.listPage({
+        page: 1,
+        pageSize: 10,
+        category: "all",
+        search: "Singapore Exit",
+      });
+      assert.deepEqual(mixedVisibleResourceSearch.items.map((item) => Number(item.id)), [101]);
+
+      const userPage = await users.getUsersPage({ page: 9, pageSize: 1 });
+      assert.equal(userPage.totalItems, 2);
+      assert.equal(userPage.page, 2);
+      assert.equal(userPage.items.length, 1);
+      assert.deepEqual(await users.getUserManagementCounts(), {
+        totalUsers: 2,
+        adminUsers: 1,
+        activeSubscriptions: 0,
+      });
+
+      const hostPage = await hosts.getHostsPage({ page: 1, pageSize: 1, search: "Tokyo" });
+      assert.equal(hostPage.totalItems, 1);
+      assert.equal(hostPage.items[0].id, 1);
+      const hostSecondPage = await hosts.getHostsPage({ page: 2, pageSize: 2 });
+      assert.equal(hostSecondPage.totalItems, 3);
+      assert.deepEqual(hostSecondPage.items.map((item) => Number(item.id)), [3]);
+      assert.deepEqual(
+        hostSecondPage.versionCounts
+          .map((item) => [item.agentVersion, item.online, Number(item.count)])
+          .sort((a, b) => String(a[0]).localeCompare(String(b[0])) || Number(a[1]) - Number(b[1])),
+        [
+          ["2.2.157", false, 1],
+          ["2.2.157", true, 1],
+          ["2.2.158", true, 1],
+        ],
+      );
+      const hostSummary = await hosts.getHostSummaryScope({ ownerUserId: 2, allowedHostIds: [1] });
+      assert.equal(hostSummary.totalHosts, 2);
+      assert.equal(hostSummary.onlineHosts, 1);
+      assert.deepEqual(hostSummary.hostIds.map(Number).sort((a, b) => a - b), [1, 3]);
+      const hostStatuses = await hosts.getHostStatusRows({
+        ownerUserId: 2,
+        allowedHostIds: [1],
+        hostIds: [1, 2, 3],
+      });
+      assert.deepEqual(hostStatuses.map((item) => Number(item.id)).sort((a, b) => a - b), [1, 3]);
+      const hostOptions = await hosts.getHostOptions(2, [1]);
+      const tokyoOption = hostOptions.find((item) => Number(item.id) === 1);
+      assert.deepEqual(
+        {
+          countryCode: tokyoOption?.geoCountryCode,
+          countryName: tokyoOption?.geoCountryName,
+          region: tokyoOption?.geoRegion,
+          latitude: tokyoOption?.geoLatitudeMicro,
+          longitude: tokyoOption?.geoLongitudeMicro,
+        },
+        {
+          countryCode: "JP",
+          countryName: "Japan",
+          region: "Tokyo",
+          latitude: 35676000,
+          longitude: 139650000,
+        },
+      );
+
+      const tunnelPage = await tunnels.getTunnelsPage({ page: 1, pageSize: 10, search: "Tokyo Entry" });
+      assert.equal(tunnelPage.totalItems, 1);
+      assert.equal(tunnelPage.items[0].id, 20);
+      assert.equal(tunnelPage.availableItems, 1);
+
+      await runtime.executeRaw(
+        'UPDATE "tunnels" SET "lastLatencyMs" = ?, "lastTestStatus" = ?, "lastTestAt" = ? WHERE "id" = ?',
+        [25, "success", now, 21],
+      );
+      const allTunnelPage = await tunnels.getTunnelsPage({ page: 1, pageSize: 10 });
+      assert.equal(allTunnelPage.availableItems, 2);
+
+      const groupPage = await groups.getForwardGroupsPage({
+        page: 1,
+        pageSize: 10,
+        groupMode: "port",
+        search: "Tokyo Entry",
+      });
+      assert.equal(groupPage.totalItems, 1);
+      assert.equal(groupPage.items[0].id, 10);
+      assert.equal(groupPage.items[0].members.length, 1);
+      assert.equal(groupPage.items[0].members[0].host.isOnline, true);
+      const groupOptions = await groups.getForwardGroupOptions([10]);
+      assert.equal(groupOptions.length, 1);
+      assert.equal(groupOptions[0].members[0].entryAddress, "192.0.2.10");
+      const userSafeGroupOptions = groups.filterForwardGroupFieldsForUse(groupOptions);
+      assert.equal(userSafeGroupOptions[0].members[0].entryAddress, "192.0.2.10");
+      assert.equal(userSafeGroupOptions[0].members[0].host.isOnline, true);
+      assert.equal(userSafeGroupOptions[0].members[0].host.name, "Tokyo Entry");
+      assert.equal(userSafeGroupOptions[0].members[0].host.agentToken, undefined);
+
+      const visibleRuleInput = {
+        ownerUserId: 2,
+        searchVisibleHostIds: [3],
+        searchVisibleTunnelIds: [20],
+        searchVisibleForwardGroupIds: [10, 13, 14],
+        entryHostId: null,
+        category: "all",
+        search: "",
+      };
+      const rulePage = await rules.getForwardRulesPage({ ...visibleRuleInput, page: 9, pageSize: 2 });
+      assert.equal(rulePage.totalItems, 5);
+      assert.equal(rulePage.scopeTotalItems, 5);
+      assert.equal(rulePage.page, 3);
+      assert.deepEqual(rulePage.categoryCounts, { all: 5, local: 3, tunnel: 1, chain: 1, group: 0 });
+      assert.equal(rulePage.items.length, 1);
+
+      const tunnelSearch = await rules.getForwardRulesPage({
+        ...visibleRuleInput,
+        page: 1,
+        pageSize: 10,
+        search: "Singapore Exit",
+      });
+      assert.deepEqual(tunnelSearch.items.map((item) => Number(item.id)), [101]);
+
+      const tunnelCategorySearch = await rules.getForwardRulesPage({
+        ...visibleRuleInput,
+        page: 1,
+        pageSize: 10,
+        search: "tunnel",
+      });
+      assert.deepEqual(tunnelCategorySearch.items.map((item) => Number(item.id)), [101]);
+
+      const entryFiltered = await rules.getForwardRulesPage({
+        ...visibleRuleInput,
+        page: 1,
+        pageSize: 10,
+        entryHostId: 1,
+      });
+      assert.deepEqual(entryFiltered.items.map((item) => Number(item.id)), [102, 101]);
+
+      const revokedTunnelEntryFiltered = await rules.getForwardRulesPage({
+        ...visibleRuleInput,
+        searchVisibleTunnelIds: [],
+        page: 1,
+        pageSize: 10,
+        entryHostId: 1,
+      });
+      assert.deepEqual(revokedTunnelEntryFiltered.items.map((item) => Number(item.id)), [102]);
+
+      const revokedGroupEntryFiltered = await rules.getForwardRulesPage({
+        ...visibleRuleInput,
+        searchVisibleForwardGroupIds: [],
+        page: 1,
+        pageSize: 10,
+        entryHostId: 1,
+      });
+      assert.deepEqual(revokedGroupEntryFiltered.items.map((item) => Number(item.id)), [101]);
+
+      const revokedTopologyEntryFiltered = await rules.getForwardRulesPage({
+        ...visibleRuleInput,
+        searchVisibleTunnelIds: [],
+        searchVisibleForwardGroupIds: [],
+        page: 1,
+        pageSize: 10,
+        entryHostId: 1,
+      });
+      assert.deepEqual(revokedTopologyEntryFiltered.items, []);
+
+      const revokedGroupHostProbe = await rulesCaller.listPage({
+        page: 1,
+        pageSize: 10,
+        category: "all",
+        entryHostId: 2,
+      });
+      assert.deepEqual(revokedGroupHostProbe.items, []);
+
+      const mapBatch = await rules.getForwardRuleMapBatch(visibleRuleInput, 2, 2);
+      assert.equal(mapBatch.totalItems, 5);
+      assert.equal(mapBatch.items.length, 2);
+      assert.equal(mapBatch.nextCursor, 4);
+
+      for (const [id, name, active, sortOrder] of [
+        [30, "Basic", 1, 0],
+        [31, "Plus", 1, 1],
+        [32, "Archive", 0, 2],
+      ]) {
+        await insert("subscription_plans", ["id", "name", "isActive", "sortOrder"], [id, name, active, sortOrder]);
+      }
+      await insert("subscription_plan_hosts", ["planId", "hostId"], [30, 1]);
+      await insert("subscription_plan_tunnels", ["planId", "tunnelId"], [31, 20]);
+      await insert("subscription_plan_forward_groups", ["planId", "forwardGroupId"], [30, 10]);
+      await insert("subscription_plan_forward_groups", ["planId", "forwardGroupId"], [32, 11]);
+
+      const planPage = await billing.listSubscriptionPlansPage({ page: 2, pageSize: 2 });
+      assert.equal(planPage.totalItems, 3);
+      assert.equal(planPage.items.length, 1);
+      assert.ok(Array.isArray(planPage.items[0].forwardGroupRefs));
+      const planSummary = await billing.getSubscriptionPlanSummary();
+      assert.equal(planSummary.totalItems, 3);
+      assert.equal(planSummary.activeItems, 2);
+      assert.deepEqual(planSummary.resources, {
+        legacyHosts: 1,
+        tunnels: 1,
+        ports: 1,
+        chains: 1,
+        groups: 0,
+        otherForwardResources: 0,
+      });
+
+      await insert("redemption_codes", ["id", "code", "type", "isActive", "usedAt"], [40, "R1", "balance", 1, null]);
+      await insert("redemption_codes", ["id", "code", "type", "isActive", "usedAt"], [41, "R2", "balance", 1, now]);
+      await insert("redemption_codes", ["id", "code", "type", "isActive", "usedAt"], [42, "R3", "balance", 0, null]);
+      await insert("discount_codes", ["id", "code", "discountType", "discountValue", "isActive", "maxUses", "usedCount", "expiresAt"], [50, "D1", "percent", 10, 1, 0, 0, null]);
+      await insert("discount_codes", ["id", "code", "discountType", "discountValue", "isActive", "maxUses", "usedCount", "expiresAt"], [51, "D2", "percent", 10, 1, 0, 0, now - 1]);
+      await insert("discount_codes", ["id", "code", "discountType", "discountValue", "isActive", "maxUses", "usedCount", "expiresAt"], [52, "D3", "percent", 10, 1, 1, 1, null]);
+
+      const billingSummary = await billing.getBillingAdminSummary();
+      assert.deepEqual(billingSummary, {
+        userCount: 2,
+        totalBalanceCents: 300,
+        activeRedemptionCodes: 1,
+        activeDiscountCodes: 1,
+      });
+      const unusedCodes = await billing.listRedemptionCodesPage({ page: 1, pageSize: 1, usage: "unused" });
+      assert.equal(unusedCodes.totalItems, 2);
+      assert.equal(unusedCodes.items.length, 1);
+      const discountPage = await billing.listDiscountCodesPage({ page: 2, pageSize: 2 });
+      assert.equal(discountPage.totalItems, 3);
+      assert.equal(discountPage.items.length, 1);
+    } finally {
+      await runtime.closeDatabase().catch(() => undefined);
+    }
+  `;
+
+  try {
+    const result = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", script], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        DATABASE_TYPE: "sqlite",
+        FORWARDX_TEST_DB: databasePath,
+        FORWARDX_LOG_DIR: path.join(directory, "logs"),
+      },
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("admin all-host pagination keeps equal-sort groups contiguous across page boundaries", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forwardx-host-group-order-"));
+  const databasePath = path.join(directory, "host-group-order.db");
+  const script = String.raw`
+    import assert from "node:assert/strict";
+    import path from "node:path";
+    import { pathToFileURL } from "node:url";
+
+    const moduleUrl = (file) => pathToFileURL(path.join(process.cwd(), file)).href;
+    const runtime = await import(moduleUrl("server/dbRuntime.ts"));
+    const schema = await import(moduleUrl("server/dbSchema.ts"));
+
+    try {
+      await runtime.connectDatabase({ type: "sqlite", sqlite: { path: process.env.FORWARDX_TEST_DB } });
+      await schema.ensureDatabaseSchema();
+
+      const hosts = await import(moduleUrl("server/repositories/hostRepository.ts"));
+      const quote = (name) => '"' + name + '"';
+      const insert = async (table, columns, values) => {
+        await runtime.executeRaw(
+          "INSERT INTO " + quote(table) + " (" + columns.map(quote).join(", ") + ") VALUES (" + values.map(() => "?").join(", ") + ")",
+          values,
+        );
+      };
+
+      await insert("users", ["id", "username", "password", "name", "role", "balanceCents"], [1, "admin", "x", "Admin", "admin", 0]);
+
+      const hostRows = [
+        [101, "New group member B", 0, 100],
+        [102, "New group member A", 99, 101],
+        [103, "New group member C", 0, 102],
+        [201, "Old group member A", 50, 200],
+        [202, "Old group member B", 0, 201],
+        [203, "Old group member C", 0, 202],
+        [999, "Ungrouped", 0, 999],
+      ];
+      for (const [id, name, sortOrder, createdAt] of hostRows) {
+        await insert(
+          "hosts",
+          ["id", "name", "ip", "userId", "sortOrder", "createdAt", "updatedAt"],
+          [id, name, "192.0.2." + (id % 255), 1, sortOrder, createdAt, createdAt],
+        );
+      }
+
+      await insert(
+        "host_groups",
+        ["id", "name", "isEnabled", "sortOrder", "userId", "createdAt", "updatedAt"],
+        [10, "Newer group", 1, 0, 1, 200, 200],
+      );
+      await insert(
+        "host_groups",
+        ["id", "name", "isEnabled", "sortOrder", "userId", "createdAt", "updatedAt"],
+        [20, "Older group", 1, 0, 1, 100, 100],
+      );
+
+      for (const [id, groupId, hostId, sortOrder] of [
+        [1003, 10, 101, 0],
+        [1001, 10, 102, 0],
+        [1002, 10, 103, 1],
+        [2003, 20, 201, 0],
+        [2001, 20, 202, 1],
+        [2002, 20, 203, 2],
+      ]) {
+        await insert(
+          "host_group_members",
+          ["id", "groupId", "hostId", "sortOrder", "createdAt"],
+          [id, groupId, hostId, sortOrder, id],
+        );
+      }
+
+      const query = (page, pageSize) => hosts.getHostsPage({
+        page,
+        pageSize,
+        groupId: null,
+        orderByGroups: true,
+      });
+      const fullPage = await query(1, 20);
+      const expectedIds = [102, 101, 103, 201, 202, 203, 999];
+      assert.deepEqual(fullPage.items.map((host) => Number(host.id)), expectedIds);
+
+      const groupByHostId = new Map([
+        [101, 10], [102, 10], [103, 10],
+        [201, 20], [202, 20], [203, 20],
+      ]);
+      assert.deepEqual(
+        fullPage.items.map((host) => groupByHostId.get(Number(host.id)) ?? null),
+        [10, 10, 10, 20, 20, 20, null],
+      );
+
+      const firstPage = await query(1, 4);
+      const secondPage = await query(2, 4);
+      assert.deepEqual(firstPage.items.map((host) => Number(host.id)), [102, 101, 103, 201]);
+      assert.deepEqual(secondPage.items.map((host) => Number(host.id)), [202, 203, 999]);
+      assert.deepEqual(
+        [...firstPage.items, ...secondPage.items].map((host) => Number(host.id)),
+        expectedIds,
+      );
+      assert.equal(firstPage.totalItems, 7);
+      assert.equal(firstPage.totalPages, 2);
+      assert.equal(secondPage.page, 2);
+    } finally {
+      await runtime.closeDatabase().catch(() => undefined);
+    }
+  `;
+
+  try {
+    const result = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", script], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        DATABASE_TYPE: "sqlite",
+        FORWARDX_TEST_DB: databasePath,
+        FORWARDX_LOG_DIR: path.join(directory, "logs"),
+      },
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

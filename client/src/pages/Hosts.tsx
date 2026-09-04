@@ -1,0 +1,3564 @@
+import { useAuth } from "@/_core/hooks/useAuth";
+import AnimatedStatValue from "@/components/AnimatedStatValue";
+import AgentTokenManager, { type AgentTokenViewMode } from "@/components/AgentTokenManager";
+import AutoAnimateContainer from "@/components/AutoAnimateContainer";
+import DashboardLayout from "@/components/DashboardLayout";
+import DateTimePickerInput, {
+  formatDateInputValue as formatDateTimeLocal,
+  parseDateInputValue as parseDateTimeLocal,
+} from "@/components/DatePickerInput";
+import HostCard, { HostActionButtons } from "@/components/hosts/HostCard";
+import HostGroupManager, { compareHostGroupDisplayOrder, type HostGroupView, type HostGroupViewMode } from "@/components/hosts/HostGroupManager";
+import HostProbeServiceManager, { type HostProbeServiceViewMode } from "@/components/hosts/HostProbeServiceManager";
+import HostProbeServiceLatencyDialog from "@/components/hosts/HostProbeServiceLatencyDialog";
+import {
+  agentDetectedIpText,
+  compareVersions,
+  formatBytes,
+  formatUptime,
+  hostAddressText,
+  hostPrimaryAddressText,
+  HostRegionBadge,
+  hostRegionText,
+  isAgentUpgradeTimedOut,
+  isAgentVersionBehind,
+  metricUsageProgressClass,
+} from "@/components/hosts/hostDisplay";
+import { PersistentPagination, usePersistentPageRequest, useServerPagination } from "@/components/PersistentPagination";
+import { SortableDragHandle, SortableItem, SortableReorderContext, useSortableReorder } from "@/components/SortableDragHandle";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { SlidingTabsList, type SlidingTabItem } from "@/components/ui/sliding-tabs";
+import { Switch } from "@/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import DataSectionLoading from "@/components/DataSectionLoading";
+import { countryFeatureHasCode, normalizeCountryCode } from "@/lib/countryFeatures";
+import { normalizeForwardProtocolSettings } from "@shared/forwardTypes";
+import { useUrlTab } from "@/hooks/useUrlTab";
+import { pollingInterval, visiblePollingInterval } from "@/lib/polling";
+import { trpc } from "@/lib/trpc";
+import { cn } from "@/lib/utils";
+import {
+  Activity,
+  ArrowDown,
+  ArrowDownToLine,
+  ArrowUp,
+  ArrowUpFromLine,
+  ArrowRightLeft,
+  CalendarDays,
+  CircleCheck,
+  Clock,
+  Cpu,
+  Plus,
+  Server,
+  HardDrive,
+  LayoutGrid,
+  List,
+  Globe,
+  RadioTower,
+  MapPinned,
+  Download,
+  Gauge,
+  AlertTriangle,
+  Filter,
+  Loader2,
+  MemoryStick,
+  RefreshCw,
+  Search,
+  Key,
+  Rows3,
+  RotateCcw,
+  XCircle,
+  ActivitySquare,
+  FolderKanban,
+  Wifi,
+} from "lucide-react";
+import type { GlobeMethods } from "react-globe.gl";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
+const ReactGlobe = lazy(() => import("react-globe.gl")) as typeof import("react-globe.gl").default;
+const HostFlatMap = lazy(() => import("@/components/HostFlatMap"));
+const GLOBE_EARTH_IMAGE_URL = "/globe/earth-dark.jpg";
+const GLOBE_BUMP_IMAGE_URL = "/globe/earth-topology.png";
+const GLOBE_BACKGROUND_IMAGE_URL = "/globe/night-sky.png";
+const GLOBE_COUNTRIES_URL = "/globe/ne_110m_admin_0_countries.geojson";
+const HOST_GLOBE_CLUSTER_DISTANCE_DEGREES = 2.4;
+const HOST_GLOBE_LABEL_PULL_DEGREES = 8.2;
+const HOST_GLOBE_LABEL_ROW_DEGREES = 3.8;
+const HOST_GLOBE_MAX_LABELS_PER_COLUMN = 6;
+
+function parseCustomPortsInput(value: string) {
+  const text = String(value || "").trim();
+  if (!text) return { ports: [] as number[], invalid: [] as string[], normalized: "" };
+  const tokens = text.split(",").map((item) => item.trim());
+  const invalid: string[] = [];
+  const ports: number[] = [];
+  for (const token of tokens) {
+    if (!token || !/^\d+$/.test(token)) {
+      invalid.push(token || "空值");
+      continue;
+    }
+    const port = Number(token);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      invalid.push(token);
+      continue;
+    }
+    ports.push(port);
+  }
+  const normalizedPorts = Array.from(new Set(ports)).sort((a, b) => a - b);
+  return {
+    ports: normalizedPorts,
+    invalid,
+    normalized: normalizedPorts.join(","),
+  };
+}
+
+function usePageVisible() {
+  const [visible, setVisible] = useState(() => typeof document === "undefined" || document.visibilityState === "visible");
+  useEffect(() => {
+    const onVisibilityChange = () => setVisible(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, []);
+  return visible;
+}
+
+function hostGeoCoordinate(host: any) {
+  if (host?.geoLatitudeMicro == null || host?.geoLongitudeMicro == null) return null;
+  const lat = Number(host.geoLatitudeMicro) / 1_000_000;
+  const lng = Number(host.geoLongitudeMicro) / 1_000_000;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+  return { lat, lng };
+}
+
+type HostGlobePoint = {
+  host: any;
+  lat: number;
+  lng: number;
+  displayLat: number;
+  displayLng: number;
+  color: string;
+  glowColor: string;
+  statusText: string;
+  regionText: string;
+  addressText: string;
+  countryCode: string;
+  flagUrl: string;
+  label: string;
+};
+
+type HostGlobeLeaderPath = {
+  point: HostGlobePoint;
+  coords: Array<{ lat: number; lng: number; alt: number }>;
+};
+
+type HostGlobeCluster = {
+  centerLat: number;
+  centerLng: number;
+  points: HostGlobePoint[];
+};
+
+type GlobeCountryFeature = {
+  type: "Feature";
+  properties?: Record<string, unknown>;
+  geometry: {
+    type: string;
+    coordinates: unknown;
+  };
+};
+
+function clampLatitude(lat: number) {
+  return Math.max(-85, Math.min(85, lat));
+}
+
+function normalizeLongitude(lng: number) {
+  if (lng < -180) return lng + 360;
+  if (lng > 180) return lng - 360;
+  return lng;
+}
+
+function longitudeDistanceDegrees(a: number, b: number) {
+  const diff = Math.abs(a - b);
+  return Math.min(diff, 360 - diff);
+}
+
+function hostCountryCode(host: any) {
+  return normalizeCountryCode(host?.geoCountryCode);
+}
+
+function hostFlagUrl(host: any) {
+  const countryCode = hostCountryCode(host).toLowerCase();
+  return /^[a-z]{2}$/.test(countryCode) ? `https://flagcdn.com/24x18/${countryCode}.png` : "";
+}
+
+function hostGlobeLabel(host: any) {
+  const name = String(host?.name || hostAddressText(host) || "-").trim();
+  return name.length > 10 ? `${name.slice(0, 9)}…` : name;
+}
+
+function hostGlobePointPulledOut(point: HostGlobePoint) {
+  return Math.abs(point.lat - point.displayLat) > 0.01 || Math.abs(point.lng - point.displayLng) > 0.01;
+}
+
+function hostGlobeClusterDistance(point: HostGlobePoint, cluster: HostGlobeCluster) {
+  const latDiff = point.lat - cluster.centerLat;
+  const lngScale = Math.max(0.35, Math.cos((((point.lat + cluster.centerLat) / 2) * Math.PI) / 180));
+  const lngDiff = longitudeDistanceDegrees(point.lng, cluster.centerLng) * lngScale;
+  return Math.sqrt(latDiff * latDiff + lngDiff * lngDiff);
+}
+
+function buildHostGlobeClusters(points: HostGlobePoint[]) {
+  const clusters: HostGlobeCluster[] = [];
+  points
+    .slice()
+    .sort((a, b) => a.lng - b.lng || a.lat - b.lat)
+    .forEach((point) => {
+      const cluster = clusters.find((item) => hostGlobeClusterDistance(point, item) <= HOST_GLOBE_CLUSTER_DISTANCE_DEGREES);
+      if (!cluster) {
+        clusters.push({ centerLat: point.lat, centerLng: point.lng, points: [point] });
+        return;
+      }
+      cluster.points.push(point);
+      cluster.centerLat = cluster.points.reduce((sum, item) => sum + item.lat, 0) / cluster.points.length;
+      cluster.centerLng = cluster.points.reduce((sum, item) => sum + item.lng, 0) / cluster.points.length;
+    });
+  return clusters;
+}
+
+function spreadHostGlobePoints(points: HostGlobePoint[]) {
+  return buildHostGlobeClusters(points).flatMap((cluster) => {
+    if (cluster.points.length <= 1) return cluster.points;
+    const sorted = cluster.points.slice().sort((a, b) => String(a.host.name || "").localeCompare(String(b.host.name || "")) || Number(a.host.id || 0) - Number(b.host.id || 0));
+    const lngScale = Math.max(0.36, Math.cos((cluster.centerLat * Math.PI) / 180));
+    const pullLng = HOST_GLOBE_LABEL_PULL_DEGREES + Math.min(6, sorted.length * 0.55);
+    const rowStep = Math.max(HOST_GLOBE_LABEL_ROW_DEGREES, Math.min(6.2, 3.2 + sorted.length * 0.35));
+    return sorted.map((point, index) => {
+      const column = Math.floor(index / HOST_GLOBE_MAX_LABELS_PER_COLUMN);
+      const row = index % HOST_GLOBE_MAX_LABELS_PER_COLUMN;
+      const columnSize = Math.min(HOST_GLOBE_MAX_LABELS_PER_COLUMN, sorted.length - column * HOST_GLOBE_MAX_LABELS_PER_COLUMN);
+      const rowOffset = row - (columnSize - 1) / 2;
+      return {
+        ...point,
+        displayLat: clampLatitude(cluster.centerLat + rowOffset * rowStep),
+        displayLng: normalizeLongitude(cluster.centerLng + (pullLng + column * 6.8) / lngScale),
+      };
+    });
+  });
+}
+
+function createHostGlobeLeaderPaths(points: HostGlobePoint[]): HostGlobeLeaderPath[] {
+  return points
+    .filter(hostGlobePointPulledOut)
+    .map((point) => ({
+      point,
+      coords: [
+        { lat: point.lat, lng: point.lng, alt: 0.052 },
+        { lat: point.displayLat, lng: point.displayLng, alt: 0.118 },
+      ],
+    }));
+}
+
+function createHostGlobeLabelElement(
+  point: HostGlobePoint,
+  onEdit: (host: any) => void,
+  onHoverChange: (point: HostGlobePoint | null) => void
+) {
+  const element = document.createElement("div");
+  element.innerHTML = `
+    <span style="width:7px;height:7px;flex:0 0 auto;border-radius:999px;background:${point.color};box-shadow:0 0 10px ${point.glowColor};"></span>
+    <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;">${escapeTooltipHtml(point.label)}</span>
+  `;
+  element.style.cssText = [
+    "display:inline-flex",
+    "align-items:center",
+    "gap:6px",
+    "max-width:150px",
+    "padding:3px 8px",
+    "border:1px solid rgba(255,255,255,.18)",
+    "border-radius:999px",
+    "background:rgba(2,6,23,.58)",
+    "box-shadow:0 8px 22px rgba(0,0,0,.28),0 0 0 1px rgba(15,23,42,.3)",
+    "backdrop-filter:blur(8px)",
+    "color:#f8fafc",
+    "font:600 13px Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",
+    "line-height:1.15",
+    "letter-spacing:0",
+    "white-space:nowrap",
+    "text-shadow:0 1px 4px rgba(0,0,0,.6)",
+    "transform:translate(-50%,-50%)",
+    "pointer-events:auto",
+    "user-select:none",
+    "cursor:pointer",
+  ].join(";");
+  element.title = `${point.host.name || point.label} · ${point.regionText || "地区获取中"}`;
+  element.addEventListener("pointerenter", () => onHoverChange(point));
+  element.addEventListener("pointerleave", () => onHoverChange(null));
+  element.addEventListener("mouseenter", () => onHoverChange(point));
+  element.addEventListener("mouseleave", () => onHoverChange(null));
+  element.addEventListener("pointerdown", (event) => event.stopPropagation());
+  element.addEventListener("click", (event) => {
+    event.stopPropagation();
+    onHoverChange(null);
+    onEdit(point.host);
+  });
+  return element;
+}
+
+function escapeTooltipHtml(value: unknown) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => {
+    switch (char) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      case "'":
+        return "&#39;";
+      default:
+        return char;
+    }
+  });
+}
+
+function renderHostGlobeTooltip(point: HostGlobePoint) {
+  const rows = [
+    { label: "地址", value: point.addressText },
+    { label: "地区", value: point.regionText || "地区获取中" },
+    { label: "系统", value: point.host.osInfo || "系统信息未上报" },
+    { label: "Agent", value: point.host.agentVersion ? `v${point.host.agentVersion}` : "未上报" },
+  ];
+  const regionValue = point.flagUrl
+    ? `<span style="display:inline-flex;min-width:0;align-items:center;gap:7px;"><img src="${escapeTooltipHtml(point.flagUrl)}" alt="${escapeTooltipHtml(point.countryCode)}" referrerpolicy="no-referrer" style="width:20px;height:15px;flex:0 0 auto;border-radius:2px;object-fit:cover;" onerror="this.style.display='none';this.nextElementSibling.style.display='inline';" /><span style="display:none;flex:0 0 auto;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace;font-size:11px;color:#cbd5e1;">${escapeTooltipHtml(point.countryCode)}</span><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;">${escapeTooltipHtml(point.regionText || "地区获取中")}</span></span>`
+    : escapeTooltipHtml(point.regionText || "地区获取中");
+  return `
+    <div style="min-width:260px;max-width:320px;border:1px solid rgba(255,255,255,.14);border-radius:8px;background:rgba(8,13,24,.92);box-shadow:0 18px 44px rgba(0,0,0,.4);backdrop-filter:blur(10px);color:#f8fafc;padding:12px;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;">
+        <div style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:700;">${escapeTooltipHtml(point.host.name || "-")}</div>
+        <div style="display:flex;align-items:center;gap:6px;color:#cbd5e1;font-size:12px;">
+          <span style="width:8px;height:8px;border-radius:999px;background:${point.color};box-shadow:0 0 14px ${point.glowColor};"></span>
+          ${escapeTooltipHtml(point.statusText)}
+        </div>
+      </div>
+      ${rows.map((row) => `
+        <div style="display:grid;grid-template-columns:42px minmax(0,1fr);gap:8px;align-items:start;margin-top:6px;font-size:12px;line-height:1.45;">
+          <span style="color:#94a3b8;">${escapeTooltipHtml(row.label)}</span>
+          <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;color:#e2e8f0;${row.label === "地址" || row.label === "Agent" ? "font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono',monospace;" : ""}">${row.label === "地区" ? regionValue : escapeTooltipHtml(row.value)}</span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function HostWorldMap({
+  hosts,
+  onEdit,
+  totalHosts = hosts.length,
+  isLoadingMore = false,
+}: {
+  hosts: any[];
+  onEdit: (host: any) => void;
+  totalHosts?: number;
+  isLoadingMore?: boolean;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const globeRef = useRef<GlobeMethods | undefined>(undefined);
+  const [globeReady, setGlobeReady] = useState(false);
+  const [size, setSize] = useState({ width: 1400, height: 780 });
+  const [hoveredPoint, setHoveredPoint] = useState<HostGlobePoint | null>(null);
+  const [countries, setCountries] = useState<GlobeCountryFeature[]>([]);
+
+  const points = useMemo(() => {
+    const rawPoints = hosts.map((host) => {
+      const coord = hostGeoCoordinate(host);
+      if (!coord) return null;
+      const isOnline = !!host.isOnline;
+      return {
+        host,
+        lat: coord.lat,
+        lng: coord.lng,
+        displayLat: coord.lat,
+        displayLng: coord.lng,
+        color: isOnline ? "#4ade80" : "#fbbf24",
+        glowColor: isOnline ? "rgba(74,222,128,.9)" : "rgba(251,191,36,.82)",
+        statusText: isOnline ? "在线" : "离线",
+        regionText: hostRegionText(host),
+        addressText: hostAddressText(host),
+        countryCode: hostCountryCode(host),
+        flagUrl: hostFlagUrl(host),
+        label: hostGlobeLabel(host),
+      };
+    })
+    .filter(Boolean) as HostGlobePoint[];
+    return spreadHostGlobePoints(rawPoints);
+  }, [hosts]);
+
+  const missingCount = Math.max(0, hosts.length - points.length);
+  const onlinePoints = useMemo(() => points.filter((point) => point.host.isOnline), [points]);
+  const leaderPaths = useMemo(() => createHostGlobeLeaderPaths(points), [points]);
+  const hostCountryCodes = useMemo(() => {
+    const codes = new Set<string>();
+    hosts.forEach((host) => {
+      const code = hostCountryCode(host);
+      if (code) codes.add(code);
+    });
+    return codes;
+  }, [hosts]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(GLOBE_COUNTRIES_URL)
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data) => {
+        if (cancelled || !Array.isArray(data?.features)) return;
+        setCountries(data.features as GlobeCountryFeature[]);
+      })
+      .catch(() => {
+        if (!cancelled) setCountries([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const element = containerRef.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    const updateSize = () => {
+      const rect = element.getBoundingClientRect();
+      const viewportHeight = typeof window === "undefined" ? 900 : window.innerHeight;
+      const width = Math.max(900, Math.round(rect.width));
+      setSize({
+        width,
+        height: Math.max(720, Math.min(980, Math.round(Math.max(viewportHeight - 230, width * 0.52)))),
+      });
+    };
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(element);
+    window.addEventListener("resize", updateSize);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateSize);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!globeReady || !globeRef.current) return;
+    const globe = globeRef.current;
+    const controls = globe.controls();
+    controls.autoRotate = true;
+    controls.autoRotateSpeed = 0.42;
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.enablePan = false;
+    controls.rotateSpeed = 0.58;
+    controls.zoomSpeed = 0.85;
+    controls.minDistance = 105;
+    controls.maxDistance = 500;
+    globe.pointOfView({ lat: 5, lng: 108, altitude: 1.18 }, 0);
+  }, [globeReady]);
+
+  useEffect(() => {
+    const controls = globeRef.current?.controls();
+    if (!controls) return;
+    controls.autoRotate = !hoveredPoint;
+  }, [hoveredPoint]);
+
+  return (
+    <div className="hidden overflow-hidden rounded-md border border-border/40 bg-[#030712] shadow-sm md:block">
+      <div
+        ref={containerRef}
+        className="relative min-h-[720px] w-full overflow-hidden"
+        style={{ height: size.height }}
+      >
+        <Suspense
+          fallback={
+            <div className="absolute inset-0 flex items-center justify-center bg-[#030712] text-sm text-white/70">
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              正在加载地球视图
+            </div>
+          }
+        >
+          <ReactGlobe
+            ref={globeRef}
+            width={size.width}
+            height={size.height}
+            backgroundColor="rgba(3,7,18,1)"
+            backgroundImageUrl={GLOBE_BACKGROUND_IMAGE_URL}
+            globeImageUrl={GLOBE_EARTH_IMAGE_URL}
+            bumpImageUrl={GLOBE_BUMP_IMAGE_URL}
+            showAtmosphere
+            atmosphereColor="#64748b"
+            atmosphereAltitude={0.22}
+            showGraticules={false}
+            globeCurvatureResolution={4}
+            polygonsData={countries}
+            polygonGeoJsonGeometry="geometry"
+            polygonAltitude={(country) => countryFeatureHasCode(country as GlobeCountryFeature, hostCountryCodes) ? 0.014 : 0.004}
+            polygonCapColor={(country) => countryFeatureHasCode(country as GlobeCountryFeature, hostCountryCodes) ? "rgba(20,184,166,.38)" : "rgba(15,23,42,.05)"}
+            polygonSideColor={(country) => countryFeatureHasCode(country as GlobeCountryFeature, hostCountryCodes) ? "rgba(20,184,166,.24)" : "rgba(2,6,23,.14)"}
+            polygonStrokeColor={(country) => countryFeatureHasCode(country as GlobeCountryFeature, hostCountryCodes) ? "rgba(94,234,212,.88)" : "rgba(148,163,184,.22)"}
+            polygonCapCurvatureResolution={4}
+            polygonsTransitionDuration={0}
+            pathsData={leaderPaths}
+            pathPoints="coords"
+            pathPointLat="lat"
+            pathPointLng="lng"
+            pathPointAlt="alt"
+            pathResolution={2}
+            pathColor={(path: object) => ((path as HostGlobeLeaderPath).point.host.isOnline ? "rgba(94,234,212,.78)" : "rgba(251,191,36,.78)")}
+            pathStroke={1.35}
+            pathTransitionDuration={0}
+            pointsData={points}
+            pointLat="lat"
+            pointLng="lng"
+            pointAltitude={(point) => ((point as HostGlobePoint).host.isOnline ? 0.045 : 0.032)}
+            pointRadius={0.34}
+            pointResolution={28}
+            pointColor={(point) => (point as HostGlobePoint).color}
+            pointsTransitionDuration={0}
+            ringsData={onlinePoints}
+            ringLat="lat"
+            ringLng="lng"
+            ringAltitude={0.048}
+            ringColor={() => ["rgba(74,222,128,.85)", "rgba(94,234,212,.26)", "rgba(74,222,128,0)"]}
+            ringMaxRadius={2.5}
+            ringPropagationSpeed={0.72}
+            ringRepeatPeriod={2600}
+            htmlElementsData={points}
+            htmlLat="displayLat"
+            htmlLng="displayLng"
+            htmlAltitude={0.12}
+            htmlElement={(point) => createHostGlobeLabelElement(point as HostGlobePoint, onEdit, setHoveredPoint)}
+            htmlTransitionDuration={0}
+            pointLabel={(point) => renderHostGlobeTooltip(point as HostGlobePoint)}
+            onPointHover={(point) => setHoveredPoint(point as HostGlobePoint | null)}
+            onPointClick={(point) => onEdit((point as HostGlobePoint).host)}
+            showPointerCursor={(objectType) => objectType === "point"}
+            enablePointerInteraction
+            onGlobeReady={() => setGlobeReady(true)}
+          />
+        </Suspense>
+        <div className="pointer-events-none absolute left-4 top-4 rounded-md border border-white/10 bg-black/35 px-3 py-2 text-xs text-white shadow-lg backdrop-blur-md">
+          <div className="font-medium">全球主机地图</div>
+          <div className="mt-1 text-white/70">
+            已加载 {hosts.length} / {Math.max(totalHosts, hosts.length)} 台 · 已定位 {points.length} 台 · 待定位 {missingCount} 台
+            {isLoadingMore ? " · 正在补充" : ""}
+          </div>
+        </div>
+        {points.length === 0 && (
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center px-6 text-center">
+            <div className="rounded-md border border-white/10 bg-black/35 px-4 py-3 text-sm text-white/80 shadow-lg backdrop-blur-md">
+              暂无可定位主机
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+type HostTrafficMeasureMode = "outbound" | "both" | "max";
+type HostBillingCycleMonths = 1 | 3 | 6 | 12 | 24 | 36;
+type HostExpiryAction = "none" | "extend_cycle";
+
+const HOST_TRAFFIC_GB_BYTES = 1024 ** 3;
+
+type HostFormData = {
+  name: string;
+  ip: string;
+  hostType: "master" | "slave";
+  networkInterface: string;
+  entryIp: string;
+  tunnelEntryIp: string;
+  portRangeStart: number | null;
+  portRangeEnd: number | null;
+  portAllowlist: string;
+  purchasedAt: string;
+  stoppedAt: string;
+  trafficLimitGb: string;
+  trafficMeasureMode: HostTrafficMeasureMode;
+  billingCycleMonths: HostBillingCycleMonths;
+  billingMonth: number;
+  billingDay: number;
+  expiryHandling: HostExpiryAction;
+  telegramTrafficAlertEnabled: boolean;
+  trafficAlertThresholdPercent: number;
+  telegramRenewalReminderEnabled: boolean;
+  renewalReminderDays: number;
+  trafficAutoReset: boolean;
+  trafficResetDay: number;
+  ddnsEnabled: boolean;
+  ddnsIpVersion: "ipv4" | "ipv6";
+  ddnsDomain: string;
+  blockHttp: boolean;
+  blockSocks: boolean;
+  blockTls: boolean;
+};
+
+const defaultFormData: HostFormData = {
+  name: "",
+  ip: "",
+  hostType: "slave",
+  networkInterface: "",
+  entryIp: "",
+  tunnelEntryIp: "",
+  portRangeStart: null,
+  portRangeEnd: null,
+  portAllowlist: "",
+  purchasedAt: "",
+  stoppedAt: "",
+  trafficLimitGb: "",
+  trafficMeasureMode: "both",
+  billingCycleMonths: 1,
+  billingMonth: 1,
+  billingDay: 1,
+  expiryHandling: "none",
+  telegramTrafficAlertEnabled: false,
+  trafficAlertThresholdPercent: 20,
+  telegramRenewalReminderEnabled: false,
+  renewalReminderDays: 3,
+  trafficAutoReset: false,
+  trafficResetDay: 1,
+  ddnsEnabled: false,
+  ddnsIpVersion: "ipv4",
+  ddnsDomain: "",
+  blockHttp: false,
+  blockSocks: false,
+  blockTls: false,
+};
+
+function clampMonthlyResetDay(value: number) {
+  return Math.min(31, Math.max(1, Math.floor(Number(value) || 1)));
+}
+
+function normalizeHostBillingCycleMonths(value: unknown): HostBillingCycleMonths {
+  const months = Math.floor(Number(value));
+  if (months === 3 || months === 6 || months === 12 || months === 24 || months === 36) return months;
+  return 1;
+}
+
+function clampBillingMonth(value: number) {
+  return Math.min(12, Math.max(1, Math.floor(Number(value) || 1)));
+}
+
+function clampBillingDay(value: number) {
+  return Math.min(31, Math.max(1, Math.floor(Number(value) || 1)));
+}
+
+function normalizeHostExpiryAction(value: unknown): HostExpiryAction {
+  return value === "extend_cycle" ? "extend_cycle" : "none";
+}
+
+function clampTrafficAlertThresholdPercent(value: number) {
+  return Math.min(99, Math.max(1, Math.floor(Number(value) || 20)));
+}
+
+function clampRenewalReminderDays(value: number) {
+  return Math.min(365, Math.max(1, Math.floor(Number(value) || 3)));
+}
+
+function normalizeHostTrafficMeasureMode(value: unknown): HostTrafficMeasureMode {
+  if (value === "outbound" || value === "max") return value;
+  return "both";
+}
+
+function hostTrafficMeasureModeLabel(value: unknown) {
+  const mode = normalizeHostTrafficMeasureMode(value);
+  if (mode === "outbound") return "仅出向";
+  if (mode === "max") return "取最大值";
+  return "双向合计";
+}
+
+function hostTrafficUsedBytes(host: any, traffic: any) {
+  const bytesIn = Math.max(0, Number(traffic?.bytesIn) || 0);
+  const bytesOut = Math.max(0, Number(traffic?.bytesOut) || 0);
+  const mode = normalizeHostTrafficMeasureMode(host?.trafficMeasureMode);
+  if (mode === "outbound") return bytesOut;
+  if (mode === "max") return Math.max(bytesIn, bytesOut);
+  return bytesIn + bytesOut;
+}
+
+function formatTrafficCorrectionGbInput(bytes: number) {
+  const gb = Math.max(0, Number(bytes) || 0) / HOST_TRAFFIC_GB_BYTES;
+  if (gb === 0) return "0";
+  return String(Number(gb.toFixed(6)));
+}
+
+function normalizeHostDdnsIpVersion(value: unknown, recordType?: unknown): "ipv4" | "ipv6" {
+  if (value === "ipv6" || (!value && String(recordType || "").toUpperCase() === "AAAA")) return "ipv6";
+  return "ipv4";
+}
+
+function formatTrafficLimitGbInput(value: unknown) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "";
+  const gb = bytes / HOST_TRAFFIC_GB_BYTES;
+  return Number.isInteger(gb) ? String(gb) : String(Number(gb.toFixed(3)));
+}
+
+function formatBytesPerSecond(value: unknown) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B/s";
+  return `${formatBytes(bytes)}/s`;
+}
+
+function formatOptionalBytesPerSecond(value: unknown) {
+  if (value === null || value === undefined) return "--";
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "--";
+  return formatBytesPerSecond(bytes);
+}
+
+function formatOptionalBytes(value: unknown) {
+  if (value === null || value === undefined) return "--";
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "--";
+  return formatBytes(bytes);
+}
+
+function metricBytesOrNull(value: unknown) {
+  if (value === null || value === undefined) return null;
+  const bytes = Number(value);
+  return Number.isFinite(bytes) ? Math.max(0, bytes) : null;
+}
+
+
+function systemNetworkTotalTitle(metric: any) {
+  const bytesIn = metricBytesOrNull(metric?.networkIn);
+  const bytesOut = metricBytesOrNull(metric?.networkOut);
+  const total = bytesIn === null && bytesOut === null ? null : (bytesIn ?? 0) + (bytesOut ?? 0);
+  return [
+    "\u7cfb\u7edf\u7d2f\u8ba1\u6d41\u91cf\uff08\u7cfb\u7edf\u91cd\u542f\u540e\u91cd\u7f6e\uff09",
+    `\u5165\u7ad9 ${formatOptionalBytes(bytesIn)}`,
+    `\u51fa\u7ad9 ${formatOptionalBytes(bytesOut)}`,
+    `\u5408\u8ba1 ${formatOptionalBytes(total)}`,
+  ].join("\n");
+}
+function clampPercent(value: unknown) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  return Math.max(0, Math.min(100, Math.round(num)));
+}
+
+function formatUsagePercent(value: unknown) {
+  const percent = clampPercent(value);
+  return percent === null ? "--" : `${percent}%`;
+}
+
+function formatMetricSizeDetail(used: unknown, total: unknown) {
+  const usedBytes = Number(used);
+  const totalBytes = Number(total);
+  if (!Number.isFinite(usedBytes) || usedBytes <= 0) return "";
+  if (!Number.isFinite(totalBytes) || totalBytes <= 0) return formatBytes(usedBytes);
+  return `${formatBytes(usedBytes)} / ${formatBytes(totalBytes)}`;
+}
+
+const hostListDayMs = 24 * 60 * 60 * 1000;
+
+function parseHostDateTime(value: unknown) {
+  if (!value) return null;
+  const ms = value instanceof Date
+    ? value.getTime()
+    : typeof value === "number"
+      ? value
+      : Date.parse(String(value));
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function formatHostDateTimeText(value: unknown) {
+  const ms = parseHostDateTime(value);
+  if (ms === null) return "--";
+  return new Date(ms).toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatHostRemainingDays(purchasedAt: unknown, stoppedAt: unknown) {
+  const purchasedMs = parseHostDateTime(purchasedAt);
+  const stoppedMs = parseHostDateTime(stoppedAt);
+  if (purchasedMs === null || stoppedMs === null || stoppedMs <= purchasedMs) return "--";
+  const remainingMs = stoppedMs - Date.now();
+  if (remainingMs <= 0) return "已到期";
+  if (remainingMs < hostListDayMs) return "不足1天";
+  return `${Math.ceil(remainingMs / hostListDayMs)}天`;
+}
+
+function formatHostUptimeTitle(uptime: unknown, uptimeText: string) {
+  const seconds = Number(uptime);
+  if (!Number.isFinite(seconds) || seconds < 0) return "运行时间：--";
+  const startedAt = new Date(Date.now() - seconds * 1000);
+  return `运行时间：${uptimeText}\n启动时间：${startedAt.toLocaleString("zh-CN", { hour12: false })}`;
+}
+
+function formatHostExpiryTitle(stoppedAt: unknown, remainingDays: string) {
+  const stoppedAtText = formatHostDateTimeText(stoppedAt);
+  if (stoppedAtText === "--") return "到期时间：--";
+  return `到期时间：${stoppedAtText}\n剩余时间：${remainingDays}`;
+}
+
+function hostRemainingClass(value: string) {
+  if (value === "已到期") return "text-destructive";
+  if (value === "不足1天") return "text-amber-500";
+  if (value === "--") return "text-muted-foreground";
+  return "text-emerald-500";
+}
+
+function compactHostOsInfo(value: unknown) {
+  return String(value || "")
+    .replace(/\s*\([^)]*\)\s*/g, " ")
+    .replace(/\s+/g, " ")
+    .trim() || "-";
+}
+
+function HostListResourceRow({
+  icon: Icon,
+  label,
+  value,
+  detail,
+  isOnline,
+}: {
+  icon: typeof ActivitySquare;
+  label: string;
+  value: unknown;
+  detail?: string;
+  isOnline: boolean;
+}) {
+  const percent = clampPercent(value);
+  const progressValue = percent ?? 0;
+  const progressClass = percent === null
+    ? "h-1.5 bg-muted [&>div]:bg-muted-foreground/20"
+    : metricUsageProgressClass(progressValue, isOnline);
+  const tooltip = [
+    `${label}: ${formatUsagePercent(value)}`,
+    detail,
+  ].filter(Boolean).join("\n");
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div className="min-w-0 cursor-help rounded-sm px-1 py-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" tabIndex={0} aria-label={tooltip}>
+          <div className="flex min-w-0 items-center justify-between gap-1.5">
+            <div className="flex min-w-0 items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
+              <Icon className="h-3.5 w-3.5 shrink-0" />
+              <span className="truncate">{label}</span>
+            </div>
+            <span className="shrink-0 text-right text-[11px] font-semibold tabular-nums text-foreground">{formatUsagePercent(value)}</span>
+          </div>
+          <Progress value={progressValue} className={cn(progressClass, "mt-1.5 w-full min-w-0")} />
+        </div>
+      </TooltipTrigger>
+      <TooltipContent collisionPadding={12} className="max-w-[260px] whitespace-pre-line text-xs">
+        {tooltip || `${label}: --`}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function HostListResourceBundle({
+  cpuValue,
+  cpuDetail,
+  memoryValue,
+  memoryDetail,
+  diskValue,
+  diskDetail,
+  isOnline,
+}: {
+  cpuValue: unknown;
+  cpuDetail?: string;
+  memoryValue: unknown;
+  memoryDetail?: string;
+  diskValue: unknown;
+  diskDetail?: string;
+  isOnline: boolean;
+}) {
+  return (
+    <TooltipProvider delayDuration={120}>
+      <div className="grid min-w-[300px] grid-cols-3 gap-1.5">
+        <HostListResourceRow
+          icon={Cpu}
+          label="CPU"
+          value={cpuValue}
+          detail={cpuDetail}
+          isOnline={isOnline}
+        />
+        <HostListResourceRow
+          icon={MemoryStick}
+          label="RAM"
+          value={memoryValue}
+          detail={memoryDetail}
+          isOnline={isOnline}
+        />
+        <HostListResourceRow
+          icon={HardDrive}
+          label="Disk"
+          value={diskValue}
+          detail={diskDetail}
+          isOnline={isOnline}
+        />
+      </div>
+    </TooltipProvider>
+  );
+}
+
+function HostListFlowPair({
+  inValue,
+  outValue,
+  inTitle,
+  outTitle,
+}: {
+  inValue: string;
+  outValue: string;
+  inTitle?: string;
+  outTitle?: string;
+}) {
+  return (
+    <div
+      className="mx-auto grid w-[96px] max-w-full grid-cols-[12px_minmax(0,1fr)] items-center gap-x-1.5 gap-y-1 text-xs tabular-nums"
+      title={`${inTitle || inValue}\n${outTitle || outValue}`}
+    >
+      <ArrowDown className="h-3 w-3 text-emerald-500" />
+      <span className="min-w-0 truncate text-right font-medium text-emerald-500">{inValue}</span>
+      <ArrowUp className="h-3 w-3 text-muted-foreground" />
+      <span className="min-w-0 truncate text-right font-medium text-foreground">{outValue}</span>
+    </div>
+  );
+}
+
+function HostListStatusBadge({ host }: { host: any }) {
+  const online = !!host?.isOnline;
+  return (
+    <span
+      className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap text-[11px] font-medium leading-none"
+      title={online ? "Agent 在线" : "Agent 离线"}
+    >
+      <span className={`h-1.5 w-1.5 rounded-full ${online ? "bg-emerald-500" : "bg-destructive"}`} />
+      <span className={online ? "text-emerald-500" : "text-destructive"}>{online ? "在线" : "离线"}</span>
+    </span>
+  );
+}
+
+function HostSummaryCard({
+  title,
+  value,
+  subtitle,
+  icon: Icon,
+  leadingIcon: LeadingIcon,
+  leadingTone = "bg-emerald-500",
+  iconTone = "bg-chart-2/10 text-chart-2",
+  tone,
+  loading,
+  cacheKey,
+  className,
+}: {
+  title: string;
+  value: string;
+  subtitle?: string;
+  icon: typeof ActivitySquare;
+  leadingIcon?: typeof ActivitySquare;
+  leadingTone?: string;
+  iconTone?: string;
+  tone: string;
+  loading?: boolean;
+  cacheKey: string;
+  className?: string;
+}) {
+  return (
+    <Card className={`group relative h-full overflow-hidden border-border/40 bg-card/60 backdrop-blur-md transition-all duration-300 hover:-translate-y-0.5 hover:border-border/70 hover:shadow-lg hover:shadow-primary/5 ${className || ""}`.trim()}>
+      <div className={`absolute inset-0 opacity-[0.035] transition-opacity group-hover:opacity-[0.07] ${tone}`} />
+      <CardContent className="relative flex h-full min-h-[112px] flex-col justify-center p-3.5 sm:min-h-[112px] sm:p-4">
+        <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{title}</p>
+        <div className={`absolute right-4 top-3.5 hidden h-9 w-9 shrink-0 items-center justify-center rounded-xl shadow-sm sm:flex ${iconTone}`}>
+          <Icon className="h-5 w-5" />
+        </div>
+        <div className="mt-1 flex min-w-0 items-center gap-2.5 pr-12">
+          {LeadingIcon && (
+            <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg shadow-sm ${leadingTone}`}>
+              <LeadingIcon className="h-4 w-4 text-white" />
+            </div>
+          )}
+          <div className="min-w-0">
+            <AnimatedStatValue
+              as="span"
+              value={value}
+              loading={loading}
+              cacheKey={cacheKey}
+              fallbackValue="0"
+              className="block truncate text-2xl font-bold leading-none tracking-tight tabular-nums"
+              title={value}
+            />
+            {subtitle && (
+              <p className="mt-2 truncate text-xs text-muted-foreground" title={subtitle}>
+                {subtitle}
+              </p>
+            )}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function HostTrafficDirectionStat({
+  label,
+  value,
+  icon: Icon,
+  tone,
+  loading,
+  cacheKey,
+  animated = true,
+  className,
+}: {
+  label: string;
+  value: string;
+  icon: typeof ActivitySquare;
+  tone: string;
+  loading?: boolean;
+  cacheKey: string;
+  animated?: boolean;
+  className?: string;
+}) {
+  return (
+    <div className={`min-w-0 ${className || ""}`.trim()}>
+      <div className="flex items-center gap-2.5">
+        <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg shadow-sm ${tone}`}>
+          <Icon className="h-4 w-4 text-white" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{label}</p>
+          {animated ? (
+            <AnimatedStatValue
+              as="p"
+              value={value}
+              loading={loading}
+              cacheKey={cacheKey}
+              fallbackValue="0 B/s"
+              className="mt-0.5 whitespace-nowrap text-base font-semibold leading-tight tabular-nums sm:text-lg"
+              title={value}
+            />
+          ) : (
+            <p
+              className="mt-0.5 whitespace-nowrap text-base font-semibold leading-tight tabular-nums sm:text-lg"
+              title={value}
+            >
+              {value}
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HostTrafficSummaryCard({
+  title,
+  inValue,
+  outValue,
+  icon: Icon,
+  tone = "bg-gradient-to-br from-chart-1/10 to-transparent",
+  iconTone = "bg-chart-1/10 text-chart-1",
+  loading,
+  cacheKey,
+  animated = true,
+  className,
+}: {
+  title: string;
+  inValue: string;
+  outValue: string;
+  icon: typeof ActivitySquare;
+  tone?: string;
+  iconTone?: string;
+  loading?: boolean;
+  cacheKey: string;
+  animated?: boolean;
+  className?: string;
+}) {
+  return (
+    <Card className={`group relative h-full overflow-hidden border-border/40 bg-card/60 backdrop-blur-md transition-all duration-300 hover:-translate-y-0.5 hover:border-border/70 hover:shadow-lg hover:shadow-primary/5 ${className || ""}`.trim()}>
+      <div className={`absolute inset-0 opacity-[0.04] transition-opacity group-hover:opacity-[0.08] ${tone}`} />
+      <CardContent className="relative flex h-full flex-col justify-start p-3.5 sm:p-4">
+        <div className="flex min-h-0 items-start justify-between gap-3">
+          <div className="min-w-0 space-y-1 pr-12">
+            <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{title}</p>
+          </div>
+          <div className={`pointer-events-none absolute right-4 top-3.5 hidden h-9 w-9 shrink-0 items-center justify-center rounded-xl shadow-sm sm:flex ${iconTone}`}>
+            <Icon className="h-5 w-5" />
+          </div>
+        </div>
+        <div className="mt-2 grid grid-cols-[repeat(auto-fit,minmax(145px,1fr))] gap-2.5">
+          <HostTrafficDirectionStat
+            label="入向"
+            value={inValue}
+            loading={loading}
+            cacheKey={`${cacheKey}.in`}
+            animated={animated}
+            icon={ArrowDownToLine}
+            tone="bg-emerald-500"
+          />
+          <HostTrafficDirectionStat
+            label="出向"
+            value={outValue}
+            loading={loading}
+            cacheKey={`${cacheKey}.out`}
+            animated={animated}
+            icon={ArrowUpFromLine}
+            tone="bg-amber-500"
+          />
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+type HostViewMode = "card" | "compact-card" | "table" | "map" | "flat-map";
+type HostManageTab = "hosts" | "groups" | "services" | "tokens";
+type HostManageFilterStats = { filtered: number; total: number };
+type HostDialogTab = "basic" | "other";
+
+const HOST_MANAGE_TABS_ADMIN = ["hosts", "groups", "tokens", "services"] as const;
+const HOST_MANAGE_TABS_USER = ["hosts"] as const;
+const HOST_MANAGE_TAB_ITEMS_ADMIN = [
+  { value: "hosts", label: "主机管理", icon: Server },
+  { value: "groups", label: "分组管理", icon: FolderKanban },
+  { value: "tokens", label: "Token 管理", icon: Key },
+  { value: "services", label: "服务管理", icon: Rows3 },
+] as const satisfies readonly SlidingTabItem<HostManageTab>[];
+const HOST_MANAGE_TAB_ITEMS_USER = [
+  { value: "hosts", label: "主机管理", icon: Server },
+] as const satisfies readonly SlidingTabItem<HostManageTab>[];
+
+const HOST_MANAGE_FILTER_CONFIG: Record<HostManageTab, { placeholder: string; unit: string }> = {
+  hosts: { placeholder: "搜索主机 / IP / 系统 / Agent 版本", unit: "台" },
+  groups: { placeholder: "搜索分组 / 主机名称 / 状态", unit: "组" },
+  tokens: { placeholder: "搜索 Token / 备注 / 状态 / 关联主机", unit: "个" },
+  services: { placeholder: "搜索服务 / 目标地址 / 类型 / 主机范围", unit: "项" },
+};
+
+const HOST_DIALOG_TABS = [
+  { value: "basic", label: "基础信息", icon: Server },
+  { value: "other", label: "其他配置", icon: Gauge },
+] as const;
+
+const HOST_MANAGE_TAB_STORAGE_KEY = "forwardx.hosts.manageTab";
+const HOST_VIEW_MODE_STORAGE_KEY = "forwardx.hosts.viewMode";
+const AGENT_TOKEN_VIEW_MODE_STORAGE_KEY = "forwardx.agentTokens.viewMode";
+const HOST_PROBE_SERVICE_VIEW_MODE_STORAGE_KEY = "forwardx.hostProbeServices.viewMode";
+const HOST_GROUP_VIEW_MODE_STORAGE_KEY = "forwardx.hostGroups.viewMode";
+
+function getStoredHostViewMode(): HostViewMode {
+  if (typeof window === "undefined") return "card";
+  try {
+    const value = window.localStorage.getItem(HOST_VIEW_MODE_STORAGE_KEY);
+    return value === "compact-card" || value === "table" || value === "map" || value === "flat-map" ? value : "card";
+  } catch {
+    return "card";
+  }
+}
+
+function storeHostViewMode(viewMode: HostViewMode) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(HOST_VIEW_MODE_STORAGE_KEY, viewMode);
+  } catch {
+    // Ignore storage failures so the page still works in restricted browsers.
+  }
+}
+
+function getStoredAgentTokenViewMode(): AgentTokenViewMode {
+  if (typeof window === "undefined") return "card";
+  try {
+    const value = window.localStorage.getItem(AGENT_TOKEN_VIEW_MODE_STORAGE_KEY);
+    return value === "table" ? "table" : "card";
+  } catch {
+    return "card";
+  }
+}
+
+function storeAgentTokenViewMode(viewMode: AgentTokenViewMode) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(AGENT_TOKEN_VIEW_MODE_STORAGE_KEY, viewMode);
+  } catch {
+    // Ignore storage failures so the page still works in restricted browsers.
+  }
+}
+
+function getStoredHostProbeServiceViewMode(): HostProbeServiceViewMode {
+  if (typeof window === "undefined") return "card";
+  try {
+    const value = window.localStorage.getItem(HOST_PROBE_SERVICE_VIEW_MODE_STORAGE_KEY);
+    return value === "table" ? "table" : "card";
+  } catch {
+    return "card";
+  }
+}
+
+function storeHostProbeServiceViewMode(viewMode: HostProbeServiceViewMode) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(HOST_PROBE_SERVICE_VIEW_MODE_STORAGE_KEY, viewMode);
+  } catch {
+    // Ignore storage failures so the page still works in restricted browsers.
+  }
+}
+
+function getStoredHostGroupViewMode(): HostGroupViewMode {
+  if (typeof window === "undefined") return "card";
+  try {
+    const value = window.localStorage.getItem(HOST_GROUP_VIEW_MODE_STORAGE_KEY);
+    return value === "table" ? "table" : "card";
+  } catch {
+    return "card";
+  }
+}
+
+function storeHostGroupViewMode(viewMode: HostGroupViewMode) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(HOST_GROUP_VIEW_MODE_STORAGE_KEY, viewMode);
+  } catch {
+    // Ignore storage failures so the page still works in restricted browsers.
+  }
+}
+
+function hostGroupHostIds(group: HostGroupView | null | undefined) {
+  if (!group) return [];
+  const rawIds = Array.isArray(group.hostIds)
+    ? group.hostIds
+    : (group.members || []).map((member) => member.hostId);
+  return Array.from(new Set(rawIds
+    .map((id) => Math.floor(Number(id)))
+    .filter((id) => Number.isInteger(id) && id > 0)));
+}
+
+function hostMatchesTextFilter(host: any, query: string) {
+  const tokens = query
+    .toLowerCase()
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+  if (tokens.length === 0) return true;
+  const haystack = [
+    host?.id,
+    host?.name,
+    host?.ip,
+    host?.ipv4,
+    host?.ipv6,
+    host?.entryIp,
+    host?.tunnelEntryIp,
+    host?.osInfo,
+    host?.cpuInfo,
+    host?.agentVersion,
+    host?.hostType,
+  ].map((value) => String(value || "").toLowerCase()).join(" ");
+  return tokens.every((token) => haystack.includes(token));
+}
+
+function HostGroupFilterBar({
+  groups,
+  totalHosts,
+  groupCounts,
+  selectedGroupId,
+  onSelectGroup,
+}: {
+  groups: HostGroupView[];
+  totalHosts: number;
+  groupCounts: Record<number, number>;
+  selectedGroupId: number | "all";
+  onSelectGroup: (groupId: number | "all") => void;
+}) {
+  const enabledGroups = useMemo(
+    () => [...(groups || [])]
+      .filter((group) => group.isEnabled !== false)
+      .sort(compareHostGroupDisplayOrder),
+    [groups],
+  );
+  if (enabledGroups.length === 0) return null;
+  const chipClass = (active: boolean) => [
+    "inline-flex h-9 shrink-0 items-center gap-2 rounded-md border px-3 text-sm transition-colors",
+    active
+      ? "border-chart-1/35 bg-chart-1/10 text-chart-1 shadow-sm"
+      : "border-border/45 bg-card/60 text-muted-foreground hover:bg-muted/45 hover:text-foreground",
+  ].join(" ");
+  const countForGroup = (group: HostGroupView) => Number(groupCounts[Number(group.id)] || 0);
+
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-2 rounded-lg border border-border/40 bg-card/50 p-2 backdrop-blur-md">
+      <button type="button" className={chipClass(selectedGroupId === "all")} onClick={() => onSelectGroup("all")}>
+        <Server className="h-3.5 w-3.5" />
+        <span>全部</span>
+        <span className={cn("rounded px-1.5 py-0.5 text-[11px] tabular-nums", selectedGroupId === "all" ? "bg-chart-1/15 text-chart-1" : "bg-background/70 text-muted-foreground")}>{totalHosts}</span>
+      </button>
+      {enabledGroups.map((group) => (
+        <button
+          key={group.id}
+          type="button"
+          className={chipClass(selectedGroupId === Number(group.id))}
+          onClick={() => onSelectGroup(Number(group.id))}
+          title={group.name}
+        >
+          <FolderKanban className="h-3.5 w-3.5" />
+          <span className="max-w-[160px] truncate">{group.name}</span>
+          <span className={cn("rounded px-1.5 py-0.5 text-[11px] tabular-nums", selectedGroupId === Number(group.id) ? "bg-chart-1/15 text-chart-1" : "bg-background/70 text-muted-foreground")}>{countForGroup(group)}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function HostsContent() {
+  const { user } = useAuth();
+  const utils = trpc.useUtils();
+  const { data: xrayPublicInfo } = trpc.system.publicInfo.useQuery(undefined, {
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+  });
+  const pageVisible = usePageVisible();
+  const [viewMode, setViewMode] = useState<HostViewMode>(() => getStoredHostViewMode());
+  const [activeManageTab, setActiveManageTab] = useUrlTab<HostManageTab>({
+    values: user?.role === "admin" ? HOST_MANAGE_TABS_ADMIN : HOST_MANAGE_TABS_USER,
+    defaultValue: "hosts",
+    storageKey: HOST_MANAGE_TAB_STORAGE_KEY,
+  });
+  const [selectedHostGroupId, setSelectedHostGroupId] = useState<number | "all">("all");
+  const [hostGroupCreateSignal, setHostGroupCreateSignal] = useState(0);
+  const [manageSearchQueries, setManageSearchQueries] = useState<Record<HostManageTab, string>>({
+    hosts: "",
+    groups: "",
+    tokens: "",
+    services: "",
+  });
+  const [bulkUpgradeDialogOpen, setBulkUpgradeDialogOpen] = useState(false);
+  const hostSearchQuery = manageSearchQueries.hosts;
+  const hostPageRequest = usePersistentPageRequest("forwardx.hosts.page");
+  const hostListRefreshInterval = visiblePollingInterval("slow", pageVisible);
+  const hostPageQuery = trpc.hosts.listPage.useQuery({
+    page: hostPageRequest.page,
+    pageSize: 12,
+    search: hostSearchQuery,
+    groupId: selectedHostGroupId === "all" ? null : Number(selectedHostGroupId),
+  }, {
+    enabled: activeManageTab === "hosts",
+    refetchInterval: hostListRefreshInterval,
+    refetchOnWindowFocus: true,
+    staleTime: 25_000,
+    placeholderData: (previousData) => previousData,
+  });
+  const hostPageFilterKey = `${selectedHostGroupId}:${hostSearchQuery.trim()}`;
+  const previousHostPageFilterKey = useRef(hostPageFilterKey);
+  useEffect(() => {
+    if (previousHostPageFilterKey.current === hostPageFilterKey) return;
+    previousHostPageFilterKey.current = hostPageFilterKey;
+    hostPageRequest.setPage(1);
+  }, [hostPageFilterKey, hostPageRequest.setPage]);
+
+  const isHostMapView = activeManageTab === "hosts" && (viewMode === "map" || viewMode === "flat-map");
+  const hostMapQuery = trpc.hosts.mapPoints.useInfiniteQuery({
+    limit: 100,
+    search: hostSearchQuery,
+    groupId: selectedHostGroupId === "all" ? null : Number(selectedHostGroupId),
+  }, {
+    enabled: isHostMapView,
+    initialCursor: 0,
+    getNextPageParam: (lastPage) => lastPage.nextCursor,
+    staleTime: 25_000,
+    refetchOnWindowFocus: false,
+    placeholderData: (previousData) => previousData,
+  });
+  const mapHosts = useMemo<any[]>(
+    () => hostMapQuery.data?.pages.flatMap((page) => page.items as any[]) || [],
+    [hostMapQuery.data?.pages],
+  );
+  const mapHostTotal = Number(hostMapQuery.data?.pages[0]?.totalItems || 0);
+
+  useEffect(() => {
+    if (!isHostMapView || !hostMapQuery.hasNextPage || hostMapQuery.isFetchingNextPage) return;
+    const loadNextPage = () => void hostMapQuery.fetchNextPage();
+    let idleHandle: number | undefined;
+    let timeoutHandle: ReturnType<typeof globalThis.setTimeout> | undefined;
+    if ("requestIdleCallback" in window) {
+      idleHandle = window.requestIdleCallback(loadNextPage, { timeout: 1_500 });
+    } else {
+      timeoutHandle = globalThis.setTimeout(loadNextPage, 120);
+    }
+    return () => {
+      if (idleHandle !== undefined && "cancelIdleCallback" in window) window.cancelIdleCallback(idleHandle);
+      if (timeoutHandle !== undefined) globalThis.clearTimeout(timeoutHandle);
+    };
+  }, [hostMapQuery.fetchNextPage, hostMapQuery.hasNextPage, hostMapQuery.isFetchingNextPage, isHostMapView]);
+
+  const needsFullHostList = activeManageTab === "groups";
+  const fullHostQuery = trpc.hosts.options.useQuery(undefined, {
+    enabled: needsFullHostList,
+    staleTime: 25_000,
+    refetchOnWindowFocus: false,
+    placeholderData: (previousData: any) => previousData,
+  });
+  const usesFullHostDisplay = isHostMapView || needsFullHostList;
+  const hosts = (isHostMapView
+    ? mapHosts
+    : needsFullHostList
+      ? fullHostQuery.data
+      : hostPageQuery.data?.items) as any[] | undefined;
+  const isLoading = isHostMapView
+    ? hostMapQuery.isLoading
+    : needsFullHostList
+      ? fullHostQuery.isLoading
+      : hostPageQuery.isLoading;
+  const isError = isHostMapView
+    ? hostMapQuery.isError
+    : needsFullHostList
+      ? fullHostQuery.isError
+      : hostPageQuery.isError;
+  const error = isHostMapView ? hostMapQuery.error : needsFullHostList ? fullHostQuery.error : hostPageQuery.error;
+  const refetch = () => isHostMapView
+    ? hostMapQuery.refetch()
+    : needsFullHostList
+      ? fullHostQuery.refetch()
+      : hostPageQuery.refetch();
+  // Shared hosts can have a per-user API order which intentionally differs
+  // from the global host sortOrder.
+  const baseDisplayHosts = useMemo<any[]>(() => [...((hosts || []) as any[])], [hosts]);
+  const { data: systemSettings } = trpc.system.getSettings.useQuery();
+  const forwardProtocolSettings = useMemo(
+    () => normalizeForwardProtocolSettings(systemSettings?.forwardProtocols),
+    [systemSettings?.forwardProtocols]
+  );
+  const nginxFeatureEnabled = forwardProtocolSettings.nginx !== false || forwardProtocolSettings.nginx_stream !== false;
+  const latestAgentVersion = useMemo(
+    () => systemSettings?.agentVersion || "",
+    [systemSettings?.agentVersion]
+  );
+  const ddnsProviderEnabled = Boolean(systemSettings?.ddns?.enabled && systemSettings?.ddns?.provider && systemSettings.ddns.provider !== "disabled");
+  const telegramBotReady = Boolean(systemSettings?.telegram?.enabled && systemSettings?.telegram?.configured);
+  const telegramBotSettingsLoaded = Boolean(systemSettings?.telegram);
+  const upgradingHosts = useRef<Map<number, string | null>>(new Map());
+
+  const [showDialog, setShowDialog] = useState(false);
+  const [hostDialogTab, setHostDialogTab] = useState<HostDialogTab>("basic");
+  const [upgradeHost, setUpgradeHost] = useState<any>(null);
+  const [probeLatencyHost, setProbeLatencyHost] = useState<any>(null);
+  const [resetTrafficHost, setResetTrafficHost] = useState<any>(null);
+  const [resetTrafficHostId, setResetTrafficHostId] = useState<number | null>(null);
+  const [trafficCorrectionHost, setTrafficCorrectionHost] = useState<any>(null);
+  const [trafficCorrectionInput, setTrafficCorrectionInput] = useState("0");
+  const [trafficCorrectionCurrentBytes, setTrafficCorrectionCurrentBytes] = useState(0);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [hostCardModeTransitionKey, setHostCardModeTransitionKey] = useState(0);
+  const [tokenViewMode, setTokenViewMode] = useState<AgentTokenViewMode>(() => getStoredAgentTokenViewMode());
+  const [serviceViewMode, setServiceViewMode] = useState<HostProbeServiceViewMode>(() => getStoredHostProbeServiceViewMode());
+  const [hostGroupViewMode, setHostGroupViewMode] = useState<HostGroupViewMode>(() => getStoredHostGroupViewMode());
+  const hostManageTabItems = user?.role === "admin" ? HOST_MANAGE_TAB_ITEMS_ADMIN : HOST_MANAGE_TAB_ITEMS_USER;
+  const hostLiveRefreshInterval = visiblePollingInterval("live", pageVisible && activeManageTab === "hosts");
+  // Sorted, because the ids travel as a query input: keeping the visual order here
+  // would give every reorder a brand-new query key and refetch the whole summary.
+  const currentPageHostIds = useMemo(
+    () => (hostPageQuery.data?.items || [])
+      .map((host: any) => Number(host.id))
+      .filter((id: number) => Number.isInteger(id) && id > 0)
+      .sort((a: number, b: number) => a - b),
+    [hostPageQuery.data?.items],
+  );
+  const { data: hostStatusRows = [] } = trpc.hosts.statusSummary.useQuery({ hostIds: currentPageHostIds }, {
+    enabled: !isHostMapView && !needsFullHostList && !!hostLiveRefreshInterval && currentPageHostIds.length > 0,
+    refetchInterval: hostLiveRefreshInterval,
+    refetchOnWindowFocus: false,
+    placeholderData: (previousData: any) => previousData,
+  });
+  const hostStatusById = useMemo(() => {
+    const map = new Map<number, any>();
+    for (const row of hostStatusRows as any[]) {
+      const hostId = Number(row?.id);
+      if (Number.isInteger(hostId) && hostId > 0) map.set(hostId, row);
+    }
+    return map;
+  }, [hostStatusRows]);
+  // Drag-to-reorder used to wait for the server: the mutation invalidated the host
+  // page query and the list only moved once the refetch landed, so the dropped card
+  // snapped back to its old slot and the whole list visibly refreshed. Holding the
+  // dropped order until the refetched order arrives keeps the drop itself the only
+  // movement the user sees.
+  const [optimisticHostOrder, setOptimisticHostOrder] = useState<number[] | null>(null);
+  const displayHosts = useMemo<any[]>(() => {
+    const merged = baseDisplayHosts.map((host: any) => {
+      const status = hostStatusById.get(Number(host?.id));
+      return status ? { ...host, ...status } : host;
+    });
+    if (!optimisticHostOrder) return merged;
+    const rank = new Map(optimisticHostOrder.map((hostId, index) => [hostId, index]));
+    // Ignore an override that no longer describes exactly this page (paging or
+    // filtering moved on) so it can never hide or duplicate a row.
+    if (merged.length !== rank.size || merged.some((host: any) => !rank.has(Number(host.id)))) return merged;
+    return merged.sort((a: any, b: any) => Number(rank.get(Number(a.id))) - Number(rank.get(Number(b.id))));
+  }, [baseDisplayHosts, hostStatusById, optimisticHostOrder]);
+  const hasDisplayHosts = displayHosts.length > 0 || Number(hostPageQuery.data?.totalItems || 0) > 0;
+  const isInitialLoadingWithoutCache = isLoading && !hasDisplayHosts;
+  const [manageFilterStats, setManageFilterStats] = useState<Record<HostManageTab, HostManageFilterStats>>({
+    hosts: { filtered: 0, total: 0 },
+    groups: { filtered: 0, total: 0 },
+    tokens: { filtered: 0, total: 0 },
+    services: { filtered: 0, total: 0 },
+  });
+  const updateManageFilterStats = useCallback((tab: HostManageTab, stats: HostManageFilterStats) => {
+    setManageFilterStats((current) => {
+      const previous = current[tab];
+      if (previous.filtered === stats.filtered && previous.total === stats.total) return current;
+      return { ...current, [tab]: stats };
+    });
+  }, []);
+  const updateGroupFilterStats = useCallback(
+    (stats: HostManageFilterStats) => updateManageFilterStats("groups", stats),
+    [updateManageFilterStats],
+  );
+  const updateTokenFilterStats = useCallback(
+    (stats: HostManageFilterStats) => updateManageFilterStats("tokens", stats),
+    [updateManageFilterStats],
+  );
+  const updateServiceFilterStats = useCallback(
+    (stats: HostManageFilterStats) => updateManageFilterStats("services", stats),
+    [updateManageFilterStats],
+  );
+  const { data: hostGroups = [], isLoading: isHostGroupsLoading } = trpc.hosts.hostGroups.useQuery(undefined, {
+    enabled: user?.role === "admin",
+    staleTime: 30_000,
+  });
+  const enabledHostGroups = useMemo(
+    () => [...(hostGroups as HostGroupView[])]
+      .filter((group) => group.isEnabled !== false)
+      .sort(compareHostGroupDisplayOrder),
+    [hostGroups],
+  );
+  const selectedHostGroup = useMemo(
+    () => selectedHostGroupId === "all"
+      ? null
+      : enabledHostGroups.find((group) => Number(group.id) === Number(selectedHostGroupId)) || null,
+    [enabledHostGroups, selectedHostGroupId],
+  );
+  const groupFilteredDisplayHosts = useMemo(() => {
+    if (!usesFullHostDisplay) return displayHosts;
+    const hostsById = new Map(displayHosts.map((host: any) => [Number(host.id), host]));
+    if (selectedHostGroupId !== "all") {
+      return hostGroupHostIds(selectedHostGroup)
+        .map((hostId) => hostsById.get(hostId))
+        .filter(Boolean);
+    }
+    if (enabledHostGroups.length === 0) return displayHosts;
+    const orderedHosts: any[] = [];
+    const usedHostIds = new Set<number>();
+    for (const group of enabledHostGroups) {
+      for (const hostId of hostGroupHostIds(group)) {
+        if (usedHostIds.has(hostId)) continue;
+        const host = hostsById.get(hostId);
+        if (!host) continue;
+        usedHostIds.add(hostId);
+        orderedHosts.push(host);
+      }
+    }
+    for (const host of displayHosts) {
+      const hostId = Number(host.id);
+      if (usedHostIds.has(hostId)) continue;
+      orderedHosts.push(host);
+    }
+    return orderedHosts;
+  }, [displayHosts, enabledHostGroups, selectedHostGroup, selectedHostGroupId, usesFullHostDisplay]);
+  const normalizedHostSearchQuery = hostSearchQuery.trim().toLowerCase();
+  const isHostTextFiltered = normalizedHostSearchQuery.length > 0;
+  const filteredDisplayHosts = useMemo(() => {
+    if (!usesFullHostDisplay) return groupFilteredDisplayHosts;
+    if (!normalizedHostSearchQuery) return groupFilteredDisplayHosts;
+    return groupFilteredDisplayHosts.filter((host: any) => hostMatchesTextFilter(host, normalizedHostSearchQuery));
+  }, [groupFilteredDisplayHosts, normalizedHostSearchQuery, usesFullHostDisplay]);
+  const activeManageSearchQuery = manageSearchQueries[activeManageTab];
+  const activeManageFilterConfig = HOST_MANAGE_FILTER_CONFIG[activeManageTab];
+  const activeManageFilterStats = activeManageTab === "hosts"
+    ? {
+        filtered: Number(hostPageQuery.data?.totalItems || 0),
+        total: Number(hostPageQuery.data?.scopeTotalItems || 0),
+      }
+    : manageFilterStats[activeManageTab];
+  const hasFilteredDisplayHosts = filteredDisplayHosts.length > 0;
+  const isHostGroupFiltered = selectedHostGroupId !== "all";
+  const { data: hostSummary, isLoading: isHostSummaryLoading } = trpc.hosts.summary.useQuery({
+    search: hostSearchQuery,
+    groupId: selectedHostGroupId === "all" ? null : Number(selectedHostGroupId),
+  }, {
+    enabled: activeManageTab === "hosts",
+    refetchInterval: hostLiveRefreshInterval || pollingInterval("slow"),
+    placeholderData: (previousData) => previousData,
+  });
+  const effectiveHostSummary = hostSummary;
+  const isEffectiveHostSummaryLoading = isHostSummaryLoading;
+  const [tokenCreateSignal, setTokenCreateSignal] = useState(0);
+  const [serviceCreateSignal, setServiceCreateSignal] = useState(0);
+  const [checkingAgentUpdate, setCheckingAgentUpdate] = useState(false);
+  const lastAgentUpdateCheck = useRef(0);
+  const [form, setForm] = useState<HostFormData>(defaultFormData);
+  const watchMetricsMutation = trpc.hosts.watchMetrics.useMutation();
+
+  useEffect(() => {
+    if (!telegramBotSettingsLoaded || telegramBotReady) return;
+    setForm((current) => {
+      if (!current.telegramTrafficAlertEnabled && !current.telegramRenewalReminderEnabled) return current;
+      return {
+        ...current,
+        telegramTrafficAlertEnabled: false,
+        telegramRenewalReminderEnabled: false,
+      };
+    });
+  }, [telegramBotSettingsLoaded, telegramBotReady]);
+
+  const handleViewModeChange = (mode: HostViewMode) => {
+    setViewMode((current) => {
+      if ((current === "card" || current === "compact-card") && (mode === "card" || mode === "compact-card") && current !== mode) {
+        setHostCardModeTransitionKey((value) => value + 1);
+      }
+      return mode;
+    });
+    storeHostViewMode(mode);
+  };
+
+  const handleTokenViewModeChange = (mode: AgentTokenViewMode) => {
+    setTokenViewMode(mode);
+    storeAgentTokenViewMode(mode);
+  };
+
+  const handleServiceViewModeChange = (mode: HostProbeServiceViewMode) => {
+    setServiceViewMode(mode);
+    storeHostProbeServiceViewMode(mode);
+  };
+
+  const handleHostGroupViewModeChange = (mode: HostGroupViewMode) => {
+    setHostGroupViewMode(mode);
+    storeHostGroupViewMode(mode);
+  };
+
+  useEffect(() => {
+    if (user?.role !== "admin" && activeManageTab !== "hosts") setActiveManageTab("hosts");
+  }, [activeManageTab, setActiveManageTab, user?.role]);
+
+  useEffect(() => {
+    if (selectedHostGroupId === "all" || isHostGroupsLoading) return;
+    const stillVisible = enabledHostGroups.some((group) => Number(group.id) === Number(selectedHostGroupId));
+    if (!stillVisible) setSelectedHostGroupId("all");
+  }, [enabledHostGroups, isHostGroupsLoading, selectedHostGroupId]);
+
+  const createMutation = trpc.hosts.create.useMutation({
+    onSuccess: () => {
+      utils.hosts.list.invalidate();
+      utils.hosts.options.invalidate();
+      utils.hosts.listPage.invalidate();
+      utils.hosts.mapPoints.invalidate();
+      utils.hosts.summary.invalidate();
+      setShowDialog(false);
+      resetForm();
+      toast.success("主机添加成功");
+    },
+    onError: (err) => toast.error(err.message || "添加失败"),
+  });
+
+  const updateMutation = trpc.hosts.update.useMutation({
+    onSuccess: () => {
+      utils.hosts.list.invalidate();
+      utils.hosts.options.invalidate();
+      utils.hosts.listPage.invalidate();
+      utils.hosts.mapPoints.invalidate();
+      utils.hosts.summary.invalidate();
+      setShowDialog(false);
+      resetForm();
+      toast.success("主机更新成功");
+    },
+    onError: (err) => toast.error(err.message || "更新失败"),
+  });
+
+  const deleteMutation = trpc.hosts.delete.useMutation({
+    onSuccess: () => {
+      utils.hosts.list.invalidate();
+      utils.hosts.options.invalidate();
+      utils.hosts.listPage.invalidate();
+      utils.hosts.mapPoints.invalidate();
+      utils.hosts.summary.invalidate();
+      toast.success("主机已删除");
+    },
+    onError: (err) => toast.error(err.message || "删除失败"),
+  });
+
+  const resetHostTrafficMutation = trpc.hosts.resetTraffic.useMutation({
+    onSuccess: () => {
+      utils.hosts.trafficSummary.invalidate();
+      utils.hosts.summary.invalidate();
+      setResetTrafficHost(null);
+      toast.success("流量统计已重置");
+    },
+    onError: (err) => toast.error(err.message || "重置流量统计失败"),
+    onSettled: () => setResetTrafficHostId(null),
+  });
+
+  const correctHostTrafficMutation = trpc.hosts.correctTraffic.useMutation({
+    onSuccess: () => {
+      utils.hosts.traffic.invalidate();
+      utils.hosts.trafficSummary.invalidate();
+      utils.hosts.summary.invalidate();
+      setTrafficCorrectionHost(null);
+      toast.success("流量用量已修正");
+    },
+    onError: (err) => toast.error(err.message || "修正流量用量失败"),
+  });
+
+  const upgradeAgentMutation = trpc.hosts.requestAgentUpgrade.useMutation({
+    onSuccess: (data) => {
+      utils.hosts.list.invalidate();
+      utils.hosts.options.invalidate();
+      utils.hosts.listPage.invalidate();
+      utils.hosts.mapPoints.invalidate();
+      setUpgradeHost(null);
+      if ((data as any)?.skippedOffline) {
+        toast.info("主机离线，已跳过升级任务");
+        return;
+      }
+      if ((data as any)?.alreadyLatest) {
+        toast.info("该 Agent 已经是最新版本");
+        return;
+      }
+      toast.success(data?.pushed ? "Agent 升级任务已推送，正在升级" : "Agent 升级任务已记录，等待 Agent 回连后执行");
+    },
+    onError: (err) => toast.error(err.message || "下发升级任务失败"),
+  });
+  const upgradeAgentsMutation = trpc.hosts.requestAgentUpgradeMany.useMutation({
+    onSuccess: (data) => {
+      utils.hosts.list.invalidate();
+      utils.hosts.options.invalidate();
+      utils.hosts.listPage.invalidate();
+      utils.hosts.mapPoints.invalidate();
+      utils.hosts.upgradeCandidates.invalidate();
+      setBulkUpgradeDialogOpen(false);
+      const skippedLatest = (data as any)?.skippedLatest || 0;
+      const skippedOffline = (data as any)?.skippedOffline || 0;
+      const scheduled = (data as any)?.scheduled || 0;
+      toast.success(`已安排 ${data?.requested || 0} 台 Agent 滚动升级，首批推送 ${data?.pushed || 0} 台${scheduled ? `，等待后续批次 ${scheduled} 台` : ""}${skippedLatest ? `，跳过 ${skippedLatest} 台最新版本` : ""}${skippedOffline ? `，跳过 ${skippedOffline} 台离线主机` : ""}`);
+    },
+    onError: (err) => toast.error(err.message || "批量下发升级任务失败"),
+  });
+
+  useEffect(() => {
+    if (!displayHosts.length) return;
+    const tracked = upgradingHosts.current;
+    const currentIds = new Set<number>();
+    for (const host of displayHosts as any[]) {
+      currentIds.add(host.id);
+      if (host.agentUpgradeRequested) {
+        tracked.set(host.id, host.agentUpgradeTargetVersion || latestAgentVersion || null);
+        continue;
+      }
+      if (tracked.has(host.id)) {
+        tracked.delete(host.id);
+        toast.success(`${host.name} Agent 升级成功，当前版本 ${host.agentVersion ? `v${host.agentVersion}` : "已上报"}`);
+      }
+    }
+    for (const hostId of Array.from(tracked.keys())) {
+      if (!currentIds.has(hostId)) tracked.delete(hostId);
+    }
+  }, [displayHosts, latestAgentVersion]);
+
+  const resetForm = () => {
+    setForm(defaultFormData);
+    setEditingId(null);
+  };
+
+  const openCreate = () => {
+    if (activeManageTab === "services") {
+      setServiceCreateSignal((value) => value + 1);
+      return;
+    }
+    if (activeManageTab === "groups") {
+      setHostGroupCreateSignal((value) => value + 1);
+      return;
+    }
+    setTokenCreateSignal((value) => value + 1);
+  };
+
+  const openEdit = (host: any) => {
+    setForm({
+      name: host.name,
+      ip: host.ip,
+      hostType: host.hostType,
+      networkInterface: host.networkInterface || "",
+      entryIp: host.entryIp || "",
+      tunnelEntryIp: host.tunnelEntryIp || "",
+      portRangeStart: host.portRangeStart ?? null,
+      portRangeEnd: host.portRangeEnd ?? null,
+      portAllowlist: host.portAllowlist || "",
+      purchasedAt: formatDateTimeLocal(host.purchasedAt),
+      stoppedAt: formatDateTimeLocal(host.stoppedAt),
+      trafficLimitGb: formatTrafficLimitGbInput(host.trafficLimit),
+      trafficMeasureMode: normalizeHostTrafficMeasureMode(host.trafficMeasureMode),
+      billingCycleMonths: normalizeHostBillingCycleMonths(host.billingCycleMonths),
+      billingMonth: clampBillingMonth(host.billingMonth),
+      billingDay: clampBillingDay(host.billingDay),
+      expiryHandling: normalizeHostExpiryAction(host.expiryHandling),
+      telegramTrafficAlertEnabled: (!telegramBotSettingsLoaded || telegramBotReady) && !!host.telegramTrafficAlertEnabled,
+      trafficAlertThresholdPercent: clampTrafficAlertThresholdPercent(host.trafficAlertThresholdPercent),
+      telegramRenewalReminderEnabled: (!telegramBotSettingsLoaded || telegramBotReady) && !!host.telegramRenewalReminderEnabled,
+      renewalReminderDays: clampRenewalReminderDays(host.renewalReminderDays),
+      trafficAutoReset: !!host.trafficAutoReset,
+      trafficResetDay: clampMonthlyResetDay(host.trafficResetDay || 1),
+      ddnsEnabled: !!host.ddnsEnabled,
+      ddnsIpVersion: normalizeHostDdnsIpVersion(host.ddnsIpVersion, host.ddnsRecordType),
+      ddnsDomain: host.ddnsDomain || "",
+      blockHttp: !!host.blockHttp,
+      blockSocks: !!host.blockSocks,
+      blockTls: !!host.blockTls,
+    });
+    setEditingId(host.id);
+    setHostDialogTab("basic");
+    setShowDialog(true);
+  };
+
+  const openingMapHostIds = useRef(new Set<number>());
+  const openMapHostEdit = async (host: any) => {
+    const hostId = Number(host?.id);
+    if (!Number.isInteger(hostId) || hostId <= 0 || openingMapHostIds.current.has(hostId)) return;
+    openingMapHostIds.current.add(hostId);
+    try {
+      const fullHost = await utils.hosts.getById.fetch({ id: hostId });
+      if (!fullHost) {
+        toast.error("主机不存在或当前账号无权访问");
+        return;
+      }
+      openEdit(fullHost);
+    } catch (err: any) {
+      toast.error(err?.message || "获取主机详情失败");
+    } finally {
+      openingMapHostIds.current.delete(hostId);
+    }
+  };
+
+  const handleSubmit = () => {
+    const name = (form.name || "").trim();
+    const entry = (form.entryIp || "").trim();
+    const tunnelEntry = (form.tunnelEntryIp || "").trim();
+    if (!name) { toast.error("请输入主机名称"); return; }
+    if (name.length > 128) { toast.error("主机名称不能超过 128 个字符"); return; }
+    if (entry.length > 253) { toast.error("入口 IP / 域名不能超过 253 个字符"); return; }
+    if (tunnelEntry.length > 128) { toast.error("内网地址不能超过 128 个字符"); return; }
+
+    const ps = form.portRangeStart;
+    const pe = form.portRangeEnd;
+    if ((ps != null && pe == null) || (ps == null && pe != null)) {
+      toast.error("请同时填写端口区间的起始和结束值，或同时留空"); return;
+    }
+    if (ps != null && pe != null) {
+      if (ps < 1 || ps > 65535 || pe < 1 || pe > 65535) { toast.error("端口区间必须在 1-65535 之间"); return; }
+      if (ps > pe) { toast.error("端口区间起始值不能大于结束值"); return; }
+    }
+    const customPorts = parseCustomPortsInput(form.portAllowlist);
+    if (customPorts.invalid.length > 0) {
+      toast.error("自定义端口只能填写 1-65535 的整数，多个端口请使用英文逗号分隔");
+      return;
+    }
+
+    const ni = (form.networkInterface || "").trim();
+    const purchasedAt = parseDateTimeLocal(form.purchasedAt);
+    const stoppedAt = parseDateTimeLocal(form.stoppedAt);
+    if (form.purchasedAt && !purchasedAt) { toast.error("机器购买时间格式不正确"); return; }
+    if (form.stoppedAt && !stoppedAt) { toast.error("机器停止时间格式不正确"); return; }
+    if (purchasedAt && stoppedAt && stoppedAt.getTime() <= purchasedAt.getTime()) {
+      toast.error("机器停止时间必须晚于购买时间");
+      return;
+    }
+    const trafficLimitGb = Number(String(form.trafficLimitGb || "").trim() || 0);
+    if (user?.role === "admin" && (!Number.isFinite(trafficLimitGb) || trafficLimitGb < 0)) {
+      toast.error("套餐流量不能小于 0");
+      return;
+    }
+    if (user?.role === "admin" && form.ddnsEnabled) {
+      if (!ddnsProviderEnabled) {
+        toast.error("请先在系统设置内启用 DDNS 服务商");
+        return;
+      }
+      if (!form.ddnsDomain.trim()) {
+        toast.error("开启 DDNS 服务需要填写域名");
+        return;
+      }
+    }
+    const trafficLimitBytes = Math.round(trafficLimitGb * HOST_TRAFFIC_GB_BYTES);
+    const trafficAlertThresholdPercent = clampTrafficAlertThresholdPercent(form.trafficAlertThresholdPercent);
+    const renewalReminderDays = clampRenewalReminderDays(form.renewalReminderDays);
+    const canSaveTelegramReminder = telegramBotSettingsLoaded ? telegramBotReady : true;
+    const trafficConfigPayload = user?.role === "admin"
+      ? {
+          purchasedAt: purchasedAt ? purchasedAt.toISOString() : null,
+          stoppedAt: stoppedAt ? stoppedAt.toISOString() : null,
+          trafficLimit: trafficLimitBytes,
+          trafficMeasureMode: form.trafficMeasureMode,
+          billingCycleMonths: normalizeHostBillingCycleMonths(form.billingCycleMonths),
+          billingMonth: clampBillingMonth(form.billingMonth),
+          billingDay: clampBillingDay(form.billingDay),
+          expiryHandling: normalizeHostExpiryAction(form.expiryHandling),
+          telegramTrafficAlertEnabled: canSaveTelegramReminder && form.telegramTrafficAlertEnabled,
+          trafficAlertThresholdPercent,
+          telegramRenewalReminderEnabled: canSaveTelegramReminder && form.telegramRenewalReminderEnabled,
+          renewalReminderDays,
+          trafficAutoReset: form.trafficAutoReset,
+          trafficResetDay: clampMonthlyResetDay(form.trafficResetDay),
+          ddnsEnabled: form.ddnsEnabled,
+          ddnsDomain: form.ddnsDomain.trim(),
+          ddnsIpVersion: form.ddnsIpVersion,
+          ddnsRecordType: (form.ddnsIpVersion === "ipv6" ? "AAAA" : "A") as "A" | "AAAA",
+        }
+      : {};
+    const protocolPolicyPayload = user?.role === "admin"
+      ? { blockHttp: form.blockHttp, blockSocks: form.blockSocks, blockTls: form.blockTls }
+      : {};
+
+    if (editingId) {
+      updateMutation.mutate({
+        id: editingId,
+        name,
+        hostType: form.hostType,
+        networkInterface: ni || null,
+        entryIp: entry || null,
+        tunnelEntryIp: tunnelEntry || null,
+        portRangeStart: ps ?? null,
+        portRangeEnd: pe ?? null,
+        portAllowlist: customPorts.normalized || null,
+        ...trafficConfigPayload,
+        ...protocolPolicyPayload,
+      });
+    } else {
+      const ip = (form.ip || entry || "unknown").trim();
+      createMutation.mutate({
+        name,
+        ip,
+        hostType: form.hostType,
+        networkInterface: ni || undefined,
+        entryIp: entry || undefined,
+        tunnelEntryIp: tunnelEntry || undefined,
+        portRangeStart: ps ?? null,
+        portRangeEnd: pe ?? null,
+        portAllowlist: customPorts.normalized || null,
+        ...trafficConfigPayload,
+        ...protocolPolicyPayload,
+      });
+    }
+  };
+  const isPending = createMutation.isPending || updateMutation.isPending;
+  const customPortInputState = useMemo(() => parseCustomPortsInput(form.portAllowlist), [form.portAllowlist]);
+  const onlineCount = Number(hostPageQuery.data?.onlineItems ?? filteredDisplayHosts.filter((host: any) => !!host.isOnline).length);
+  const displayedHostTotal = Number(hostPageQuery.data?.totalItems ?? (isHostMapView ? mapHostTotal : filteredDisplayHosts.length));
+  const updateCount = Number(hostPageQuery.data?.outdatedItems || 0);
+  const onlineOutdatedCount = Number(hostPageQuery.data?.onlineOutdatedItems || 0);
+  const bulkUpgradeCandidateQuery = trpc.hosts.upgradeCandidates.useQuery({
+    search: hostSearchQuery,
+    groupId: selectedHostGroupId === "all" ? null : Number(selectedHostGroupId),
+  }, {
+    enabled: bulkUpgradeDialogOpen,
+    staleTime: 5_000,
+    refetchOnWindowFocus: false,
+  });
+  const bulkUpgradeableHosts = useMemo(
+    () => (bulkUpgradeCandidateQuery.data?.ids || []).map((id: number) => ({ id })),
+    [bulkUpgradeCandidateQuery.data?.ids],
+  );
+  const offlineUpgradeableHostCount = Number(
+    bulkUpgradeCandidateQuery.data?.offlineItems ?? hostPageQuery.data?.offlineUpgradeableItems ?? 0,
+  );
+  const hostPagination = useServerPagination<any>(usesFullHostDisplay ? [] : filteredDisplayHosts, Number(hostPageQuery.data?.totalItems || 0), hostPageRequest, {
+    pageSize: 12,
+    isReady: !hostPageQuery.isLoading && !!hostPageQuery.data,
+  });
+  const pagedHosts = hostPagination.items;
+  const xrayVisibleHostIds = useMemo(
+    () => pagedHosts
+      .map((host: any) => Number(host.id))
+      .filter((id: number) => Number.isSafeInteger(id) && id > 0)
+      .slice(0, 100)
+      .sort((left: number, right: number) => left - right),
+    [pagedHosts],
+  );
+  const { data: xrayRuntimePage } = trpc.xray.runtimes.list.useQuery({
+    page: 1,
+    pageSize: 100,
+    hostIds: xrayVisibleHostIds,
+  }, {
+    enabled: xrayPublicInfo?.xrayEnabled === true && xrayVisibleHostIds.length > 0,
+    staleTime: 25_000,
+    refetchOnWindowFocus: false,
+    placeholderData: (previousData) => previousData,
+  });
+  const xrayRuntimeByHostId = useMemo(
+    () => new Map((xrayRuntimePage?.items ?? []).map((runtime) => [runtime.hostId, runtime])),
+    [xrayRuntimePage?.items],
+  );
+  const pagedHostIds = useMemo(
+    () => pagedHosts.map((host: any) => Number(host.id)).filter((id) => Number.isInteger(id) && id > 0),
+    [pagedHosts]
+  );
+  // The live metric queries are keyed by their input, so handing them the visual
+  // order would rebuild the query on every reorder and blank out traffic, network
+  // and resource cells until the new request resolved.
+  const pagedMetricHostIds = useMemo(() => [...pagedHostIds].sort((a, b) => a - b), [pagedHostIds]);
+  const pagedHostIdKey = useMemo(() => pagedMetricHostIds.join(","), [pagedMetricHostIds]);
+  const hostOrderRequestRef = useRef(0);
+  const beginOptimisticHostOrder = useCallback((hostIds: number[]) => {
+    hostOrderRequestRef.current += 1;
+    setOptimisticHostOrder(hostIds);
+    return hostOrderRequestRef.current;
+  }, []);
+  const releaseOptimisticHostOrder = useCallback((requestId: number) => {
+    // A newer drop already owns the override; that one must stay on screen.
+    if (hostOrderRequestRef.current !== requestId) return;
+    setOptimisticHostOrder(null);
+  }, []);
+  const refreshHostOrderQueries = useCallback((includeHostGroups: boolean) => Promise.all([
+    utils.hosts.list.invalidate(),
+    utils.hosts.options.invalidate(),
+    utils.hosts.listPage.invalidate(),
+    utils.hosts.mapPoints.invalidate(),
+    ...(includeHostGroups ? [utils.hosts.hostGroups.invalidate()] : []),
+  ]), [utils]);
+  // Resync in the background instead of from `onSettled`: a mutation option is
+  // awaited before the pending flag clears, which would keep sorting locked for the
+  // whole refetch. The optimistic order is dropped once that refetch has landed, so
+  // the list never rewinds to the pre-drop order in between.
+  const resyncHostOrder = useCallback((requestId: number, includeHostGroups: boolean) => {
+    void refreshHostOrderQueries(includeHostGroups)
+      .catch(() => {})
+      .finally(() => releaseOptimisticHostOrder(requestId));
+  }, [refreshHostOrderQueries, releaseOptimisticHostOrder]);
+  const reorderHostsMutation = trpc.hosts.reorder.useMutation({
+    onSuccess: () => toast.success("主机顺序已更新"),
+    onError: (err) => toast.error(err.message || "更新主机顺序失败"),
+  });
+  const reorderHostGroupMembersMutation = trpc.hosts.reorderHostGroupMembers.useMutation({
+    onSuccess: () => toast.success("分组主机顺序已更新"),
+    onError: (err) => toast.error(err.message || "更新分组主机顺序失败"),
+  });
+  const hostReorderPending = reorderHostsMutation.isPending || reorderHostGroupMembersMutation.isPending;
+  const hostSortGroupId = selectedHostGroupId === "all" ? null : Number(selectedHostGroupId);
+  const hostSortMode: "hosts" | "group" | null = selectedHostGroupId !== "all" && selectedHostGroup
+    ? "group"
+    : selectedHostGroupId === "all" && enabledHostGroups.length === 0 && !(user?.role === "admin" && isHostGroupsLoading)
+      ? "hosts"
+      : null;
+  // Deliberately independent of the in-flight mutation: gating this on `isPending`
+  // swapped the sortable grid for the animated one for the length of the request,
+  // which remounted every card and read as a full page refresh after each drop.
+  const hostSortingEnabled = !!hostSortMode
+    && !isHostTextFiltered
+    && viewMode !== "map"
+    && viewMode !== "flat-map"
+    && filteredDisplayHosts.length > 1;
+  const hostSortable = useSortableReorder({
+    items: filteredDisplayHosts,
+    getId: (host: any) => Number(host.id),
+    // One reorder at a time, otherwise two overlapping writes can land out of order.
+    disabled: !hostSortingEnabled || hostPageQuery.isPlaceholderData || hostReorderPending,
+    onReorder: (nextHosts) => {
+      const groupSortId = hostSortMode === "group" ? hostSortGroupId : null;
+      if (!groupSortId && hostSortMode !== "hosts") return;
+      const hostIds = nextHosts.map((host: any) => Number(host.id)).filter((id) => Number.isInteger(id) && id > 0);
+      const startIndex = (hostPagination.currentPage - 1) * hostPagination.pageSize;
+      const requestId = beginOptimisticHostOrder(hostIds);
+      const onError = () => releaseOptimisticHostOrder(requestId);
+      const onSettled = () => resyncHostOrder(requestId, !!groupSortId);
+      if (groupSortId) {
+        reorderHostGroupMembersMutation.mutate({ groupId: groupSortId, hostIds, startIndex }, { onError, onSettled });
+        return;
+      }
+      reorderHostsMutation.mutate({ ids: hostIds, startIndex }, { onError, onSettled });
+    },
+  });
+  const hostCardListMotionKey = useMemo(
+    () => [
+      viewMode,
+      hostCardModeTransitionKey,
+      normalizedHostSearchQuery || "search-all",
+      selectedHostGroupId === "all" ? "all" : `group-${selectedHostGroupId}`,
+      hostPagination.currentPage,
+    ].join(":"),
+    [hostCardModeTransitionKey, hostPagination.currentPage, normalizedHostSearchQuery, selectedHostGroupId, viewMode],
+  );
+  useEffect(() => {
+    if (!hostLiveRefreshInterval || !pagedMetricHostIds.length) return;
+    const hostIds = pagedMetricHostIds;
+    if (hostIds.length === 0) return;
+    watchMetricsMutation.mutate({ hostIds });
+    const timer = window.setInterval(() => {
+      watchMetricsMutation.mutate({ hostIds });
+    }, hostLiveRefreshInterval);
+    return () => window.clearInterval(timer);
+  }, [hostLiveRefreshInterval, pagedHostIdKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const { data: probeServices = [] } = trpc.hosts.probeServices.useQuery(undefined, { refetchInterval: pollingInterval("slow") });
+  const { data: hostTrafficRows = [] } = trpc.hosts.trafficSummary.useQuery(
+    { hostIds: pagedMetricHostIds },
+    { enabled: !!hostLiveRefreshInterval && pagedMetricHostIds.length > 0, refetchInterval: hostLiveRefreshInterval }
+  );
+  const hostTrafficById = useMemo(() => {
+    const map = new Map<number, any>();
+    for (const row of hostTrafficRows as any[]) map.set(Number(row.hostId), row);
+    return map;
+  }, [hostTrafficRows]);
+  const { data: hostLatestMetricRows = [] } = trpc.hosts.latestMetricsSummary.useQuery(
+    { hostIds: pagedMetricHostIds },
+    { enabled: !!hostLiveRefreshInterval && pagedMetricHostIds.length > 0, refetchInterval: hostLiveRefreshInterval }
+  );
+  const hostLatestMetricById = useMemo(() => {
+    const map = new Map<number, any>();
+    for (const row of hostLatestMetricRows as any[]) map.set(Number(row.hostId), row);
+    return map;
+  }, [hostLatestMetricRows]);
+  const hostLatestMetricSeriesById = useMemo(() => {
+    const map = new Map<number, any[]>();
+    for (const row of hostLatestMetricRows as any[]) map.set(Number(row.hostId), [row]);
+    return map;
+  }, [hostLatestMetricRows]);
+  const renderHostCard = (host: any, options: { dragHandle?: any; sortableClassName?: string; compact?: boolean } = {}) => (
+    <HostCard
+      key={host.id}
+      host={host}
+      onEdit={openEdit}
+      onDelete={(id) => deleteMutation.mutate({ id })}
+      onUpgrade={requestAgentUpgrade}
+      canUpgrade={user?.role === "admin"}
+      onResetTraffic={user?.role === "admin" ? requestResetHostTraffic : undefined}
+      onCorrectTraffic={user?.role === "admin" ? requestCorrectHostTraffic : undefined}
+      onViewProbeLatency={setProbeLatencyHost}
+      resetTrafficPending={resetTrafficHostId === host.id && resetHostTrafficMutation.isPending}
+      traffic={hostTrafficById.get(host.id)}
+      metrics={hostLatestMetricSeriesById.get(host.id) ?? null}
+      latestAgentVersion={latestAgentVersion}
+      refreshInterval={hostLiveRefreshInterval}
+      compact={options.compact ?? viewMode === "compact-card"}
+      dragHandle={options.dragHandle}
+      sortableClassName={options.sortableClassName}
+      xrayRuntime={xrayRuntimeByHostId.get(Number(host.id)) ?? null}
+    />
+  );
+  const requestResetHostTraffic = (host: any) => {
+    const hostId = Number(host?.id);
+    if (!Number.isInteger(hostId) || hostId <= 0) return;
+    setResetTrafficHost(host);
+  };
+  const confirmResetHostTraffic = () => {
+    const hostId = Number(resetTrafficHost?.id);
+    if (!Number.isInteger(hostId) || hostId <= 0) return;
+    setResetTrafficHostId(hostId);
+    resetHostTrafficMutation.mutate({ hostId });
+  };
+  const requestCorrectHostTraffic = (host: any) => {
+    const hostId = Number(host?.id);
+    if (!Number.isInteger(hostId) || hostId <= 0) return;
+    const currentBytes = hostTrafficUsedBytes(host, hostTrafficById.get(hostId));
+    setTrafficCorrectionHost(host);
+    setTrafficCorrectionCurrentBytes(currentBytes);
+    setTrafficCorrectionInput(formatTrafficCorrectionGbInput(currentBytes));
+  };
+  const confirmCorrectHostTraffic = () => {
+    const hostId = Number(trafficCorrectionHost?.id);
+    if (!Number.isInteger(hostId) || hostId <= 0) return;
+    const amountGb = Number(trafficCorrectionInput.trim());
+    if (!Number.isFinite(amountGb) || amountGb < 0) {
+      toast.error("请输入不小于 0 的流量用量");
+      return;
+    }
+    const usedBytes = Math.round(amountGb * HOST_TRAFFIC_GB_BYTES);
+    if (!Number.isSafeInteger(usedBytes) || usedBytes < 0) {
+      toast.error("流量用量超出可保存范围");
+      return;
+    }
+    correctHostTrafficMutation.mutate({ hostId, usedBytes });
+  };
+  const isAgentLatest = (host: any) => {
+    if (!latestAgentVersion || !host?.agentVersion) return false;
+    return compareVersions(host.agentVersion, latestAgentVersion) >= 0;
+  };
+  const requestAgentUpgrade = (host: any) => {
+    if (!host?.isOnline) {
+      toast.info("主机离线，无法下发升级任务");
+      return;
+    }
+    if (isAgentLatest(host)) {
+      toast.info("该 Agent 已经是最新版本");
+      return;
+    }
+    setUpgradeHost(host);
+  };
+  const confirmAgentUpgrade = () => {
+    if (!upgradeHost) return;
+    if (isAgentLatest(upgradeHost)) {
+      toast.info("该 Agent 已经是最新版本");
+      setUpgradeHost(null);
+      return;
+    }
+    upgradeAgentMutation.mutate({ hostId: upgradeHost.id, targetVersion: latestAgentVersion || null });
+  };
+  const requestAllAgentUpgrades = () => {
+    if (onlineOutdatedCount === 0) {
+      toast.info("暂无需要升级的 Agent");
+      return;
+    }
+    setBulkUpgradeDialogOpen(true);
+  };
+  const confirmAllAgentUpgrades = () => {
+    if (bulkUpgradeableHosts.length === 0) {
+      toast.info("暂无需要升级的 Agent");
+      setBulkUpgradeDialogOpen(false);
+      return;
+    }
+    upgradeAgentsMutation.mutate({
+      hostIds: bulkUpgradeableHosts.map((host: any) => Number(host.id)),
+      targetVersion: latestAgentVersion || null,
+    });
+  };
+
+  const handleCheckAgentUpdate = async () => {
+    const now = Date.now();
+    const cooldownMs = 30 * 1000;
+    const waitMs = cooldownMs - (now - lastAgentUpdateCheck.current);
+    if (waitMs > 0) {
+      toast.info(`请 ${Math.ceil(waitMs / 1000)} 秒后重试`);
+      return;
+    }
+    try {
+      setCheckingAgentUpdate(true);
+      lastAgentUpdateCheck.current = now;
+      await utils.system.getSettings.invalidate();
+      const latestHosts = await utils.hosts.list.fetch();
+      const latestSettings = await utils.system.getSettings.fetch();
+      const agentVersion = latestSettings?.agentVersion || "";
+      const count = latestHosts.filter((host: any) => isAgentVersionBehind(host.agentVersion, agentVersion)).length;
+      toast.success(count > 0 ? `发现 ${count} 台 Agent 有新版本` : "Agent 版本检查完成，暂无新版本");
+    } catch (err: any) {
+      toast.error(err?.message || "检查 Agent 更新失败");
+    } finally {
+      setCheckingAgentUpdate(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-bold tracking-tight">主机管理</h1>
+          <p className="text-muted-foreground mt-1 text-sm">
+            管理 Agent 主机和运行状态
+          </p>
+        </div>
+        <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center sm:justify-end">
+          <Badge variant="outline" className="justify-center gap-1.5 px-3 py-1.5 text-xs">
+            <Server className="h-3 w-3 text-chart-2" />
+            <AnimatedStatValue
+              value={`${onlineCount} / ${displayedHostTotal} 在线`}
+              loading={isInitialLoadingWithoutCache}
+              cacheKey="hosts.header.online"
+              fallbackValue="0 / 0 在线"
+            />
+          </Badge>
+          {/* 布局切换按钮 */}
+          {updateCount > 0 && (
+            <Badge variant="outline" className="justify-center gap-1.5 border-amber-500/30 px-3 py-1.5 text-xs text-amber-500">
+              <AlertTriangle className="h-3 w-3" />
+              {updateCount} 台发现新版本
+            </Badge>
+          )}
+          {activeManageTab === "hosts" && (
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                className="col-span-2 w-full gap-2 sm:col-span-1 sm:w-auto"
+                disabled={checkingAgentUpdate}
+                onClick={handleCheckAgentUpdate}
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${checkingAgentUpdate ? "animate-spin" : ""}`} />
+                检查 Agent 更新
+              </Button>
+              {user?.role === "admin" && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="col-span-2 w-full gap-2 sm:col-span-1 sm:w-auto"
+                  disabled={onlineOutdatedCount === 0 || upgradeAgentsMutation.isPending}
+                  onClick={requestAllAgentUpgrades}
+                >
+                  {upgradeAgentsMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+                  一键升级 Agent
+                </Button>
+              )}
+              <div className="hidden items-center overflow-hidden rounded-md border border-border/40 sm:flex">
+                <Button
+                  variant={viewMode === "compact-card" ? "secondary" : "ghost"}
+                  size="icon"
+                  className="h-8 w-8 rounded-none"
+                  title="精简卡片"
+                  onClick={() => handleViewModeChange("compact-card")}
+                >
+                  <Rows3 className="h-4 w-4" />
+                </Button>
+                <Button
+                  variant={viewMode === "card" ? "secondary" : "ghost"}
+                  size="icon"
+                  className="h-8 w-8 rounded-none"
+                  title="标准卡片"
+                  onClick={() => handleViewModeChange("card")}
+                >
+                  <LayoutGrid className="h-4 w-4" />
+                </Button>
+                <Button
+                  variant={viewMode === "table" ? "secondary" : "ghost"}
+                  size="icon"
+                  className="h-8 w-8 rounded-none"
+                  title="列表视图"
+                  onClick={() => handleViewModeChange("table")}
+                >
+                  <List className="h-4 w-4" />
+                </Button>
+                <Button
+                  variant={viewMode === "map" ? "secondary" : "ghost"}
+                  size="icon"
+                  className="hidden h-8 w-8 rounded-none md:inline-flex"
+                  title="3D 地球视图"
+                  onClick={() => handleViewModeChange("map")}
+                >
+                  <Globe className="h-4 w-4" />
+                </Button>
+                <Button
+                  variant={viewMode === "flat-map" ? "secondary" : "ghost"}
+                  size="icon"
+                  className="hidden h-8 w-8 rounded-none md:inline-flex"
+                  title="平面地图视图"
+                  onClick={() => handleViewModeChange("flat-map")}
+                >
+                  <MapPinned className="h-4 w-4" />
+                </Button>
+              </div>
+            </>
+          )}
+          {activeManageTab === "tokens" && user?.role === "admin" && (
+            <div className="hidden items-center overflow-hidden rounded-md border border-border/40 sm:flex">
+              <Button
+                variant={tokenViewMode === "card" ? "secondary" : "ghost"}
+                size="icon"
+                className="h-8 w-8 rounded-none"
+                title="卡片视图"
+                onClick={() => handleTokenViewModeChange("card")}
+              >
+                <LayoutGrid className="h-4 w-4" />
+              </Button>
+              <Button
+                variant={tokenViewMode === "table" ? "secondary" : "ghost"}
+                size="icon"
+                className="h-8 w-8 rounded-none"
+                title="列表视图"
+                onClick={() => handleTokenViewModeChange("table")}
+              >
+                <List className="h-4 w-4" />
+              </Button>
+            </div>
+          )}
+          {activeManageTab === "groups" && user?.role === "admin" && (
+            <div className="hidden items-center overflow-hidden rounded-md border border-border/40 sm:flex">
+              <Button
+                variant={hostGroupViewMode === "card" ? "secondary" : "ghost"}
+                size="icon"
+                className="h-8 w-8 rounded-none"
+                title="卡片视图"
+                onClick={() => handleHostGroupViewModeChange("card")}
+              >
+                <LayoutGrid className="h-4 w-4" />
+              </Button>
+              <Button
+                variant={hostGroupViewMode === "table" ? "secondary" : "ghost"}
+                size="icon"
+                className="h-8 w-8 rounded-none"
+                title="列表视图"
+                onClick={() => handleHostGroupViewModeChange("table")}
+              >
+                <List className="h-4 w-4" />
+              </Button>
+            </div>
+          )}
+          {activeManageTab === "services" && user?.role === "admin" && (
+            <div className="hidden items-center overflow-hidden rounded-md border border-border/40 sm:flex">
+              <Button
+                variant={serviceViewMode === "card" ? "secondary" : "ghost"}
+                size="icon"
+                className="h-8 w-8 rounded-none"
+                title="卡片视图"
+                onClick={() => handleServiceViewModeChange("card")}
+              >
+                <LayoutGrid className="h-4 w-4" />
+              </Button>
+              <Button
+                variant={serviceViewMode === "table" ? "secondary" : "ghost"}
+                size="icon"
+                className="h-8 w-8 rounded-none"
+                title="列表视图"
+                onClick={() => handleServiceViewModeChange("table")}
+              >
+                <List className="h-4 w-4" />
+              </Button>
+            </div>
+          )}
+          {user?.role === "admin" && (
+            <Button onClick={openCreate} className="col-span-2 w-full gap-2 sm:col-span-1 sm:w-auto">
+              <Plus className="h-4 w-4" />
+              {activeManageTab === "services" ? "添加服务" : activeManageTab === "groups" ? "添加分组" : "添加主机"}
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div className="grid gap-2 sm:flex sm:flex-wrap sm:items-center sm:gap-3">
+        <div className="flex items-center gap-2">
+          <Filter className="h-4 w-4 text-muted-foreground" />
+          <span className="text-sm text-muted-foreground">筛选:</span>
+        </div>
+        <div className="relative w-full sm:w-[260px] lg:w-[320px]">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={activeManageSearchQuery}
+            onChange={(event) => {
+              const value = event.target.value;
+              setManageSearchQueries((current) => ({ ...current, [activeManageTab]: value }));
+            }}
+            placeholder={activeManageFilterConfig.placeholder}
+            className="h-8 w-full pl-8 pr-8 text-xs"
+          />
+          {activeManageSearchQuery ? (
+            <button
+              type="button"
+              aria-label="清空搜索"
+              className="absolute right-2 top-1/2 inline-flex h-4 w-4 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              onClick={() => setManageSearchQueries((current) => ({ ...current, [activeManageTab]: "" }))}
+            >
+              <XCircle className="h-3.5 w-3.5" />
+            </button>
+          ) : null}
+        </div>
+        <span className="text-xs tabular-nums text-muted-foreground">
+          {activeManageFilterStats.filtered} / {activeManageFilterStats.total} {activeManageFilterConfig.unit}
+        </span>
+      </div>
+
+      <Tabs
+        value={activeManageTab}
+        onValueChange={(value) => setActiveManageTab(value as HostManageTab)}
+        className="space-y-4"
+      >
+        <SlidingTabsList items={hostManageTabItems} activeValue={activeManageTab} ariaLabel="主机管理" minItemWidthRem={7.5} />
+
+        <TabsContent value="hosts" className="space-y-4">
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          <HostSummaryCard
+            title="在线状态"
+            value={`${effectiveHostSummary?.onlineHosts ?? onlineCount} / ${effectiveHostSummary?.totalHosts ?? filteredDisplayHosts.length}`}
+            subtitle={effectiveHostSummary
+              ? (() => {
+                const total = effectiveHostSummary?.totalHosts ?? filteredDisplayHosts.length;
+                const online = effectiveHostSummary?.onlineHosts ?? onlineCount;
+                const offlineCount = Math.max(0, total - online);
+                return offlineCount > 0 ? `离线 ${offlineCount} 台` : "全部在线";
+              })()
+              : "暂无统计"}
+            icon={Server}
+            leadingIcon={CircleCheck}
+            tone="bg-gradient-to-br from-emerald-500 to-emerald-600"
+            loading={isEffectiveHostSummaryLoading && !effectiveHostSummary}
+            cacheKey="hosts.summary.online"
+          />
+          <HostTrafficSummaryCard
+            title="当前瞬时流量"
+            inValue={formatBytesPerSecond(effectiveHostSummary?.currentTrafficIn)}
+            outValue={formatBytesPerSecond(effectiveHostSummary?.currentTrafficOut)}
+            icon={ActivitySquare}
+            tone="bg-gradient-to-br from-chart-1/10 to-transparent"
+            iconTone="bg-chart-1/10 text-chart-1"
+            loading={isEffectiveHostSummaryLoading && !effectiveHostSummary}
+            cacheKey="hosts.summary.currentTraffic"
+            animated={false}
+          />
+          <HostTrafficSummaryCard
+            title="累计流量"
+            inValue={formatBytes(effectiveHostSummary?.totalTrafficIn)}
+            outValue={formatBytes(effectiveHostSummary?.totalTrafficOut)}
+            icon={ArrowRightLeft}
+            tone="bg-gradient-to-br from-chart-4/10 to-transparent"
+            iconTone="bg-chart-4/10 text-chart-4"
+            loading={isEffectiveHostSummaryLoading && !effectiveHostSummary}
+            cacheKey="hosts.summary.totalTraffic"
+          />
+        </div>
+        {user?.role === "admin" && (
+          <HostGroupFilterBar
+            groups={hostGroups as HostGroupView[]}
+            totalHosts={Number(hostPageQuery.data?.scopeTotalItems || 0)}
+            groupCounts={(hostPageQuery.data?.groupCounts || {}) as Record<number, number>}
+            selectedGroupId={selectedHostGroupId}
+            onSelectGroup={setSelectedHostGroupId}
+          />
+        )}
+      {/* Content */}
+      {isInitialLoadingWithoutCache ? (
+        <DataSectionLoading label="正在加载主机数据" minHeight="min-h-[260px]" />
+      ) : isError ? (
+        <Card className="border-border/40 bg-card/60 backdrop-blur-md">
+          <CardContent className="p-0">
+            <div className="flex flex-col items-center justify-center px-4 py-20 text-center text-muted-foreground">
+              <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-destructive/10 text-destructive">
+                <AlertTriangle className="h-8 w-8" />
+              </div>
+              <p className="text-lg font-medium text-foreground">主机加载失败</p>
+              <p className="mt-2 max-w-xl break-words text-sm text-muted-foreground">
+                {error?.message || "无法获取主机列表，请稍后重试"}
+              </p>
+              <Button variant="outline" className="mt-5 gap-2" onClick={() => refetch()}>
+                <RefreshCw className="h-4 w-4" />
+                重新加载
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      ) : hasFilteredDisplayHosts ? (
+        <>
+        {viewMode === "map" ? (
+          <>
+            <HostWorldMap
+              hosts={filteredDisplayHosts}
+              onEdit={openMapHostEdit}
+              totalHosts={mapHostTotal}
+              isLoadingMore={hostMapQuery.isFetchingNextPage}
+            />
+            <AutoAnimateContainer className="grid grid-cols-1 gap-4 md:hidden">
+              {pagedHosts.map((host) => renderHostCard(host, { compact: false }))}
+            </AutoAnimateContainer>
+            <div className="md:hidden">
+              <PersistentPagination pagination={hostPagination} itemName="台主机" />
+            </div>
+          </>
+        ) : viewMode === "flat-map" ? (
+          <>
+            <Suspense
+              fallback={
+                <div className="hidden min-h-[720px] items-center justify-center rounded-md border border-border/40 bg-[#020617] text-sm text-white/70 md:flex">
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  正在加载平面地图
+                </div>
+              }
+            >
+              <HostFlatMap hosts={filteredDisplayHosts} onEdit={openMapHostEdit} />
+            </Suspense>
+            <AutoAnimateContainer className="grid grid-cols-1 gap-4 md:hidden">
+              {pagedHosts.map((host) => renderHostCard(host, { compact: false }))}
+            </AutoAnimateContainer>
+            <div className="md:hidden">
+              <PersistentPagination pagination={hostPagination} itemName="台主机" />
+            </div>
+          </>
+        ) : viewMode === "card" || viewMode === "compact-card" ? (
+          /* ========== 卡片式布局 ========== */
+          hostSortingEnabled ? (
+            <SortableReorderContext sortable={hostSortable} ids={pagedHostIds} strategy="rect">
+              <div
+                key={`host-card-mode-sortable-${hostCardListMotionKey}`}
+                className={viewMode === "compact-card" ? "standard-card-grid-compact gap-3" : "standard-card-grid gap-4"}
+              >
+                {pagedHosts.map((host) => (
+                  <SortableItem key={host.id} id={Number(host.id)} disabled={hostSortable.disabled}>
+                    {({ itemProps, handleProps, isDragging, isDropTarget }) => (
+                      <div {...itemProps}>
+                        {renderHostCard(host, {
+                          compact: viewMode === "compact-card",
+                          dragHandle: <SortableDragHandle dragHandleProps={handleProps} visible={isDragging} busy={hostReorderPending} className="-ml-2" />,
+                          sortableClassName: cn(isDragging && "opacity-55 ring-1 ring-primary/35", isDropTarget && "ring-1 ring-primary/45"),
+                        })}
+                      </div>
+                    )}
+                  </SortableItem>
+                ))}
+              </div>
+            </SortableReorderContext>
+          ) : (
+            <AutoAnimateContainer
+              key={`host-card-mode-${hostCardListMotionKey}`}
+              duration={220}
+              layout={false}
+              className={
+                viewMode === "compact-card"
+                  ? "standard-card-grid-compact host-card-grid-static host-card-grid-static-compact gap-3"
+                  : "standard-card-grid host-card-grid-static host-card-grid-static-standard gap-4"
+              }
+            >
+              {pagedHosts.map((host) => renderHostCard(host, { compact: viewMode === "compact-card" }))}
+            </AutoAnimateContainer>
+          )
+        ) : (
+          /* ========== 表格式布局 ========== */
+          <>
+            {hostSortingEnabled ? (
+              <SortableReorderContext sortable={hostSortable} ids={pagedHostIds} strategy="vertical" restrictToList>
+                <div className="grid grid-cols-1 gap-3 sm:hidden">
+                  {pagedHosts.map((host) => (
+                    <SortableItem key={host.id} id={Number(host.id)} disabled={hostSortable.disabled}>
+                      {({ itemProps, handleProps, isDragging, isDropTarget }) => (
+                        <div {...itemProps}>
+                          {renderHostCard(host, {
+                            compact: false,
+                            dragHandle: <SortableDragHandle dragHandleProps={handleProps} visible={isDragging} busy={hostReorderPending} className="-ml-2" />,
+                            sortableClassName: cn(isDragging && "opacity-55 ring-1 ring-primary/35", isDropTarget && "ring-1 ring-primary/45"),
+                          })}
+                        </div>
+                      )}
+                    </SortableItem>
+                  ))}
+                </div>
+              </SortableReorderContext>
+            ) : (
+              <AutoAnimateContainer className="grid grid-cols-1 gap-3 sm:hidden">
+                {pagedHosts.map((host) => renderHostCard(host, { compact: false }))}
+              </AutoAnimateContainer>
+            )}
+            <Card className="host-table-shell hidden overflow-hidden border-border/40 bg-card/60 backdrop-blur-md sm:block">
+              <CardContent className="p-0">
+                <Table className="host-management-table w-full min-w-[1340px] table-fixed">
+                  <colgroup>
+                    <col className="w-[320px]" />
+                    <col className="w-[128px]" />
+                    {/* The center columns divide only the width left after the pinned columns. */}
+                    <col style={{ width: "calc(25% + 5px)" }} />
+                    <col style={{ width: "calc(25% - 191px)" }} />
+                    <col style={{ width: "calc(25% - 191px)" }} />
+                    <col style={{ width: "calc(25% - 191px)" }} />
+                    <col className="w-[120px]" />
+                  </colgroup>
+                  <TableHeader>
+                    <TableRow className="hover:bg-transparent">
+                      <TableHead className="host-table-frozen-cell host-table-frozen-left sticky left-0 z-30 w-[320px] min-w-[320px] max-w-[320px] border-r border-border/60 bg-card">
+                        设备名称
+                      </TableHead>
+                      <TableHead className="w-[128px] whitespace-nowrap text-center">运行信息</TableHead>
+                      <TableHead className="min-w-[204px] whitespace-nowrap">
+                        <span className="inline-flex items-center gap-1.5"><Gauge className="h-3.5 w-3.5" />{"\u8d44\u6e90"}</span>
+                      </TableHead>
+                      <TableHead className="w-[128px] whitespace-nowrap px-3 text-center">
+                        <span className="inline-flex items-center gap-1.5"><ArrowRightLeft className="h-3.5 w-3.5" />累计流量</span>
+                      </TableHead>
+                      <TableHead className="w-[128px] whitespace-nowrap px-3 text-center">
+                        <span className="inline-flex items-center gap-1.5"><Wifi className="h-3.5 w-3.5" />实时网络</span>
+                      </TableHead>
+                      <TableHead className="w-[128px] whitespace-nowrap px-3 text-center">
+                        <span className="inline-flex items-center gap-1.5"><Activity className="h-3.5 w-3.5" />{"\u7cfb\u7edf\u7d2f\u8ba1"}</span>
+                      </TableHead>
+                      <TableHead className="host-table-frozen-cell host-table-frozen-right sticky right-0 z-30 w-[120px] min-w-[120px] max-w-[120px] border-l border-border/60 bg-card px-2 text-right">
+                        操作
+                      </TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <SortableReorderContext sortable={hostSortable} ids={pagedHostIds} strategy="vertical" restrictToList>
+                  <TableBody>
+                    {pagedHosts.map((host) => {
+                      const traffic = hostTrafficById.get(host.id);
+                      const latestMetric = hostLatestMetricById.get(host.id);
+                      const agentUpgradeTimedOut = isAgentUpgradeTimedOut(host);
+                      const agentNeedsUpdate = isAgentVersionBehind(host.agentVersion, latestAgentVersion);
+                      const remainingDays = formatHostRemainingDays(host.purchasedAt, host.stoppedAt);
+                      const primaryAddressText = hostPrimaryAddressText(host);
+                      const uptimeText = latestMetric?.uptime == null ? "--" : formatUptime(latestMetric.uptime);
+                      const uptimeTitle = formatHostUptimeTitle(latestMetric?.uptime, uptimeText);
+                      const expiryTitle = formatHostExpiryTitle(host.stoppedAt, remainingDays);
+                      const memoryDetail = formatMetricSizeDetail(latestMetric?.memoryUsed, host.memoryTotal);
+                      const diskDetail = formatMetricSizeDetail(latestMetric?.diskUsed, latestMetric?.diskTotal);
+                      const recoveryStartedText = formatHostDateTimeText(host.agentRecoveryStartedAt);
+                      const recoveryCompletedText = formatHostDateTimeText(host.agentRecoveryCompletedAt);
+                      const hostRuntimeTitle = [
+                        String(host.name || ""),
+                        host.agentBootId ? `Boot ID: ${host.agentBootId}` : "",
+                        host.agentProcessId ? `Agent PID: ${host.agentProcessId}` : "",
+                        recoveryStartedText ? `恢复开始: ${recoveryStartedText}` : "",
+                        recoveryCompletedText ? `恢复完成: ${recoveryCompletedText}` : "",
+                        Number(host.agentRecoveryExpected || 0) > 0 ? `恢复进度: ${Number(host.agentRecoveryReady || 0)}/${Number(host.agentRecoveryExpected || 0)}` : "",
+                        host.mimicRuntimeStatus ? `Mimic: ${host.mimicRuntimeStatus}` : "",
+                        host.mimicRuntimeMessage ? String(host.mimicRuntimeMessage) : "",
+                      ].filter(Boolean).join("\n");
+                      return (
+                      <SortableItem key={host.id} id={Number(host.id)} disabled={hostSortable.disabled} itemKind="row">
+                        {({ itemProps, handleProps, isDragging, isDropTarget }) => (
+                      <TableRow
+                        {...itemProps}
+                        className={cn(
+                          "group/sortable host-table-row align-middle hover:bg-transparent",
+                          isDragging && "opacity-55 ring-1 ring-primary/35",
+                          isDropTarget && "ring-1 ring-primary/45",
+                        )}
+                      >
+                        <TableCell className="host-table-frozen-cell host-table-frozen-left sticky left-0 z-20 w-[320px] min-w-[320px] max-w-[320px] border-r border-border/60 bg-card px-3 py-2.5">
+                          <div className="flex min-w-0 items-center gap-2">
+                            {hostSortingEnabled && (
+                              <SortableDragHandle dragHandleProps={handleProps} visible={isDragging} busy={hostReorderPending} className="shrink-0" />
+                            )}
+                            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border/50 bg-muted/20 text-muted-foreground">
+                              <Server className="h-3.5 w-3.5" />
+                            </span>
+                            <div className="min-w-0 flex-1 space-y-0.5">
+                              <div className="flex min-w-0 items-center gap-1.5">
+                                <HostListStatusBadge host={host} />
+                                <span className="min-w-0 truncate font-semibold" title={hostRuntimeTitle}>{host.name}</span>
+                              </div>
+                              <div className="flex min-w-0 items-center gap-1.5 overflow-hidden whitespace-nowrap text-[11px] text-muted-foreground">
+                                {host.agentVersion && (
+                                  <span className="shrink-0 rounded border border-border/50 bg-muted/35 px-1.5 py-0.5 font-mono text-[10px] leading-none text-muted-foreground">
+                                    v{host.agentVersion}
+                                  </span>
+                                )}
+                                {agentNeedsUpdate && (
+                                  <Badge variant="outline" className="h-4 shrink-0 border-amber-500/30 px-1 py-0 text-[9px] leading-none text-amber-500">
+                                    新版本
+                                  </Badge>
+                                )}
+                                {host.agentUpgradeRequested && (
+                                  <Badge variant="outline" className={`h-4 shrink-0 px-1 py-0 text-[9px] leading-none ${agentUpgradeTimedOut ? "border-destructive/30 text-destructive" : "border-primary/25 text-primary"}`}>
+                                    {agentUpgradeTimedOut ? "升级失败" : "升级中"}
+                                  </Badge>
+                                )}
+                                <HostRegionBadge host={host} compact />
+                              </div>
+                              <div className="flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground" title={primaryAddressText}>
+                                <RadioTower className="h-3 w-3 shrink-0" />
+                                <span className="min-w-0 truncate font-mono">{primaryAddressText}</span>
+                              </div>
+                            </div>
+                          </div>
+                        </TableCell>
+                        <TableCell className="w-[128px] whitespace-nowrap py-2.5 text-center">
+                          <div className="flex flex-col items-center justify-center gap-1.5 text-center">
+                            <div className="flex items-center justify-center gap-1.5 text-[11px] font-medium tabular-nums text-muted-foreground" title={uptimeTitle}>
+                              <Clock className="h-3.5 w-3.5 shrink-0" />
+                              <span>{uptimeText}</span>
+                            </div>
+                            <div className="flex items-center justify-center gap-1.5 text-[11px] font-semibold tabular-nums" title={expiryTitle}>
+                              <CalendarDays className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                              <span className={hostRemainingClass(remainingDays)}>{remainingDays}</span>
+                            </div>
+                          </div>
+                        </TableCell>
+                        <TableCell className="px-3 py-2.5">
+                          <HostListResourceBundle
+                            cpuValue={latestMetric?.cpuUsage}
+                            cpuDetail={host.cpuInfo ? String(host.cpuInfo) : undefined}
+                            memoryValue={latestMetric?.memoryUsage}
+                            memoryDetail={memoryDetail}
+                            diskValue={latestMetric?.diskUsage}
+                            diskDetail={diskDetail}
+                            isOnline={!!host.isOnline}
+                          />
+                        </TableCell>
+                        <TableCell className="px-3 py-2.5">
+                          <HostListFlowPair
+                            inValue={formatBytes(Number(traffic?.bytesIn || 0))}
+                            outValue={formatBytes(Number(traffic?.bytesOut || 0))}
+                            inTitle={`累计入向：${formatBytes(Number(traffic?.bytesIn || 0))}`}
+                            outTitle={`累计出向：${formatBytes(Number(traffic?.bytesOut || 0))}`}
+                          />
+                        </TableCell>
+                        <TableCell className="px-3 py-2.5">
+                          <HostListFlowPair
+                            inValue={formatOptionalBytesPerSecond(latestMetric?.networkSpeedIn)}
+                            outValue={formatOptionalBytesPerSecond(latestMetric?.networkSpeedOut)}
+                            inTitle="实时入向"
+                            outTitle="实时出向"
+                          />
+                        </TableCell>
+                        <TableCell className="px-3 py-2.5">
+                          <HostListFlowPair
+                            inValue={formatOptionalBytes(latestMetric?.networkIn)}
+                            outValue={formatOptionalBytes(latestMetric?.networkOut)}
+                            inTitle={systemNetworkTotalTitle(latestMetric)}
+                            outTitle={systemNetworkTotalTitle(latestMetric)}
+                          />
+                        </TableCell>
+                        <TableCell className="host-table-frozen-cell host-table-frozen-right sticky right-0 z-20 w-[120px] min-w-[120px] max-w-[120px] border-l border-border/60 bg-card px-2 py-2.5 text-right">
+                          <HostActionButtons
+                            host={host}
+                            onEdit={openEdit}
+                            onDelete={(id) => deleteMutation.mutate({ id })}
+                            onUpgrade={requestAgentUpgrade}
+                            onResetTraffic={user?.role === "admin" ? requestResetHostTraffic : undefined}
+                            onCorrectTraffic={user?.role === "admin" ? requestCorrectHostTraffic : undefined}
+                            onViewProbeLatency={setProbeLatencyHost}
+                            resetTrafficPending={resetTrafficHostId === host.id && resetHostTrafficMutation.isPending}
+                            canUpgrade={user?.role === "admin"}
+                            xrayRuntime={xrayRuntimeByHostId.get(Number(host.id)) ?? null}
+                            className="flex items-center justify-end gap-0.5"
+                            buttonClassName="h-8 w-8"
+                          />
+                        </TableCell>
+                      </TableRow>
+                        )}
+                      </SortableItem>
+                    );
+                    })}
+                  </TableBody>
+                  </SortableReorderContext>
+                </Table>
+              </CardContent>
+            </Card>
+          </>
+        )}
+        {viewMode !== "map" && viewMode !== "flat-map" && <PersistentPagination pagination={hostPagination} itemName="台主机" />}
+        </>
+      ) : (
+        <Card className="border-border/40 bg-card/60 backdrop-blur-md">
+          <CardContent className="p-0">
+            <div className="flex flex-col items-center justify-center py-20 text-muted-foreground">
+              <div className="h-16 w-16 rounded-2xl bg-muted/30 flex items-center justify-center mb-4">
+                <Server className="h-8 w-8 opacity-40" />
+              </div>
+              <p className="text-lg font-medium">{isHostTextFiltered ? "未找到匹配主机" : isHostGroupFiltered ? "当前分组暂无主机" : "暂无主机"}</p>
+              <p className="text-sm mt-1 text-muted-foreground/60">
+                {isHostTextFiltered ? "调整筛选内容或清空搜索" : isHostGroupFiltered ? "可以在分组管理中为该分组添加主机" : user?.role === "admin" ? "点击添加主机生成 Agent 安装命令" : "请联系管理员添加主机"}
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+        </TabsContent>{user?.role === "admin" && (
+          <TabsContent value="tokens" className="space-y-4">
+            <AgentTokenManager
+              showCreateButton={false}
+              hideViewModeToggle
+              viewMode={tokenViewMode}
+              onViewModeChange={handleTokenViewModeChange}
+              searchQuery={manageSearchQueries.tokens}
+              onFilterStatsChange={updateTokenFilterStats}
+            />
+          </TabsContent>
+        )}
+
+        {user?.role === "admin" && (
+          <TabsContent value="groups" className="space-y-4">
+            <HostGroupManager
+              hosts={displayHosts}
+              groups={hostGroups as HostGroupView[]}
+              isLoading={isHostGroupsLoading}
+              createSignal={hostGroupCreateSignal}
+              onCreateSignalHandled={() => setHostGroupCreateSignal(0)}
+              viewMode={hostGroupViewMode}
+              searchQuery={manageSearchQueries.groups}
+              onFilterStatsChange={updateGroupFilterStats}
+            />
+          </TabsContent>
+        )}
+
+        {user?.role === "admin" && (
+          <TabsContent value="services" className="space-y-4">
+            <p className="text-xs text-muted-foreground sm:text-sm">
+              管理主机 Ping / TCPing 探测服务。
+            </p>
+            <HostProbeServiceManager
+              createSignal={serviceCreateSignal}
+              onCreateSignalHandled={() => setServiceCreateSignal(0)}
+              viewMode={serviceViewMode}
+              onViewModeChange={handleServiceViewModeChange}
+              hideViewModeToggle
+              searchQuery={manageSearchQueries.services}
+              onFilterStatsChange={updateServiceFilterStats}
+            />
+          </TabsContent>
+        )}
+      </Tabs>
+
+      {user?.role === "admin" && (
+        <AgentTokenManager
+          createSignal={tokenCreateSignal}
+          dialogOnly
+          showCreateButton={false}
+          hideViewModeToggle
+          onCreateSignalHandled={() => setTokenCreateSignal(0)}
+        />
+      )}
+
+      <HostProbeServiceLatencyDialog
+        open={!!probeLatencyHost}
+        onOpenChange={(open) => !open && setProbeLatencyHost(null)}
+        host={probeLatencyHost}
+        services={probeServices as any[]}
+      />
+      {/* Reset Host Traffic Dialog */}
+      <Dialog open={!!resetTrafficHost} onOpenChange={(open) => !open && !resetHostTrafficMutation.isPending && setResetTrafficHost(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <RotateCcw className="h-5 w-5 text-primary" />
+              重置流量统计
+            </DialogTitle>
+            <DialogDescription>
+              确认清空该主机当前累计的流量统计？
+            </DialogDescription>
+          </DialogHeader>
+          {resetTrafficHost && (
+            <div className="space-y-3 rounded-lg border border-border/40 bg-muted/20 p-3 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">主机</span>
+                <span className="font-medium">{resetTrafficHost.name}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">Agent</span>
+                <span className="font-mono">{resetTrafficHost.agentVersion ? `v${resetTrafficHost.agentVersion}` : "未上报"}</span>
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setResetTrafficHost(null)}
+              disabled={resetHostTrafficMutation.isPending}
+            >
+              取消
+            </Button>
+            <Button
+              className="gap-2"
+              onClick={confirmResetHostTraffic}
+              disabled={!resetTrafficHost || resetHostTrafficMutation.isPending}
+            >
+              {resetHostTrafficMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+              {resetHostTrafficMutation.isPending ? "重置中..." : "确认重置"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      {/* Correct Host Traffic Dialog */}
+      <Dialog
+        open={!!trafficCorrectionHost}
+        onOpenChange={(open) => !open && !correctHostTrafficMutation.isPending && setTrafficCorrectionHost(null)}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Gauge className="h-5 w-5 text-primary" />
+              用量修正
+            </DialogTitle>
+            <DialogDescription>
+              手动调整该主机当前已使用的流量，后续上报将在修正后的用量上继续累计。
+            </DialogDescription>
+          </DialogHeader>
+          {trafficCorrectionHost && (
+            <div className="space-y-4">
+              <div className="space-y-2 rounded-md border border-border/40 bg-muted/20 p-3 text-sm">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-muted-foreground">主机</span>
+                  <span className="truncate font-medium" title={trafficCorrectionHost.name}>{trafficCorrectionHost.name}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-muted-foreground">当前统计</span>
+                  <span className="font-medium tabular-nums">{formatBytes(trafficCorrectionCurrentBytes)}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-muted-foreground">计量方式</span>
+                  <span className="font-medium">{hostTrafficMeasureModeLabel(trafficCorrectionHost.trafficMeasureMode)}</span>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="host-traffic-correction">修正后已用流量</Label>
+                <div className="relative">
+                  <Input
+                    id="host-traffic-correction"
+                    type="number"
+                    min="0"
+                    step="0.001"
+                    inputMode="decimal"
+                    value={trafficCorrectionInput}
+                    onChange={(event) => setTrafficCorrectionInput(event.target.value)}
+                    className="pr-14 tabular-nums"
+                    autoFocus
+                  />
+                  <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-sm text-muted-foreground">GB</span>
+                </div>
+                <p className="text-xs leading-5 text-muted-foreground">
+                  仅修正面板累计用量，不会修改 Agent 的系统累计流量。
+                </p>
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setTrafficCorrectionHost(null)}
+              disabled={correctHostTrafficMutation.isPending}
+            >
+              取消
+            </Button>
+            <Button
+              className="gap-2"
+              onClick={confirmCorrectHostTraffic}
+              disabled={!trafficCorrectionInput.trim() || correctHostTrafficMutation.isPending}
+            >
+              {correctHostTrafficMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Gauge className="h-4 w-4" />}
+              {correctHostTrafficMutation.isPending ? "保存中..." : "保存修正"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      {/* Agent Upgrade Dialog */}
+      <Dialog open={!!upgradeHost} onOpenChange={(open) => !open && setUpgradeHost(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Download className="h-5 w-5 text-primary" />
+              升级 Agent
+            </DialogTitle>
+            <DialogDescription>
+              通过 Agent 下发升级任务。
+            </DialogDescription>
+          </DialogHeader>
+          {upgradeHost && (
+            <div className="space-y-3 rounded-lg border border-border/40 bg-muted/20 p-3 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">主机</span>
+                <span className="font-medium">{upgradeHost.name}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">当前 Agent</span>
+                <span className="font-mono">{upgradeHost.agentVersion ? `v${upgradeHost.agentVersion}` : "未上报"}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">目标版本</span>
+                <span className="font-mono">v{latestAgentVersion || "-"}</span>
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setUpgradeHost(null)}>
+              取消
+            </Button>
+            <Button
+              className="gap-2"
+              disabled={!upgradeHost || upgradeAgentMutation.isPending}
+              onClick={confirmAgentUpgrade}
+            >
+              {upgradeAgentMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+              {upgradeAgentMutation.isPending ? "下发中..." : "确认升级"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Bulk Agent Upgrade Dialog */}
+      <Dialog open={bulkUpgradeDialogOpen} onOpenChange={setBulkUpgradeDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Download className="h-5 w-5 text-primary" />
+              一键升级 Agent
+            </DialogTitle>
+            <DialogDescription>
+              点击确认后才会向在线且可升级的 Agent 下发升级任务。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 rounded-lg border border-border/40 bg-muted/20 p-3 text-sm">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-muted-foreground">升级数量</span>
+              <span className="font-medium">{bulkUpgradeableHosts.length} 台</span>
+            </div>
+            {offlineUpgradeableHostCount > 0 && (
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">已跳过离线主机</span>
+                <span className="font-medium">{offlineUpgradeableHostCount} 台</span>
+              </div>
+            )}
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-muted-foreground">目标版本</span>
+              <span className="font-mono">v{latestAgentVersion || "-"}</span>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setBulkUpgradeDialogOpen(false)}
+              disabled={upgradeAgentsMutation.isPending}
+            >
+              取消
+            </Button>
+            <Button
+              className="gap-2"
+              disabled={bulkUpgradeCandidateQuery.isLoading || bulkUpgradeableHosts.length === 0 || upgradeAgentsMutation.isPending}
+              onClick={confirmAllAgentUpgrades}
+            >
+              {upgradeAgentsMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+              {upgradeAgentsMutation.isPending ? "下发中..." : "确认升级"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 编辑主机对话框 */}
+      <Dialog open={showDialog} onOpenChange={setShowDialog}>
+        <DialogContent className="flex h-[min(720px,86vh)] max-h-[86vh] flex-col overflow-hidden sm:max-w-[44rem]">
+          <DialogHeader className="shrink-0 space-y-1">
+            <DialogTitle>编辑主机</DialogTitle>
+            <DialogDescription className="sr-only">
+              修改主机信息
+            </DialogDescription>
+          </DialogHeader>
+          <Tabs
+            value={hostDialogTab}
+            onValueChange={(value) => setHostDialogTab(value as HostDialogTab)}
+            className="min-h-0 flex flex-1 flex-col overflow-hidden"
+          >
+            <TabsList className="grid h-auto w-full grid-cols-2 gap-1 rounded-md bg-muted/50 p-1">
+              {HOST_DIALOG_TABS.map((item) => {
+                const Icon = item.icon;
+                return (
+                  <TabsTrigger key={item.value} value={item.value} className="min-w-0 gap-2 px-3 py-1.5 text-sm">
+                    <Icon className="h-4 w-4 shrink-0" />
+                    <span className="truncate">{item.label}</span>
+                  </TabsTrigger>
+                );
+              })}
+            </TabsList>
+            <div className="dialog-scroll-area mt-3 min-h-0 flex-1 overflow-y-auto overflow-x-hidden pb-4 pl-0.5 pr-7">
+              <TabsContent value="basic" className="m-0 space-y-3 !animate-none">
+                <section className="space-y-3">
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <Label className="text-sm font-semibold">基础信息</Label>
+                    <span className="text-xs text-muted-foreground">主机连接</span>
+                  </div>
+                  <div className="grid gap-2.5 sm:grid-cols-2">
+                    <div className="space-y-1">
+                      <Label className="text-sm">主机名称</Label>
+                      <Input
+                        className="h-8"
+                        placeholder="例如: 香港节点-01"
+                        value={form.name}
+                        onChange={(e) => setForm({ ...form, name: e.target.value })}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-sm">Agent 检测 IP</Label>
+                      <Input className="h-8 bg-muted/40" value={agentDetectedIpText(displayHosts.find((host: any) => host.id === editingId) || form)} readOnly />
+                    </div>
+                  </div>
+                  <div className="mt-2.5 grid gap-2.5 sm:grid-cols-2">
+                    <div className="space-y-1">
+                      <Label className="text-sm">入口 IP / 域名</Label>
+                      <Input
+                        className="h-8"
+                        placeholder="例如: example.com 或 1.2.3.4"
+                        value={form.entryIp}
+                        onChange={(e) => setForm({ ...form, entryIp: e.target.value })}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-sm">内网地址 <span className="text-xs text-muted-foreground">可选</span></Label>
+                      <Input
+                        className="h-8"
+                        placeholder="10.0.0.8 或 node-a.internal"
+                        value={form.tunnelEntryIp}
+                        onChange={(e) => setForm({ ...form, tunnelEntryIp: e.target.value })}
+                      />
+                    </div>
+                  </div>
+                  <div className="mt-2.5 grid gap-3 sm:grid-cols-2">
+                    <div className="space-y-1">
+                      <Label className="text-sm">网卡名称 <span className="text-xs text-muted-foreground">可选</span></Label>
+                      <Input
+                        className="h-8"
+                        placeholder="eth0, ens33, bond0"
+                        value={form.networkInterface}
+                        onChange={(e) => setForm({ ...form, networkInterface: e.target.value })}
+                      />
+                    </div>
+                  </div>
+                </section>
+
+                <section className="space-y-3 border-t border-border/40 pt-3">
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <Label className="text-sm font-semibold">端口限制</Label>
+                    <span className="text-xs text-muted-foreground">留空不限</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <div className="space-y-1">
+                      <Label className="text-xs text-muted-foreground">起始端口</Label>
+                      <Input
+                        className="h-8"
+                        type="number"
+                        min={1}
+                        max={65535}
+                        step={1}
+                        placeholder="例如: 10000"
+                        value={form.portRangeStart ?? ""}
+                        onChange={(e) => {
+                          const v = e.target.value ? parseInt(e.target.value) : null;
+                          setForm({ ...form, portRangeStart: v });
+                        }}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-xs text-muted-foreground">结束端口</Label>
+                      <Input
+                        className="h-8"
+                        type="number"
+                        min={1}
+                        max={65535}
+                        step={1}
+                        placeholder="例如: 20000"
+                        value={form.portRangeEnd ?? ""}
+                        onChange={(e) => {
+                          const v = e.target.value ? parseInt(e.target.value) : null;
+                          setForm({ ...form, portRangeEnd: v });
+                        }}
+                      />
+                    </div>
+                  </div>
+                  <div className="mt-2.5 space-y-1">
+                    <div className="flex items-center justify-between gap-3">
+                      <Label className="text-xs text-muted-foreground">自定义端口</Label>
+                      {customPortInputState.invalid.length === 0 && customPortInputState.ports.length > 0 ? (
+                        <span className="text-xs text-muted-foreground">{customPortInputState.ports.length} 个</span>
+                      ) : null}
+                    </div>
+                    <Input
+                      placeholder="例如: 80,443,65095"
+                      value={form.portAllowlist}
+                      onChange={(e) => setForm({ ...form, portAllowlist: e.target.value })}
+                      className={`h-8 ${customPortInputState.invalid.length > 0 ? "border-destructive focus-visible:ring-destructive" : ""}`}
+                    />
+                    {customPortInputState.invalid.length > 0 ? (
+                      <p className="text-xs text-destructive">
+                        自定义端口只能填写 1-65535 的整数，多个端口使用英文逗号分隔
+                      </p>
+                    ) : null}
+                  </div>
+                  {form.portRangeStart != null && form.portRangeEnd != null && form.portRangeStart > form.portRangeEnd && (
+                    <p className="mt-3 text-xs text-destructive">
+                      起始端口不能大于结束端口
+                    </p>
+                  )}
+                </section>
+                {user?.role === "admin" && (
+                  <section className="space-y-3 border-t border-border/40 pt-3">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <Label className="text-sm font-semibold">协议屏蔽</Label>
+                      <span className="text-xs text-muted-foreground">访问策略</span>
+                    </div>
+                    <p className="rounded-md border border-border/40 bg-muted/30 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+{nginxFeatureEnabled ? "支持 ForwardX、Realm、GOST、Socat 和 Nginx；不支持 iptables/nftables。" : "支持 ForwardX、Realm、GOST 和 Socat；不支持 iptables/nftables。"}
+                    </p>
+                    <div className="grid gap-2 sm:grid-cols-3">
+                      <label className="flex min-w-0 items-center justify-between gap-3 rounded-md bg-muted/35 px-2.5 py-2">
+                        <span className="min-w-0 truncate text-sm font-medium">HTTP</span>
+                        <Switch className="shrink-0" checked={form.blockHttp} onCheckedChange={(checked) => setForm({ ...form, blockHttp: checked })} />
+                      </label>
+                      <label className="flex min-w-0 items-center justify-between gap-3 rounded-md bg-muted/35 px-2.5 py-2">
+                        <span className="min-w-0 truncate text-sm font-medium">SOCKS</span>
+                        <Switch className="shrink-0" checked={form.blockSocks} onCheckedChange={(checked) => setForm({ ...form, blockSocks: checked })} />
+                      </label>
+                      <label className="flex min-w-0 items-center justify-between gap-3 rounded-md bg-muted/35 px-2.5 py-2">
+                        <span className="min-w-0 truncate text-sm font-medium">TLS</span>
+                        <Switch className="shrink-0" checked={form.blockTls} onCheckedChange={(checked) => setForm({ ...form, blockTls: checked })} />
+                      </label>
+                    </div>
+                  </section>
+                )}
+              </TabsContent>
+
+              <TabsContent value="other" className="m-0 !animate-none">
+                <section className="space-y-3">
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <Label className="text-sm font-semibold">其他配置</Label>
+                    <span className="text-xs text-muted-foreground">主机统计</span>
+                  </div>
+                  {user?.role === "admin" ? (
+                    <>
+                      <div className="grid min-w-0 gap-2.5 px-1 md:grid-cols-2">
+                        <div className="space-y-1">
+                          <Label className="text-sm">机器购买时间</Label>
+                          <DateTimePickerInput
+                            value={form.purchasedAt}
+                            onChange={(value) => setForm({ ...form, purchasedAt: value })}
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <Label className="text-sm">机器停止时间</Label>
+                          <DateTimePickerInput
+                            value={form.stoppedAt}
+                            onChange={(value) => setForm({ ...form, stoppedAt: value })}
+                            align="end"
+                          />
+                        </div>
+                        <div className="min-w-0 space-y-1">
+                          <Label className="text-sm">账单周期</Label>
+                          <Select
+                            value={String(normalizeHostBillingCycleMonths(form.billingCycleMonths))}
+                            onValueChange={(value) => setForm({ ...form, billingCycleMonths: normalizeHostBillingCycleMonths(value) })}
+                          >
+                            <SelectTrigger className="h-8 min-w-0">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="1">月付</SelectItem>
+                              <SelectItem value="3">季付</SelectItem>
+                              <SelectItem value="6">半年付</SelectItem>
+                              <SelectItem value="12">年付</SelectItem>
+                              <SelectItem value="24">两年付</SelectItem>
+                              <SelectItem value="36">三年付</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="min-w-0 space-y-1">
+                          <Label className="text-sm">账单月日</Label>
+                          <div className="grid min-w-0 grid-cols-2 gap-2">
+                            <Select
+                              value={String(clampBillingMonth(form.billingMonth))}
+                              onValueChange={(value) => setForm({ ...form, billingMonth: clampBillingMonth(Number(value)) })}
+                            >
+                              <SelectTrigger className="h-8 min-w-0">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {Array.from({ length: 12 }, (_, index) => index + 1).map((month) => (
+                                  <SelectItem key={month} value={String(month)}>{month} 月</SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                            <Select
+                              value={String(clampBillingDay(form.billingDay))}
+                              onValueChange={(value) => setForm({ ...form, billingDay: clampBillingDay(Number(value)) })}
+                            >
+                              <SelectTrigger className="h-8 min-w-0">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {Array.from({ length: 31 }, (_, index) => index + 1).map((day) => (
+                                  <SelectItem key={day} value={String(day)}>{day} 日</SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                        </div>
+                        <div className="min-w-0 space-y-1">
+                          <Label className="text-sm">机器到期处理</Label>
+                          <Select
+                            value={normalizeHostExpiryAction(form.expiryHandling)}
+                            onValueChange={(value) => setForm({ ...form, expiryHandling: normalizeHostExpiryAction(value) })}
+                          >
+                            <SelectTrigger className="h-8 min-w-0">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="none">不处理</SelectItem>
+                              <SelectItem value="extend_cycle">周期顺延</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="min-w-0 space-y-1">
+                          <Label className="text-sm">套餐流量</Label>
+                          <div className="flex h-8 min-w-0 overflow-hidden rounded-md border border-input bg-background focus-within:border-ring focus-within:ring-2 focus-within:ring-inset focus-within:ring-ring">
+                            <Input
+                              className="h-8 min-w-0 flex-1 rounded-none border-0 bg-transparent px-3 py-1 focus-visible:border-0 focus-visible:ring-0 focus-visible:ring-offset-0"
+                              type="text"
+                              inputMode="decimal"
+                              placeholder="例如: 2000"
+                              value={form.trafficLimitGb}
+                              onChange={(e) => setForm({ ...form, trafficLimitGb: e.target.value })}
+                            />
+                            <span className="flex h-full shrink-0 items-center border-l border-border/60 bg-muted/50 px-2.5 text-sm text-muted-foreground">
+                              GB
+                            </span>
+                          </div>
+                        </div>
+                        <div className="min-w-0 space-y-1">
+                          <Label className="text-sm">流量计算</Label>
+                          <Select
+                            value={form.trafficMeasureMode}
+                            onValueChange={(value) => setForm({ ...form, trafficMeasureMode: normalizeHostTrafficMeasureMode(value) })}
+                          >
+                            <SelectTrigger className="h-8 min-w-0">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="outbound">仅出向</SelectItem>
+                              <SelectItem value="both">双向</SelectItem>
+                              <SelectItem value="max">取最大值</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      </div>
+                      <div className="mt-2.5 flex min-h-9 flex-col gap-2 rounded-md bg-muted/35 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="min-w-0 space-y-0.5">
+                          <Label className="text-sm font-medium">流量耗尽提醒</Label>
+                          <p className="text-xs text-muted-foreground">
+                            {telegramBotReady ? "开启后通过 TG 机器人发送提醒。" : "请先在系统设置内配置并启用 TG 机器人。"}
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <div className="flex h-8 w-20 overflow-hidden rounded-md border border-input bg-background focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2">
+                            <Input
+                              className="h-8 rounded-none border-0 px-2 text-right focus-visible:ring-0 focus-visible:ring-offset-0"
+                              type="number"
+                              min={1}
+                              max={99}
+                              step={1}
+                              value={form.trafficAlertThresholdPercent}
+                              onChange={(e) => setForm({ ...form, trafficAlertThresholdPercent: clampTrafficAlertThresholdPercent(Number(e.target.value)) })}
+                            />
+                            <span className="flex h-8 shrink-0 items-center border-l border-border/60 bg-muted/50 px-1.5 text-sm text-muted-foreground">%</span>
+                          </div>
+                          <Switch
+                            checked={telegramBotReady && form.telegramTrafficAlertEnabled}
+                            disabled={!telegramBotReady}
+                            onCheckedChange={(checked) => setForm({ ...form, telegramTrafficAlertEnabled: checked })}
+                          />
+                        </div>
+                      </div>
+                      <div className="mt-2.5 flex min-h-9 flex-col gap-2 rounded-md bg-muted/35 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="min-w-0 space-y-0.5">
+                          <Label className="text-sm font-medium">续费提醒</Label>
+                          <p className="text-xs text-muted-foreground">
+                            {telegramBotReady ? "机器剩余日期不足指定天数时通过 TG 机器人提醒。" : "请先在系统设置内配置并启用 TG 机器人。"}
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <div className="flex h-8 w-24 overflow-hidden rounded-md border border-input bg-background focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2">
+                            <Input
+                              className="h-8 rounded-none border-0 px-2 text-right focus-visible:ring-0 focus-visible:ring-offset-0"
+                              type="number"
+                              min={1}
+                              max={365}
+                              step={1}
+                              value={form.renewalReminderDays}
+                              onChange={(e) => setForm({ ...form, renewalReminderDays: clampRenewalReminderDays(Number(e.target.value)) })}
+                            />
+                            <span className="flex h-8 shrink-0 items-center border-l border-border/60 bg-muted/50 px-2 text-sm text-muted-foreground">天</span>
+                          </div>
+                          <Switch
+                            checked={telegramBotReady && form.telegramRenewalReminderEnabled}
+                            disabled={!telegramBotReady}
+                            onCheckedChange={(checked) => setForm({ ...form, telegramRenewalReminderEnabled: checked })}
+                          />
+                        </div>
+                      </div>
+                      <div className="mt-2.5 flex min-h-9 flex-col gap-2 rounded-md bg-muted/35 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="min-w-0">
+                          <Label className="text-sm font-medium">自动重置流量</Label>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <Select
+                            value={String(clampMonthlyResetDay(form.trafficResetDay))}
+                            onValueChange={(value) => setForm({ ...form, trafficResetDay: clampMonthlyResetDay(Number(value)) })}
+                          >
+                            <SelectTrigger className="h-8 w-24">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {Array.from({ length: 31 }, (_, index) => index + 1).map((day) => (
+                                <SelectItem key={day} value={String(day)}>{day} 号</SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <Switch checked={form.trafficAutoReset} onCheckedChange={(checked) => setForm({ ...form, trafficAutoReset: checked })} />
+                        </div>
+                      </div>
+                      <p className="mt-1.5 px-3 text-xs text-muted-foreground">当月没有该日期时按最后一天重置。</p>
+                      <div className="mt-2.5 space-y-2 rounded-md bg-muted/35 px-3 py-2.5">
+                        <div className="flex min-h-8 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                          <div className="flex min-w-0 items-center gap-2">
+                            <RadioTower className="h-4 w-4 shrink-0 text-muted-foreground" />
+                            <Label className="text-sm font-medium">DDNS 服务</Label>
+                            {!ddnsProviderEnabled ? (
+                              <Badge variant="secondary" className="shrink-0 text-[11px]">未配置服务商</Badge>
+                            ) : null}
+                          </div>
+                          <Switch
+                            checked={form.ddnsEnabled}
+                            disabled={!ddnsProviderEnabled && !form.ddnsEnabled}
+                            onCheckedChange={(checked) => setForm({ ...form, ddnsEnabled: checked })}
+                          />
+                        </div>
+                        <div className="grid min-w-0 gap-2.5 sm:grid-cols-[8rem_minmax(0,1fr)]">
+                          <Select
+                            value={form.ddnsIpVersion}
+                            disabled={!ddnsProviderEnabled}
+                            onValueChange={(value) => setForm({ ...form, ddnsIpVersion: normalizeHostDdnsIpVersion(value) })}
+                          >
+                            <SelectTrigger className="h-8 min-w-0">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="ipv4">IPv4 / A</SelectItem>
+                              <SelectItem value="ipv6">IPv6 / AAAA</SelectItem>
+                            </SelectContent>
+                          </Select>
+                          <Input
+                            className="h-8 min-w-0"
+                            placeholder="例如: node.example.com"
+                            value={form.ddnsDomain}
+                            disabled={!ddnsProviderEnabled}
+                            onChange={(e) => setForm({ ...form, ddnsDomain: e.target.value })}
+                          />
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          开启后，Agent 上报的对应 IP 发生变化时会自动更新到系统设置中的 DDNS 服务商。
+                        </p>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="rounded-md bg-muted/35 px-3 py-2 text-sm text-muted-foreground">
+                      仅管理员可配置主机其他配置。
+                    </div>
+                  )}
+                </section>
+              </TabsContent>
+
+            </div>
+          </Tabs>
+          <DialogFooter className="shrink-0 pt-2">
+            <Button variant="outline" onClick={() => setShowDialog(false)}>
+              取消
+            </Button>
+            <Button onClick={handleSubmit} disabled={isPending || !form.name}>
+              {isPending ? "处理中..." : "保存"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+export default function Hosts() {
+  return (
+    <DashboardLayout>
+      <HostsContent />
+    </DashboardLayout>
+  );
+}

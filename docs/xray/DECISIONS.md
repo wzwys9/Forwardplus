@@ -1,0 +1,122 @@
+# Xray 设计决定
+
+状态：持续更新。新决定追加编号；不得静默覆盖旧决定。若决定被替代，保留原记录并指向新编号。
+
+| 编号 | 状态 | 决定 | 理由/备注 |
+|---|---|---|---|
+| `XRAY-ADR-001` | 已确认 | 一个节点定义为一个 inbound，一个 inbound 允许多个客户端 | 客户端以独立 UUID 分享，同端口共用协议和 Reality 配置 |
+| `XRAY-ADR-002` | 已确认 | 每个 inbound 使用独立 Reality 密钥对 | 限制密钥泄漏和轮换影响范围 |
+| `XRAY-ADR-003` | 已确认 | Reality 私钥和节点配置以面板数据库为权威来源 | 支持恢复和 desired-state 对齐；Agent 仅保留运行副本 |
+| `XRAY-ADR-004` | 已确认 | 默认自动端口范围为 `1000–65535` | 用户明确指定；1000–1023 的权限由 Agent bind 探测确认 |
+| `XRAY-ADR-005` | 已确认 | 创建节点时离线主机灰显且禁选 | 离线时无法可靠探测端口、扫描目标或应用配置 |
+| `XRAY-ADR-006` | 已确认 | 分享链接使用 Agent 公网 IP | 公网 IP 通常稳定；inbound 保存独立 publicAddress |
+| `XRAY-ADR-007` | 已确认 | Reality 扫描由目标 Agent 执行 | 节点所在位置的 DNS、路由、限制和延迟才具有权威性 |
+| `XRAY-ADR-008` | 已确认 | Xray 按需从面板下载安装 | 避免每台 Agent 预装，节点服务器不要求直连 GitHub |
+| `XRAY-ADR-009` | 已确认 | 已有系统 Xray 不覆盖，ForwardX 使用独立路径 | 避免破坏用户已有服务和配置 |
+| `XRAY-ADR-010` | 已确认 | 面板版本高于受管版本时提供升级选项，不自动强制升级 | 配置同步和二进制升级分离；失败可控 |
+| `XRAY-ADR-011` | 已确认 | 第一版仅管理员；不做流量统计和防火墙管理 | 控制范围，先完成可靠节点生命周期 |
+| `XRAY-ADR-012` | 已确认 | 面板生成完整主机 Xray 配置，Agent 验证后整包应用 | 避免双向配置和增量命令漂移，复用 ForwardX desired state |
+| `XRAY-ADR-013` | 已确认 | Token 错误或面板离线不能主动停止已有 Xray | 控制面故障不应中断数据面 |
+| `XRAY-ADR-014` | 已确认 | Xray 由 ForwardX Agent 直接作为 OS 子进程持有和监管，不创建独立 Xray service | 用户明确选择；Token/网络错误与本地 supervisor 解耦，Agent 启动时从 last-good 恢复 |
+| `XRAY-ADR-015` | 已确认 | Reality 私钥、UUID、shortId 使用独立面板主密钥做 AEAD 静态加密 | 安装器自动生成；持久数据目录独立文件；原始数据库备份需配套备份密钥；预留 keyId 轮换 |
+| `XRAY-ADR-016` | 已废弃 | Agent 离线时在“排队 desired”和“全部禁用”之间选择 | 由 `XRAY-ADR-019` 取代 |
+| `XRAY-ADR-017` | 已确认 | 删除最后一个 inbound 时停止受管 Xray但保留二进制 | 保持按需安装并避免下次重复下载 |
+| `XRAY-ADR-018` | 已废弃 | 第一版建议支持 `linux-amd64` 和 `linux-arm64` | 由含自动识别要求的 `XRAY-ADR-021` 取代 |
+| `XRAY-ADR-019` | 已确认 | Agent 离线或心跳过期时拒绝该主机全部 Xray 写操作，不保存新的离线草稿或排队修改 | 用户明确选择；只读页面保留并把 observed 状态标为历史信息 |
+| `XRAY-ADR-020` | 已废弃 | 第一版固定 Xray-core `v26.7.28`，不隐式跟随 `latest` | 固定版本由 `XRAY-ADR-041` 替代；不跟随 `latest` 的边界保留 |
+| `XRAY-ADR-021` | 已确认 | Agent 自动识别 CPU 架构，第一版制品仅支持 `linux-amd64`、`linux-arm64` | ForwardX 现有 Agent/运行时发布链只构建这两种架构；未知架构安全报告不支持 |
+| `XRAY-ADR-022` | 已确认 | Agent 正常停止/升级时允许短暂中断 Xray，并由新 Agent 在连接面板前从 last-good 快速恢复 | 保持默认 cgroup 清理语义，避免遗留孤儿进程；Token/网络错误仍不停止 Xray |
+| `XRAY-ADR-023` | 已确认 | 显式卸载 Agent 默认停止并删除 ForwardX 受管 Xray 进程、配置和二进制 | 卸载是管理员主动移除执行器，与 Token 撤销/离线不同；避免遗留无人管理的有效凭据和代理进程 |
+| `XRAY-ADR-024` | 已确认 | artifact GET 在 Agent Token 映射 host 后使用受限的 Xray OS/arch 请求头匹配制品，不解析 `osInfo`/`cpuInfo` 展示文本 | capability 的 Go runtime 平台值是规范来源；展示文本不稳定且不能安全推断架构，请求仍只允许固定 artifactId 和已验证清单项 |
+| `XRAY-ADR-025` | 已确认 | Xray mutation 的离线错误统一使用 `HOST_OFFLINE`；`AGENT_OFFLINE` 只保留为主机选择器不可用原因 | 修正 `API_CONTRACT.md` 内部术语冲突，并与稳定 API 错误码和 UI 错误映射保持一致 |
+| `XRAY-ADR-026` | 已确认 | Reality 扫描用同一固定公网 IP 的普通 TLS 握手和强制 TLS 1.3 + X25519 握手分别判定证书/ALPN 与 X25519；策略拒绝地址不回传原值 | Go 公共 `tls.ConnectionState` 不暴露协商曲线；强制曲线握手可直接证明支持，同时固定 IP/SNI 和脱敏哨兵满足 DNS rebinding 与内部地址保密边界 |
+| `XRAY-ADR-027` | 已废弃 | Reality 默认候选 `v1` 固定为协议示例中的 Cloudflare/Microsoft 两项；面板与 Agent 双重执行公网地址策略，单主机最多 2 个活动扫描 operation | 默认列表由 `XRAY-ADR-042` 的 `v2` 取代；双端地址策略、历史 operation 可解释性和并发上限继续保留 |
+| `XRAY-ADR-028` | 已确认 | `v26.7.28` 配置使用稳定排序/固定 JSON 字节；密钥 AAD 绑定不可变的 `runtimeTag`/`statsKey`，无启用客户端时 Reality `shortIds` 写入空 sentinel | 自增 id 在创建前不可用，稳定服务端身份可支持事务前加密；真实固定版本 config test 会拒绝空 `shortIds`，而 `clients: []` 保证 sentinel 不授予任何客户端认证能力 |
+| `XRAY-ADR-029` | 已确认 | heartbeat 在 busy/coalesced 返回前处理 Xray capability/observed；完整状态和数据库缓存均校验后才接受签名压缩，SSE 与 heartbeat 复用同一份 desired | Agent 只有收到成功 HTTP 响应才提交压缩签名，面板重启后需要可恢复的安全缓存；单次构建避免两条投递通道产生不同字节或身份 |
+| `XRAY-ADR-030` | 已确认 | Agent 用独立的有界串行队列统一处理 heartbeat/SSE Xray desired；相同 identity 合并，最多一个运行中和一个最新 pending | Xray config 可能含密钥且最大 1 MiB，必须同时限制内存快照数量、避免双通道重复重启，并保持应用 context 与控制面取消解耦 |
+| `XRAY-ADR-031` | 已确认 | `xray_runtime_reports` 持久化经 capability schema 验证的 OS/arch、功能位和稳定错误码；非法报告清空投影 | 主机选择器必须按受信平台匹配制品并区分旧 Agent/平台不支持，`osInfo`/`cpuInfo` 是不稳定展示文本且按 ADR-024 不得作为规范来源 |
+| `XRAY-ADR-032` | 已确认 | 创建首个 inbound 的顶层 `SYNC` operation 复用自身 operationId 投递前置 `INSTALL` task，安装成功前暂缓 desired | 避免事务提交后再创建第二个不关联 operation 的半完成窗口；一个 operation 贯穿安装、配置应用和 observed READY，metadata 只保存固定制品与阶段 |
+| `XRAY-ADR-033` | 已确认 | Agent 把固定 Xray 在 Linux 上为 `0.0.0.0` 创建的同 PID 双栈 `::` socket 视为 expected IPv4 wildcard | 真实 v26.7.28 垂直测试证明 IPv4 可连接且 socket inode 属于受管 PID；旧探测只查 IPv4 procfs 表示会误报 MISSING 并回滚，地址/端口/PID 所有权约束仍保留 |
+| `XRAY-ADR-034` | 已确认 | TASK-028 先交付只读运行环境状态和主机页入口；install/upgrade/restart/sync 的 mutation、确认和持久进度统一在 TASK-029 交付 | 原任务文字一面要求 TASK-028 调用“可用的 runtime mutation”，一面把 mutation 定义在依赖 TASK-028 的 TASK-029，形成循环；此次只澄清实施顺序，`API_CONTRACT.md` 与 `UI_DESIGN.md` 的第一版能力不变 |
+| `XRAY-ADR-035` | 已确认 | 停用或待删除的 inbound/client 仍允许管理员只读取得当前分享材料，并返回 `DISABLED/PENDING_DELETE` 状态 | 远端旧 generation 仍可能接受现有凭据；禁用分享会妨碍管理员识别仍可能有效的材料。所有写操作继续受离线/状态门控，应用收敛并清理后返回 not found |
+| `XRAY-ADR-036` | 已确认 | secret HMAC fingerprint 绑定 envelope 版本、资源类型和字段类型，但不绑定单条资源 id；AEAD AAD 继续绑定 runtimeTag/statsKey | fingerprint 用于同类字段跨记录判重，资源 id 会让同一明文无法比较；密文防搬运由 AEAD AAD 独立保证 |
+| `XRAY-ADR-037` | 已确认 | 密码加密完整备份恢复先以候选 keyring 在内存预检全部 Xray envelope，基本快照验证后才提交密钥；结构化导入开始后保留已验证候选密钥 | 不合法备份不能覆盖密钥；但导入允许部分成功，开始写入后回滚密钥会使已写入的备份密文不可解密。不同密钥仍只允许用于原本没有 Xray 密文的目标库 |
+| `XRAY-ADR-038` | 已确认 | Agent 用持久 `apply-pending.json` 恢复崩溃中的配置切换；artifact 下载请求头必须匹配受鉴权主机已持久化 capability；受管本地对象逐级校验所有者 | 关闭进程崩溃半切换、伪造平台请求头和跨用户磁盘对象三个信任缺口，不改变面板 desired state 的唯一权威性 |
+| `XRAY-ADR-039` | 已确认 | 旧 Xray client fingerprint 在 schema 初始化、备份导入结束和首个新写操作前升级为记录无关的版本 2；迁移串行并在单一事务中两阶段替换 | 旧实现把记录身份混入 HMAC，无法跨记录判重；先解密并全量检查重复、再原子替换，可避免唯一索引碰撞和半迁移状态，重复旧数据必须显式失败 |
+| `XRAY-ADR-040` | 已废弃 | 生产面板在数据库就绪后异步填充固定 v26.7.28 的 amd64/arm64 制品，完整验证后设置默认版本；Agent 仍只从面板下载 | 固定版本由 `XRAY-ADR-041` 替代；启动异步填充和 Agent 只从面板下载的行为保留 |
+| `XRAY-ADR-041` | 已确认 | 面板和 Agent 的固定默认 Xray-core 版本由 `v26.7.28` 替换为 `v26.3.27`，新面板自动填充官方 amd64/arm64 制品后设置默认版本 | 用户在开发测试阶段明确选择该版本以兼容现有 Reality 客户端；制品仍固定官方 URL、大小与 SHA-256，不使用 `latest`。已运行更高版本仍不自动降级，本次测试环境由管理员执行一次显式维护切换 |
+| `XRAY-ADR-042` | 已确认 | Reality 默认候选升级为 `v2`，移除 `www.microsoft.com:443`，采用 Cloudflare、Amazon/AWS、Samsung、NVIDIA、AMD、Intel、Sony、Google 下载站共 9 项固定候选 | 用户确认 Microsoft 目标会出现 Reality 校验失败；3x-ui 的扩展候选仅作为域名参考，ForwardX 未复制其实现。其余 9 项已在 A/B 验证 TLS 1.3、H2、X25519 和证书，并以真实 Xray `v26.3.27` 完成 Reality 代理请求。版本号确保历史 `v1` operation 仍可解释；所有候选仍需面板预筛和 Agent 独立复核 |
+| `XRAY-ADR-043` | 已确认 | 多协议扩展继续采用“面板数据库唯一权威、按主机生成完整快照、Agent 原子应用”的单向控制架构；面板分别控制每台 Agent，Agent 之间不建立主从关系 | 用户明确要求保持当前架构。Agent 不回传配置参与合并，避免双向真相、密钥泄漏和手工配置漂移；本地旧配置只服务于幂等和 last-good 回滚 |
+| `XRAY-ADR-044` | 已确认 | 协议能力使用服务端拥有的类型化 profile 目录和判别联合逐项开放，不复制 3x-ui 的任意 JSON 透传；默认核心继续固定 `v26.3.27` | 组合兼容性、凭据类型、分享格式和监听网络必须可验证。未通过固定版本配置/运行测试的 profile 不暴露给前端；现有 VLESS Reality 是首个可用 profile |
+| `XRAY-ADR-045` | 已确认 | 多协议阶段先交付节点创建、部署、监听、凭据和分享；流量限额、到期、订阅、fallback、sniffing、路由暂不实施。HTTP/SOCKS/Mixed/Tunnel 后置，TUN/MTProto/AmneziaWG 使用独立受管服务阶段 | 用户明确排除运营功能。UDP 能力在 Agent v2 可选扩展后实施；特权或 sidecar 服务不能削弱 typed task、专属路径和最小权限边界 |
+| `XRAY-ADR-046` | 已确认 | inbound profile/spec 先以三列全空的 legacy 映射和三列齐全的显式 envelope 并存；当前 profile 的 v1 spec 为严格空对象、最大 4096 UTF-8 字节，Reality 参数继续使用原列 | 可重复地增加三数据库字段而不回填或重建密钥，保持旧配置字节/hash；profile/version allowlist 和读取重验为后续判别 spec 留出边界，同时拒绝完整 Xray JSON |
+| `XRAY-ADR-047` | 已确认 | 以本地 3x-ui 当前后端的协议集合和创建页传输集合建立明确对照目标，但按 ForwardX 类型化 profile 逐项验证，不复制任意组合；TUN 不算普通 inbound，MTProto/AmneziaWG 使用独立服务 | 用户明确要求支持 3x-ui 所列协议。参考代码当前普通协议为 VLESS/VMess/Trojan/Shadowsocks/Hysteria/WireGuard/HTTP/Mixed/Tunnel，传输为 RAW/mKCP/WS/gRPC/HTTPUpgrade/XHTTP；TUN 仅保留旧数据渲染，MTProto/AmneziaWG 由外部进程或接口承载 |
+| `XRAY-ADR-048` | 已确认 | 通用账户使用可空唯一 `legacyClientId` 显式关联旧 `xray_clients`，不得依赖两个表的自增 id 相同；通用 secret 以资源+kind 唯一并由服务层执行有作用域 fingerprint 判重 | 双写期间新协议和旧 API 会分别推进序列，隐式复用 id 会碰撞。显式映射允许幂等回填、双读/双写和回滚，同时不把旧表结构强加给新协议 |
+| `XRAY-ADR-049` | 已确认 | 通用 access settings v1 使用按 credentialType 选择的严格 4096-byte schema；secret kind 使用固定枚举和凭据策略。旧 UUID/shortId/Reality 的 AAD/fingerprint context 保持字节兼容，其他类别以独立 field 隔离 | 防止 settingsJson 退化成任意 Xray JSON，并允许旧密文无重加密迁移。WireGuard 等尚未验证的非敏感设置以后通过新 schema 版本增加，不在 v1 预留任意对象 |
+| `XRAY-ADR-050` | 已确认 | `VLESS_GRPC_REALITY` 第一版只开放严格 `serviceName`、固定 `multiMode=false`、空 authority 和无 Vision flow | 先交付可验证、可分享的最小 gRPC Reality 组合，避免复制 3x-ui 的任意高级字段；后续字段必须作为新 spec 版本重新验证 |
+| `XRAY-ADR-051` | 已确认 | VLESS gRPC 在旧表仍非空的过渡期原子双写真实 UUID/shortId/Reality 列和通用 access 表，flow 精确映射为空字符串/`NONE`；非 VLESS profile 必须使用 generic-only 路径 | gRPC 只改变 VLESS 传输，凭据语义与现有 VLESS 完全相同，可复用已验证的删除、备份和密钥生命周期；禁止把这个过渡例外扩大到 password/其他协议或写入虚假 legacy 值 |
+| `XRAY-ADR-052` | 已确认 | `VLESS_XHTTP_REALITY` v1 只开放严格 path，固定 auto mode、空 host/headers 和无 Vision；不照搬 3x-ui 的 padding、xmux、placement、downloadSettings 等高级项 | 固定 `v26.3.27` 已确认 Reality 只允许 RAW、gRPC、XHTTP；先交付能由 URI 完整表达并真实连接的最小互操作组合，高级字段以后必须作为新 spec 版本单独批准和验证 |
+| `XRAY-ADR-053` | 已确认 | ADR-051 的 VLESS 过渡双写例外扩展到 `VLESS_XHTTP_REALITY`，继续只写真实 UUID/shortId/Reality 凭据并把空 flow 映射为 `NONE` | XHTTP 同样只改变 VLESS 传输，不改变账户凭据语义；该例外仍不得用于 Trojan、VMess 或任何需要 password/其他凭据的 profile |
+| `XRAY-ADR-054` | 已确认 | `TROJAN_RAW_REALITY` 使用 generic-only PASSWORD 账户、32-byte canonical base64url 随机密码、空 spec 和无 flow/fallback | Xray `v26.3.27` 的 Trojan account 只有 password，不支持 VLESS flow 字段；generic-only 路径避免伪造 UUID/shortId，也为后续其他 password 协议复用加密、删除和脱敏边界 |
+| `XRAY-ADR-055` | 已确认 | TLS 第一版使用主机级面板托管 PEM 证书资源：公开链明文、私钥以稳定 certificateTag 绑定 AEAD；同主机 inbound 引用，固定 `v26.3.27` 内联下发，不接受 Agent 路径 | 用户确认面板托管方案。主机作用域避免一次轮换跨多主机 generation；Xray 固定版本原生支持内联 certificate/key，复用完整快照、config test、原子切换和 last-good，无需建立第二套证书文件权威 |
+| `XRAY-ADR-056` | 已确认 | 创建 Dialog 采用“基础配置/协议/传输/安全/账户/确认”分区，选项始终从服务端可用 profile 派生；只借鉴 3x-ui 的信息架构，不复制任意字段或组合 | 用户要求改进现有 UI 并提供 3X-UI 参考。分区降低多协议表单复杂度，同时清除不兼容隐藏字段并继续排除 fallback、sniffing、路由和高级 JSON |
+| `XRAY-ADR-057` | 已确认 | VLESS/Trojan TLS 锁定 13 个独立 profile：VLESS RAW 分标准 TLS 与 Vision，其余传输无 flow；只开放空 spec、严格 path 或严格 serviceName 的最小组合 | 参考界面明确提供禁用 XTLS flow 开关，而 Xray 仅允许 RAW TCP + TLS/Reality 使用 Vision。独立 profile 避免隐藏 flow；固定 `v26.3.27` 已对 13 个最小配置完成 `run -test`，每项仍须真实连接后才可用 |
+| `XRAY-ADR-058` | 已确认 | mKCP TLS profile 保留在 3x-ui 对照目标，但因其真实监听为 UDP，必须等待 TASK049 的 Agent v2 UDP 探测、readiness 和 network-aware reservation 后再开放 | 原 TASK047 顺序把 mKCP 放在 UDP 合同之前，与“监听和真实连接后开放”的验收门槛冲突。配置测试无法证明 UDP socket 被受管 PID 正确监听，也不能提供安全回滚证据 |
+| `XRAY-ADR-059` | 已确认 | TLS 分享链接始终携带所选叶证书 SHA-256 `pcs`、规范化 SNI 和 chrome fingerprint，不使用 `allowInsecure`；轮换证书后必须重新分发链接 | 受管导入允许自签证书，单靠系统 CA 无法连接；固定核心和当前分享标准支持 `pinnedPeerCertSha256/pcs`。固定叶证书同时适用于公开 CA 和自签证书，但轮换会有意使旧 pin 失效 |
+| `XRAY-ADR-060` | 已确认 | TLS 复用 `realityServerName` 保存真实 SNI，其他 Reality-only 非空旧列写固定中性兼容值并按 profile 忽略；VLESS TLS 使用 generic-only UUID v2，不写 shortId、旧 client 或 Reality secret | 避免三数据库重建现有非空列，也不伪造或重复加密凭据。profile/security 是解释旧列的唯一判别；TLS 私钥继续只存在主机证书资源中，UUID v2 区分既有 VMess UUID v1 语义 |
+| `XRAY-ADR-061` | 已确认 | VMess/Shadowsocks 首个兼容切片只实施 `VMESS_RAW_TLS` 和 `SHADOWSOCKS_2022_RAW_NONE`，并通过 catalog `CORE_DEPRECATED` 在 UI 显示核心废弃告警 | 两协议在固定 `v26.3.27` 语法可用但核心明确建议迁移；以最小可互操 profile 满足 3x-ui 协议对照，不将其任意传输/安全组合变成产品承诺 |
+| `XRAY-ADR-062` | 已确认 | Shadowsocks 固定 AES-256-GCM SS2022 多用户模式，inbound/user 各持服务端生成的 32-byte canonical base64 PSK；启用中禁止移除最后一个有效账户 | 固定核心的 SS2022 multi-user 只允许 AES method，客户端凭据是 `server:user` 双 PSK。`clients=[]` 会切到仅服务端 PSK 的单用户语义，若仍编译启用 inbound 会意外扩大凭据面 |
+| `XRAY-ADR-063` | 已确认 | UDP 使用 v1 envelope 上的两个可选 capability 位 `supportsUdpPortProbe`/`supportsUdpListenerReadiness`，缺失按 false；listener/PORT_PROBE 只扩展 `tcp\|udp`，端口身份为 host/network/port | 这是对旧面板和旧 Agent 均安全的加法：旧面板会忽略新 capability 字段并继续只下发 TCP，旧 Agent 会拒绝未知 UDP network；无需仅为扩大受 capability 门控的枚举复制整套 v2 envelope。UDP probe 单 task 单端口，避免形成任意范围扫描；TCP/UDP 同端口互不冲突，`both` 不进入 Xray 合同 |
+| `XRAY-ADR-064` | 已确认 | Hysteria 2 首版只开放 TLS-only `HYSTERIA2_TLS`：严格空 spec、固定 Hysteria v2/h3/60 秒 UDP idle、generic-only 32-byte base64url auth，并以标准 URI 的 `pinSHA256` 分发受管叶证书指纹 | 固定 `v26.3.27` 已通过正确/错误 auth、叶 pin、受管 UDP readiness、混合 last-good 和真实客户端验收且无需 `allowInsecure`，050E 后 profile 标记为 `AVAILABLE`。3x-ui 的带宽、跳端口、masquerade、obfs、FinalMask/ECH 等高级组合以后必须作为新 spec/profile 单独批准和验证 |
+| `XRAY-ADR-065` | 已确认 | Shadowsocks 原生 UDP 新增独立 `SHADOWSOCKS_2022_RAW_TCP_UDP_NONE`，不改变现有 TCP-only profile；双网络创建复用两个单网络 Agent probe，并以 additive `portReservations` 同时验证/消费 TCP、UDP 预留 | 固定核心实测 `settings.network=tcp,udp` 会在同一端口创建两个 socket，现有节点只持有 TCP 预留，静默改义可能撞上既有 UDP 服务。Agent v1 明确拒绝 `both`，复用已验证的单网络任务可避免新增 capability/envelope，同时 profile 的双 expected listener 仍能逐项收敛 |
+| `XRAY-ADR-066` | 已确认 | 第一版禁止通过仅有单 reservation 的既有 update API 修改双网络入站端口；其他入站与账户写操作继续支持并按 UDP capability 门控 | 允许单预留端口迁移会在另一个网络未探测、未占位时制造竞争窗口，违背 ADR-065 的原子双预留边界。先安全拒绝，再以独立 additive 合同补齐，比暗中复用或扩展 `both` 更可回滚 |
+| `XRAY-ADR-067` | 已确认 | WireGuard 首版锁定 `WIREGUARD_UDP_NONE`：固定 gVisor/MTU 1420/IPv4 `10.0.0.0/24`，服务端生成 server/peer X25519 key 与每 peer PSK，分享标准 IPv4 全隧道 `.conf`；不开放 kernel TUN 或高级字段 | 官方文档确认 WireGuard inbound 是 userspace UDP，固定 `v26.3.27` 源码的 server 只实现 UDP 且 inbound 不支持 kernel TUN。临时双 peer 探针用唯一 `.2/32`、`.3/32` 在同一 inbound 均真实连通；固定 userspace 模式无需新增宿主机 TUN 权限，同时严格 profile 避免把 3x-ui 的任意 key/subnet/route 字段变成透传入口 |
+| `XRAY-ADR-068` | 已确认 | HTTP 首版只开放 `HTTP_RAW_NONE` 管理代理：RAW/TCP、无 TLS、非透明模式，并强制至少一个服务端生成的 Basic 认证账户 | 固定 `v26.3.27` 的 HTTP inbound 原生支持 accounts；空 accounts 不会执行认证，公开监听会成为开放代理。最小强制认证 profile 可复用现有 TCP reservation、完整快照、Agent readiness 和 last-good，不引入透明转发或任意配置 |
+| `XRAY-ADR-069` | 已确认 | HTTP 账户使用独立 `HTTP_BASIC` credential，用户名和密码均作为资源绑定 secret 加密；显示名称与登录用户名解耦，分享为按需 `private, no-store` 的标准认证型 HTTP proxy URL | 复用显示名称会使改备注隐式轮换登录身份，复用 PASSWORD 又无法表达两个必需 secret。独立类型可让创建 API 继续只接收名称、普通 DTO 继续禁密，并使缺失任一凭据时配置生成安全失败 |
+| `XRAY-ADR-070` | 已确认 | SOCKS/Mixed 首版只开放 `MIXED_RAW_NONE`：固定核心同一 TCP listener 上的密码认证 SOCKS5 + HTTP/CONNECT，使用独立 `MIXED_USER_PASSWORD` 双 secret；不宣传或兼容 SOCKS4/4a | `v26.3.27` 把 `mixed`/`socks` 都解析为 `SocksServerConfig` 并内嵌 HTTP server；密码模式会明确拒绝 SOCKS4。独立 credential 避免把 HTTP Basic 或通用 password 的名称误当成整个组合协议的认证合同 |
+| `XRAY-ADR-071` | 已确认 | `MIXED_RAW_NONE` 固定 `udp=false`，不复制 3x-ui 的 UDP 开关；分享只按需返回一组 `socks5://` 与 `http://` 管理代理地址，不进入订阅 | 固定核心的 SOCKS UDP 认证过滤只按来源 IP 放行且不可靠绑定 TCP association 生命周期，共享 NAT 下存在认证绕过面，不能满足公网认证不变量。3x-ui 本身也不为 Mixed 生成订阅 URL；结构化双地址明确表达同一 listener 的两种客户端入口 |
+| `XRAY-ADR-072` | 已确认 | Tunnel 首版只开放 `TUNNEL_TCP_LOCAL_NONE`：固定 `127.0.0.1` 单 TCP listener、严格目标地址/端口、`followRedirect=false`、默认 direct outbound、零账户与零分享 | Xray Tunnel/Dokodemo 没有客户端认证能力；按 MP007 暴露 wildcard/LAN/公网会形成未经认证入口。回环监听提供可验证的访问边界，同时保留给主机本地进程或经管理员另行建立的 SSH/系统隧道使用的固定端口转发能力 |
+| `XRAY-ADR-073` | 已确认 | 固定 `v26.3.27` 的 Tunnel 编译使用 `address/port/network` 旧字段，不复制当前 3x-ui 的 `rewriteAddress/rewritePort/allowedNetwork/portMap`，也不开放透明代理或路由 | 3x-ui 参考版本依赖更新的 Xray 源码，而 ForwardX 固定 tag 的 `DokodemoConfig` 仍读取旧字段；混用新字段会被核心忽略并产生错误目标/网络语义。任意 portMap、followRedirect/TProxy 和 outbound 选择还会越过现有严格 profile、无防火墙管理及无任意路由边界 |
+| `XRAY-ADR-074` | 已确认 | 独立服务第一片只实现 `MTPROTO_FAKE_TLS`；固定 `mtg-multi v1.15.0`、一服务一子进程、linux/amd64 与 linux/arm64，并通过独立 `managedServices` desired/observed 合同管理 | Xray-core 不实现 MTProto；固定 sidecar 能在不污染 inbound/configJson 的情况下复用面板到 Agent 的单向期望状态。制品版本、URL、大小与 SHA-256 固定，不跟随 latest，Agent 仍只从受鉴权面板下载。 |
+| `XRAY-ADR-075` | 已确认 | MTProto 子进程不继承 Agent 的 root 权限：安装器维护无登录专用账户 `forwardx-mtproto`，Agent 只以固定 binary + `run` + 受管 config path 启动，端口限定 `1000..65535`，不授予 Linux capability | MTProto 只需普通 TCP listener。专用 UID、私有目录和无额外 capability 将 sidecar compromise 与 root Agent/其他配置隔离；不接受 shell、任意参数、任意路径、任意 service 或环境变量覆盖。 |
+| `XRAY-ADR-076` | 已确认 | MTProto v1 只开放统一 FakeTLS 域名和服务端生成的每账户 secret；不开放 API listener、ad-tag、quota/expiry、domain-fronting IP、代理链、PROXY protocol、throttle、流量统计或路由 | 这是可用且能严格验证的最小 Telegram proxy。面板 DB 保存结构化服务与资源绑定密文；Agent 从判别联合生成固定 TOML，配置变更首版使用可回滚重启，不把 mtg 的高级配置面暴露成任意设置。 |
+| `XRAY-ADR-077` | 已确认 | TASK053 先完成 MTProto 合同、制品、supervisor、CRUD/分享和 UI，再集中验证；TUN 与 AmneziaWG 保持未实现并分别重新确认 | TUN 需要 `CAP_NET_ADMIN` 和明确用例；当前 AmneziaWG 安全实现需要单独选择内嵌 userspace netstack 或受限 sidecar。三种运行时的权限和回滚模型不同，不能以一个通用开关同时开放。 |
+| `XRAY-ADR-078` | 已确认 | AmneziaWG 首片采用当前 ForwardX Agent 二进制的固定低权限 helper 子命令，内嵌官方 `amneziawg-go/v3 v3.1.20260814` 与 gVisor userspace 栈；不使用内核 TUN、awg-quick、DKMS、iptables/nftables 或 `CAP_NET_ADMIN` | 用户在 2026-09-03 明确要求继续行动并启用多 Agent 开发。固定 helper 保留独立 UID 和进程故障边界，同时免除第三方 helper 制品供应链；官方模块 `go.mod` 要求 Go 1.25，因此 Agent 基线同步升级。来源：[官方仓库](https://github.com/amnezia-vpn/amneziawg-go)、[固定 tag go.mod](https://raw.githubusercontent.com/amnezia-vpn/amneziawg-go/v3.1.20260814/go.mod)。 |
+| `XRAY-ADR-079` | 已确认 | AmneziaWG v1 固定 IPv4 公网全隧道、`10.8.1.0/24`、MTU 1420、固定 DNS、多 peer 与服务端随机 AWG 3.1 混淆；所有非公网和本机目的地址均在 helper 内 fail closed | 3x-ui 的表单字段用于语义对照，但其任意 key/混淆/JSON、IPv6 alias、外部网卡和 forwardedPorts 不适合 ForwardX 单向控制边界。公网 allow policy 防止受管 VPN 变成到 Agent/面板/云 metadata/宿主私网的跳板。参数含义以[官方 AmneziaWG 文档](https://docs.amnezia.org/documentation/amnezia-wg/)为准。 |
+| `XRAY-ADR-080` | 已确认 | `managedServices` 继续使用一个 host-wide generation/hash；capability 增加可选 per-kind 描述，desired/observed 增加严格 `AMNEZIAWG` 分支。服务级 server/header key 使用新 instance-secret 表，peer settings 扩展现有 account 表，peer private key/PSK 扩展现有 account-secret 表 | 旧 Agent 没有 per-kind AWG capability 时新面板不会下发；旧面板可忽略新增 capability 字段并继续识别 legacy MTProto 字段。独立 service secret 避免伪造 server account，也保证 tombstone/last-good 确认前不提前删除密钥。 |
+| `XRAY-ADR-081` | 已确认 | AWG desired 显式携带规范化 service `publicAddress`，Agent 以仅本地 wrapper 合并当前 panel URL hostname；helper 周期刷新这些 hostname 的 A 记录和本机接口地址，任一配置 hostname 未解析时保持数据面运行但全部出口 fail closed；panel URL 变更使用带 revision 的 `TRANSITION`/`STABLE` 本地策略、kind-root durable pin 和两次严格权限 ACK，文件与父目录 `fsync` 后才切换或解除 hold；未变更 revision 的周期重读不中断会话 | 新鲜上下文安全审查发现，仅在 helper 启动时快照本机接口无法阻止云 NAT 公网地址、远程面板公网地址或后续新增接口。串行两阶段刷新避免新面板的短暂策略空窗；durable pin 又确保进程终止、service 目录替换或 Agent 重启也不会意外放行。该补强不下发完整 panel URL、不进入 observed/log，也不增加系统网络权限。 |
+| `XRAY-ADR-082` | 已确认 | inbound 删除 mutation 受理后关闭详情、清除 URL 身份并由父列表刷新，不再 refetch 被删详情 | 删除 operation 可能在成功回调后的首次 refetch 前完成 observed 收敛并物理清理记录；此时详情 `NOT_FOUND` 是正常竞态，不应被界面误报为删除失败。列表仍负责展示尚未收敛的 tombstone。 |
+| `XRAY-ADR-083` | 已确认 | 外部出口节点使用全局类型化资源，首版只导入 VLESS RAW/TCP + Reality + Vision、Shadowsocks 和 SOCKS5；同一资源可独立用于 Xray outbound 或 Realm/GOST TCP 原始端口中转 | 用户明确需要一个美国节点既能进入 Xray 配置作 outbound，也能让香港主机只按目标 IP/端口中转。两者运行语义不同，不能把 Realm/GOST 描述成代理协议客户端。 |
+| `XRAY-ADR-084` | 已确认 | 导入链接只在请求内解析，原始 URI 不持久化；公开规范设置与资源绑定 AEAD secret 分表保存，普通 DTO 只返回凭据配置状态 | 链接包含 UUID、shortId、密码或用户名。严格拆分能复用现有密钥轮换/备份/脱敏边界，并避免列表、错误和数据库普通列形成第二份凭据。 |
+| `XRAY-ADR-085` | 已确认 | Xray 出口选择只按 inbound 稳定 runtimeTag 生成确定性 routing rule；仍下发完整主机配置和 generation/hash，缺失或损坏出口 fail-closed，不回退 direct | 按端口路由可能误匹配其他流量，增量 outbound 命令会破坏面板唯一权威和 last-good。完整快照允许 Agent 继续不理解出口协议细节。 |
+| `XRAY-ADR-086` | 已确认 | Realm/GOST 引用出口时把公开 endpoint 物化进既有规则配置，首版仅 TCP 且禁止向上游发送 PROXY Protocol；派生中转链接只替换 authority | Realm/GOST 是 L4 转发器，目标服务器仍负责 VLESS/SS/SOCKS 握手。物化 endpoint 保持旧 Agent 合同兼容，禁止前置字节避免破坏代理握手；保留凭据/SNI/公钥才能让派生链接继续认证真实出口。 |
+| `XRAY-ADR-087` | 已确认 | 出口节点仅管理员可管理；被 inbound/规则引用时禁止删除和除名称外的变更，界面用稳定 id 联动显示引用 | 端点或密钥原地变化会同时触发多主机 Xray generation 和多条规则更新，首版以显式解绑/重绑避免部分成功、静默换路与跨主机事务。 |
+| `XRAY-ADR-088` | 已确认 | 外部出口节点的规则目标引用扩展到 iptables、nftables、Realm、socat、GOST、Nginx 六种现有本地转发方式，继续固定 TCP、物化公开 endpoint、禁止上游 PROXY Protocol，并复用既有隧道/转发组最终出口语义 | 用户明确要求覆盖 ForwardX 已有六种本地转发工具。六者都只需转发到公开 `address:port`，现有 Agent 已分别具备用户态域名处理或内核转发 DNS 物化/重建路径，因此无需下发代理凭据、修改 Agent 合同或引入新运行时。 |
+| `XRAY-ADR-089` | 已确认 | 外部 VLESS RAW Reality Vision 导入允许 `fp=chrome|random`，并把 authority 后的空路径与单个 `/` 规范为同一无业务路径输入；指纹必须在存储、Xray outbound 和重建链接中原样保留 | 用户提供的常见客户端链接同时包含 `:port/?...` 与 `fp=random`。固定 Xray `v26.3.27` 源码明确注册 `random` 为启动时从现代浏览器集合选择的预设，3x-ui 也透传 Reality 指纹；采用两个显式字面量可兼容该生态格式，同时避免开放任意 uTLS 名称或把 `random` 静默降级为 `chrome`。 |
+
+| `XRAY-ADR-090` | 已确认 | 系统设置增加可扩展 DNS provider account，首版只允许一个全局 DNSPod 账号；SecretId/SecretKey 使用稳定账户身份绑定 AEAD，不复用既有 DDNS 明文设置作为快速配置权威 | 快速配置需要长期、可审计地调用外部 DNS API。独立账户/secret 模型既满足当前单账号交互，也避免未来多账号或其他服务商时重建表结构；明文双写会扩大凭据泄漏面。 |
+| `XRAY-ADR-091` | 已确认 | 快速配置第一步使用“DNSPod zone 下拉 + 相对多级主机记录”，不支持 `@`/通配符；检查通过后必须再次确认，同名 A/AAAA/CNAME 只在最终提交时显式替换，TXT/MX/CAA 保留 | 用户明确要求只填写 `dfd` 生成 `dfd.cocbc.com`，多 zone 可选择且不能绕过检查。延迟替换和类型白名单避免在向导取消或转发失败时破坏既有网站、验证或邮件记录。 |
+| `XRAY-ADR-092` | 已确认 | 电信、联通、移动、教育网分别选择多个 `host + IPv4|IPv6` 入口；DNSPod lineId 动态获取。同一 host 的多线路共用一个实际规则 | 运营商线路和可用 lineId 取决于 DNSPod 域名/套餐，不能硬编码；按实际监听去重可以避免同端口重复进程，同时保留多条 A/AAAA 解析关系。 |
+| `XRAY-ADR-093` | 已确认 | 增加不区分 TCP/UDP 的持久全局端口分配层；新 Xray listener 跨全部 host 按端口数字唯一。ADR-063 的 `host+network+port` 继续限定 Agent 探测/监听合同，但不再代表面板允许端口复用 | 用户要求 A 主机 Xray 使用 5556 后 B 主机不得再创建 5556，且所有服务器共享已用端口库。分离底层探测身份和上层分配策略能保持已发布 Agent 合同兼容，同时实施更严格的新业务规则。 |
+| `XRAY-ADR-094` | 已确认 | TASK057 快速配置只使用 Realm；TASK058 扩展为一次配置统一选择 iptables、nftables、Realm、socat、GOST、Nginx 之一。生成项始终是普通 `forward_rules` 正式记录并显示快速配置归属 | 先用单一已存在运行时收敛跨 DNS/多 Agent 编排，再复用 TASK056 的六引擎兼容矩阵。正式规则记录可直接获得现有状态、日志和清理能力，避免隐藏的第二套运行时。 |
+| `XRAY-ADR-095` | 已确认 | 优先使用落地原端口；冲突时受管 Xray 由用户选新入口端口，外部节点由系统推荐后确认，目标原端口不变。端口确定后再决定默认线路 | DNS 不能表达端口。先确定唯一客户端端口，才能判断默认线路能否直达落地或必须选择一个受管转发入口，避免外部节点在改写端口后生成不可连接的默认解析。 |
+| `XRAY-ADR-096` | 已确认 | 快速配置使用持久 saga 管理规则、DNS 和端口；删除后的无引用端口进入待扫描，每 12 小时只对无 Xray/规则引用项做不重叠全主机占用校准，离线或无法确认时不释放 | 外部 DNS 与多台 Agent 无法由单数据库事务原子提交。持久阶段、补偿和保守回收避免部分成功、并发重用及端口永久泄漏；有效逻辑引用无需重复实际扫描。 |
+| `XRAY-ADR-097` | 已确认 | 快速配置 operation step 的资源型 `subjectId` 使用对应数据库主键的规范十进制字符串，并在结构化迁移时按目标 ID 重映射；域名和端口 subject 只保存规范安全值 | step 必须能在重启后精确恢复资源，同时数据库迁移会改变内部 ID；显式闭合语义可避免 worker 操作旧 ID，也不把 provider 原始标识或敏感连接材料放入通用 subject 字段。 |
+| `XRAY-ADR-098` | 已确认 | DNS 托管记录和替换快照使用同一 `quick-config-dns-tuple:v1` 固定字段哈希；057D 阶段 operation/step 摘要只允许 `{}`，后续 worker 必须按 kind 增加版本化字段白名单 | 只校验 64 位哈希外形无法证明恢复材料属于当前 tuple，敏感键黑名单也可被通用 `value/payload` 绕过；共享重算和默认拒绝未知摘要可在 saga 上线前关闭这两个恢复边界。 |
+| `XRAY-ADR-099` | 已确认 | domain check/confirmed token 使用从持久 cookie secret 以 quick-config 专用 context 派生的版本化 HMAC-SHA256；confirm 再次实时读取远端精确 record set，recordRef 只暴露用途隔离的 MAC | 无状态短期 token 可跨面板进程与正常重启验证，同时不把 DNSPod provider recordId 暴露给浏览器；purpose、管理员、账号/binding revision、zone、目标版本、记录集合、action 和过期时间的完整绑定关闭跨步骤替换与远端竞态。cookie secret 轮换只会使最长 10 分钟的未提交向导安全失效。 |
+| `XRAY-ADR-100` | 已确认 | 快速配置用独立管理员查询列出 Realm 入口候选，只投影 hostId、名称、可选状态、稳定禁用码和经公网策略过滤的 IPv4/IPv6 endpoint；资格复用新鲜在线状态、现有 TCP/UDP 探测与 UDP listener readiness capability 及 Realm 系统开关 | 普通 host options 暴露了向导不需要的内部主机字段，Xray host options 又只有 IPv4 且错误地要求 Xray 制品。Realm 没有独立的预安装 observed 报告，因此目录只表达可验证的编排前置条件，最终端口检查/apply 仍须重验并以真实规则 readiness 为准。 |
+| `XRAY-ADR-101` | 已确认 | TASK058 六引擎目录固定复用共享 `FORWARD_TYPES`、系统全局开关、公开 IPv4/IPv6 和 Agent `2.2.192` + 现有双网络探测/readiness 基线，对全部已选入口取交集；不增加 Agent payload，旧 Agent/缺字段禁用。创建只用一种 engine，切换同端口采用持久 break-before-make 与旧规则恢复 | 六种普通规则 action 已存在，但没有可安全公开的逐二进制能力报告；固定到包含现有六种 action 和 quick-config 所需探测合同的 Agent 基线，比从 OS 文本、运行中规则或文件路径猜测更保守。相同端口不能并行监听，因此界面必须承认短暂中断，失败时恢复旧 engine 而不是混用或静默回退 Realm。 |
+| `XRAY-ADR-102` | 已确认 | 隧道主监听、附加出口、hop、规则 tunnel exit 和 ForwardX v2 mimic UDP 端口统一加入全局端口账本；更换端口时先持有 staged `OWNERSHIP` 再根据 Agent 完整运行快照促进，删除后也只在完整快照确认监听消失后释放 | 先放旧端口会在 Agent 尚未完成切换时被其他资源抢占。Agent 因此只为 `localState.tunnels[]` 增加可选的运行观测 `udpPort`；旧 Agent 在仍报告 tunnel 时缺少该字段按未知处理，保守保留 mimic 引用，而不用缓存、签名或猜测状态提前释放。 |
+| `XRAY-ADR-103` | 已确认 | 快速配置创建提交接口命名为 `xray.quickConfigs.createApply`；禁止使用 tRPC 保留的 `apply` 作为 procedure 名称 | tRPC 会在路由初始化时拒绝 Object prototype 保留字；显式区分 create/edit/remove apply 可保持契约清晰，并避免生产进程在监听前退出。 |
+| `XRAY-ADR-104` | 已确认 | 快速配置继续一次性收集默认及运营商线路选择，但 DNSPod 执行层按动态线路类别把全部 `DEFAULT` A/AAAA 排在 carrier create/replace 前；不改变 preview、向导或持久拓扑语义 | DNSPod 官方 CreateRecord 合同要求先存在默认线路记录，并提供专用 `FailedOperation.MustAddDefaultLineFirst` 错误。顺序必须由已验证的动态 category 决定，不能硬编码 lineId，也不能把 provider 限制转嫁给用户操作流程。 |
+| `XRAY-ADR-105` | 已确认 | DNSPod 新建后的可见性验证使用最多 30 秒的有界轮询；RETRY 接管未登记远端记录时必须同时证明前序同配置 DNS_CREATE 已尝试、tuple 唯一精确匹配且 provider recordId 无其他面板归属 | 生产 operation #4 已证明 CreateRecord 可成功写入，但紧接着的查询仍暂时不可见，导致数据库未保存 recordId。DNSPod [CreateRecord 官方文档](https://cloud.tencent.com/document/api/1427/56180)明确提示新增记录存在短暂索引延迟、查询不到时应在 30 秒后重试；仅凭 tuple 自动接管又会越过第三方记录保护，因此必须绑定持久前序 intent。 |
+| `XRAY-ADR-106` | 已废弃 | 链路管理将未绑定资源组/隧道的普通本地根规则作为只读“独立转发规则”明细区展示 | 规则级投影能找到服务器 B，但把其放在主卡片区下方不符合链路管理的主机视角；由 `XRAY-ADR-107` 取代。 |
+| `XRAY-ADR-107` | 已废弃 | 独立本地根规则按真实 `hostId` 聚合后，以同级主机卡片/表格行显示在“端口转发”主列表；不伪造 `forward_groups`，不显示下方规则明细区 | 用户进一步澄清：B 应显示与 `dfaf` 相同语义的真实可控端口资源，不是标为“实际规则”的只读主机汇总；由 `XRAY-ADR-108` 取代。 |
+| `XRAY-ADR-108` | 已确认 | 快速配置规则通过独立 `portResourceGroupId` 归属真实 `port` 资源；唯一已启用同 owner/host/engine 资源复用，否则幂等创建“快速配置默认生成”系统资源。引用计数合并，存在快速引用时锁定停用/破坏性变更 | `forwardGroupId` 已承担模板与运行时派生语义，不能复用。独立归属让 A 的 `dfaf` 正确显示 2 条引用、B 获得同类真实资源卡片，同时保持快速配置规则仍是唯一数据面且不触发额外 Agent 下发。 |
+
+## 更新规则
+
+- 状态使用“已确认”“建议，待确认”“已废弃”；当前没有“建议，待确认”项。
+- 需求行为改变时同时更新 `SPEC.md`，协议/数据库/安全细节分别更新对应权威文档。
+- 实施中发现的新事实先记录为建议，不自行扩大第一版范围。
+- 直接参考或复制 3x-ui 代码的许可决定需要新增 ADR，不能只写在提交信息中。

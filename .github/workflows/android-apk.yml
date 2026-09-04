@@ -1,0 +1,244 @@
+name: Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: APK build type for manual runs
+        required: true
+        type: choice
+        default: release
+        options:
+          - release
+          - debug
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: forwardx-release-android-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-android-apk:
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Resolve release version
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_BUILD_TYPE: ${{ github.event.inputs.build_type || 'release' }}
+        run: |
+          PANEL_VERSION="v$(node -p "require('./package.json').version")"
+          ANDROID_VERSION="v$(node -e "const fs=require('fs');const text=fs.readFileSync('shared/versions.ts','utf8');const match=text.match(/ANDROID_APP_VERSION\\s*=\\s*['\\\"]v?([^'\\\"]+)['\\\"]/);if(!match)throw new Error('ANDROID_APP_VERSION not found');process.stdout.write(match[1]);")"
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="$GITHUB_REF_NAME"
+            PUBLISH_RELEASE=true
+          elif [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == "refs/heads/main" ]]; then
+            VERSION="$PANEL_VERSION"
+            PUBLISH_RELEASE=true
+          else
+            VERSION="$ANDROID_VERSION"
+            PUBLISH_RELEASE=false
+          fi
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$MANUAL_BUILD_TYPE" == "debug" ]]; then
+            BUILD_TYPE=debug
+          else
+            BUILD_TYPE=release
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "android_version=$ANDROID_VERSION" >> "$GITHUB_OUTPUT"
+          echo "publish_release=$PUBLISH_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "build_type=$BUILD_TYPE" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check release versions and tag
+        env:
+          FORWARDX_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: pnpm check:versions
+
+      - name: Type check and test shared application code
+        run: |
+          pnpm exec tsc --noEmit
+          pnpm test:server
+
+      - name: Check existing Android APK
+        id: existing_apk
+        if: steps.release.outputs.publish_release == 'true' && steps.release.outputs.build_type == 'release'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const androidVersion = '${{ steps.release.outputs.android_version }}';
+            const releaseTag = '${{ steps.release.outputs.version }}';
+            const expectedName = `forwardx-android-${androidVersion}.apk`;
+            let existing = false;
+            try {
+              const { data: release } = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: releaseTag,
+              });
+              existing = (release.assets || []).some((asset) => asset.name === expectedName);
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            core.setOutput('exists', existing ? 'true' : 'false');
+            if (existing) {
+              core.notice(`Android APK ${expectedName} already exists in ${releaseTag}; skipping APK rebuild for this panel release.`);
+            }
+
+      - name: Build web assets
+        if: steps.existing_apk.outputs.exists != 'true'
+        run: pnpm build:client
+
+      - name: Sync Capacitor Android project
+        if: steps.existing_apk.outputs.exists != 'true'
+        run: pnpm exec cap sync android
+
+      - name: Prepare Gradle wrapper
+        if: steps.existing_apk.outputs.exists != 'true'
+        run: chmod +x android/gradlew
+
+      - name: Prepare release signing
+        id: signing
+        if: steps.existing_apk.outputs.exists != 'true'
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -n "$ANDROID_KEYSTORE_BASE64" && -n "$ANDROID_KEYSTORE_PASSWORD" && -n "$ANDROID_KEY_ALIAS" && -n "$ANDROID_KEY_PASSWORD" ]]; then
+            mkdir -p android/app/keystore
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/app/keystore/release.jks
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "source=secrets" >> "$GITHUB_OUTPUT"
+            echo "keystore_file=keystore/release.jks" >> "$GITHUB_OUTPUT"
+            echo "keystore_type=" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "source=missing" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require release signing
+        if: steps.existing_apk.outputs.exists != 'true' && steps.release.outputs.build_type == 'release' && steps.signing.outputs.signed != 'true'
+        run: |
+          echo "Release APK signing secrets are not configured."
+          echo "Add ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD."
+          echo "Use a workflow_dispatch debug build only for local testing."
+          exit 1
+
+      - name: Build release APK with secret signing
+        if: steps.existing_apk.outputs.exists != 'true' && steps.release.outputs.build_type == 'release' && steps.signing.outputs.source == 'secrets'
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_FILE: ${{ steps.signing.outputs.keystore_file }}
+          ANDROID_KEYSTORE_TYPE: ${{ steps.signing.outputs.keystore_type }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease
+
+      - name: Build debug APK
+        if: steps.existing_apk.outputs.exists != 'true' && steps.release.outputs.build_type == 'debug'
+        working-directory: android
+        run: ./gradlew assembleDebug
+
+      - name: Rename APK
+        if: steps.existing_apk.outputs.exists != 'true'
+        shell: bash
+        run: |
+          VERSION="${{ steps.release.outputs.version }}"
+          ANDROID_VERSION="${{ steps.release.outputs.android_version }}"
+          mkdir -p dist/android
+          if [[ -f android/app/build/outputs/apk/release/app-release.apk ]]; then
+            cp android/app/build/outputs/apk/release/app-release.apk "dist/android/forwardx-android-${ANDROID_VERSION}.apk"
+          else
+            cp android/app/build/outputs/apk/debug/app-debug.apk "dist/android/forwardx-android-${ANDROID_VERSION}-debug.apk"
+            cat > dist/android/README-APK-SIGNING.txt <<'EOF'
+          This APK is debug-signed because release signing secrets are not configured.
+          Debug APKs are for local testing only and are not uploaded to GitHub Releases.
+          To support in-place upgrades, add these repository secrets:
+          ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD.
+          EOF
+          fi
+
+      - name: Upload APK artifact
+        if: steps.existing_apk.outputs.exists != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: forwardx-android-apk
+          path: |
+            dist/android/*.apk
+            dist/android/*.txt
+
+      - name: Upload APK to GitHub Release
+        if: steps.existing_apk.outputs.exists != 'true' && steps.release.outputs.publish_release == 'true' && steps.release.outputs.build_type == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+          files=(dist/android/*.apk)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::Android APK was not generated"
+            exit 1
+          fi
+
+          attempt=1
+          until gh release view "$RELEASE_VERSION" >/dev/null 2>&1; do
+            if [ "$attempt" -ge 120 ]; then
+              echo "::error::GitHub Release $RELEASE_VERSION was not created by the panel workflow within 30 minutes"
+              exit 1
+            fi
+            echo "Waiting for panel workflow to create GitHub Release $RELEASE_VERSION (attempt ${attempt}/120)..."
+            sleep 15
+            attempt=$((attempt + 1))
+          done
+
+          attempt=1
+          delay=8
+          until gh release upload "$RELEASE_VERSION" "${files[@]}" --clobber; do
+            if [ "$attempt" -ge 5 ]; then
+              echo "::error::Android APK upload failed after ${attempt} attempts"
+              exit 1
+            fi
+            echo "Android APK upload failed, retrying in ${delay}s (attempt ${attempt}/5)..."
+            sleep "$delay"
+            attempt=$((attempt + 1))
+            delay=$((delay * 2))
+          done

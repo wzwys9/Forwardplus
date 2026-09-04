@@ -1,0 +1,81 @@
+{
+  "capability": {
+    "schemaVersion": 1,
+    "supported": true,
+    "supervisor": "AGENT_CHILD",
+    "supportsPortProbe": true,
+    "supportsUdpPortProbe": true,
+    "supportsUdpListenerReadiness": true,
+    "supportsRealityScan": true,
+    "supportsArtifactInstall": true,
+    "supportedOS": "linux",
+    "supportedArch": "amd64"
+  },
+  "desired": {
+    "schemaVersion": 1,
+    "generation": 13,
+    "issuedAt": "2026-09-03T08:00:00Z",
+    "targetVersion": "v26.3.27",
+    "configHash": "3333333333333333333333333333333333333333333333333333333333333333",
+    "configEncoding": "JSON_UTF8",
+    "configJson": "{}",
+    "expectedListeners": [
+      {
+        "inboundId": 102,
+        "runtimeTag": "forwardx-inbound-udp-contract",
+        "network": "tcp",
+        "listenAddress": "0.0.0.0",
+        "port": 24456
+      },
+      {
+        "inboundId": 102,
+        "runtimeTag": "forwardx-inbound-udp-contract",
+        "network": "udp",
+        "listenAddress": "0.0.0.0",
+        "port": 24456
+      }
+    ]
+  },
+  "observed": {
+    "xrayStateSignature": "4444444444444444444444444444444444444444444444444444444444444444",
+    "xrayState": {
+      "schemaVersion": 1,
+      "isInstalled": true,
+      "installedVersion": "v26.3.27",
+      "runningVersion": "v26.3.27",
+      "serviceStatus": "RUNNING",
+      "processId": 2145,
+      "binarySha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "appliedGeneration": 13,
+      "appliedConfigHash": "3333333333333333333333333333333333333333333333333333333333333333",
+      "listeners": [
+        {
+          "runtimeTag": "forwardx-inbound-udp-contract",
+          "network": "tcp",
+          "port": 24456,
+          "status": "READY"
+        },
+        {
+          "runtimeTag": "forwardx-inbound-udp-contract",
+          "network": "udp",
+          "port": 24456,
+          "status": "READY"
+        }
+      ],
+      "lastError": null,
+      "observedAt": "2026-09-03T08:00:05Z"
+    }
+  },
+  "task": {
+    "schemaVersion": 1,
+    "taskId": "udp-contract-probe",
+    "type": "PORT_PROBE",
+    "createdAt": "2026-09-03T08:00:00Z",
+    "expiresAt": "2026-09-03T08:00:30Z",
+    "payload": {
+      "network": "udp",
+      "listenAddress": "0.0.0.0",
+      "ports": [24456]
+    }
+  }
+}

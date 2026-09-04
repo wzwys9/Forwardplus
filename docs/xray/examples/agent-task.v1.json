@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "taskId": "01991b5b-38e7-7f22-a676-c42693bded21",
+  "type": "PORT_PROBE",
+  "createdAt": "2026-09-01T08:00:00Z",
+  "expiresAt": "2026-09-01T08:00:30Z",
+  "payload": {
+    "network": "tcp",
+    "listenAddress": "0.0.0.0",
+    "ports": [
+      23456,
+      23501,
+      25123
+    ]
+  }
+}

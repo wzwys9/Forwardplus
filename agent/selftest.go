@@ -1,0 +1,279 @@
+package main
+
+import (
+	"fmt"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const selfTestWorkerConcurrency = 16
+const selfTestQueueCapacity = 256
+const selfTestRuntimeReadinessWindow = 20 * time.Second
+const selfTestActionWaitWindow = 4 * time.Second
+const selfTestPostActionReadinessWindow = 5 * time.Second
+const selfTestTCPAttemptTimeout = 1500 * time.Millisecond
+const selfTestWireGuardAttemptTimeout = 2500 * time.Millisecond
+const selfTestPingTimeout = 1500 * time.Millisecond
+const selfTestRetryBaseDelay = 250 * time.Millisecond
+const selfTestRetryMaxDelay = 750 * time.Millisecond
+
+type selfTestJob struct {
+	cfg  Config
+	test selfTest
+}
+
+var selfTestQueue = make(chan selfTestJob, selfTestQueueCapacity)
+var selfTestWorkersOnce sync.Once
+var selfTestInFlightMu sync.Mutex
+var selfTestInFlight = map[int]bool{}
+
+func selfTestPoller(cfg Config) {
+	activeUntil := time.Time{}
+	for {
+		if !shouldPollSelfTests(agentEventStreamConnected.Load()) {
+			time.Sleep(selfTestIdlePollInterval)
+			continue
+		}
+		var resp selfTestResp
+		if err := post(cfg, "/api/agent/selftest-pull", map[string]any{}, &resp); err != nil {
+			logAgentCommError("selftest-pull", err)
+		} else {
+			if len(resp.SelfTests) > 0 {
+				activeUntil = time.Now().Add(selfTestActiveWindow)
+			}
+			for _, t := range resp.SelfTests {
+				enqueueSelfTest(cfg, t)
+			}
+		}
+		interval := selfTestIdlePollInterval
+		if time.Now().Before(activeUntil) {
+			interval = selfTestActivePollInterval
+		}
+		time.Sleep(interval)
+	}
+}
+
+func shouldPollSelfTests(eventStreamConnected bool) bool {
+	return !eventStreamConnected
+}
+
+func enqueueSelfTest(cfg Config, t selfTest) {
+	if !claimSelfTest(t.TestID) {
+		return
+	}
+	selfTestWorkersOnce.Do(startSelfTestWorkers)
+	select {
+	case selfTestQueue <- selfTestJob{cfg: cfg, test: t}:
+	default:
+		releaseSelfTest(t.TestID)
+		if shouldLogAgentReport("selftest-queue-full", agentReportLogInterval) {
+			logf("selftest queue full; dropping test=%d target=%s", t.TestID, t.TargetIP)
+		}
+	}
+}
+
+func enqueueSelfTestsAfterActions(cfg Config, tests []selfTest, actionDone []<-chan struct{}) {
+	if len(tests) == 0 {
+		return
+	}
+	tests = append([]selfTest(nil), tests...)
+	actionDone = append([]<-chan struct{}(nil), actionDone...)
+	enqueue := func() {
+		actionsCompleted := len(actionDone) == 0
+		if len(actionDone) > 0 {
+			actionsCompleted = waitForActionBatch(actionDone, selfTestActionWaitWindow)
+		}
+		for _, test := range tests {
+			test.runtimeActionsWaited = len(actionDone) > 0 && actionsCompleted
+			enqueueSelfTest(cfg, test)
+		}
+	}
+	if len(actionDone) == 0 {
+		enqueue()
+		return
+	}
+	go enqueue()
+}
+
+func startSelfTestWorkers() {
+	for i := 0; i < selfTestWorkerConcurrency; i++ {
+		go func() {
+			for job := range selfTestQueue {
+				func() {
+					defer releaseSelfTest(job.test.TestID)
+					handleSelfTest(job.cfg, job.test)
+				}()
+			}
+		}()
+	}
+}
+
+func claimSelfTest(testID int) bool {
+	if testID <= 0 {
+		return false
+	}
+	selfTestInFlightMu.Lock()
+	defer selfTestInFlightMu.Unlock()
+	if selfTestInFlight[testID] {
+		return false
+	}
+	selfTestInFlight[testID] = true
+	return true
+}
+
+func releaseSelfTest(testID int) {
+	selfTestInFlightMu.Lock()
+	delete(selfTestInFlight, testID)
+	selfTestInFlightMu.Unlock()
+}
+
+func handleSelfTest(cfg Config, t selfTest) {
+	method := strings.ToLower(strings.TrimSpace(t.Method))
+	if method == "" {
+		method = strings.ToLower(strings.TrimSpace(t.Protocol))
+	}
+	if normalizeRuntimeProtocol(method) == "udp" {
+		method = "ping"
+	}
+	if method == "ping" {
+		latency, reachable, detail := pingLatency(t.TargetIP, selfTestPingTimeout)
+		msg := ""
+		if reachable {
+			msg = fmt.Sprintf("目标 %s Ping可达，延迟 %dms", t.TargetIP, latency)
+		} else {
+			msg = fmt.Sprintf("目标 %s Ping不可达：%s", t.TargetIP, detail)
+		}
+		payload := map[string]any{
+			"testId":          t.TestID,
+			"targetReachable": reachable,
+			"latencyMs":       latency,
+			"message":         msg,
+		}
+		if err := post(cfg, "/api/agent/selftest-result", payload, &map[string]any{}); err != nil {
+			logSelfTestReportError(t.TestID, t.TargetIP, err)
+		}
+		return
+	}
+
+	latency, reachable, resolvedTarget := 0, false, ""
+	minimumAttempts := selfTestTCPAttempts(t)
+	readinessWindow := selfTestTCPReadinessWindow(t)
+	startedAt := time.Now()
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			delay := selfTestRetryDelay(attempt)
+			if readinessWindow > 0 {
+				remaining := readinessWindow - time.Since(startedAt)
+				if remaining <= 0 {
+					break
+				}
+				if delay > remaining {
+					delay = remaining
+				}
+			}
+			time.Sleep(delay)
+		}
+		attemptTimeout := selfTestTCPAttemptTimeout
+		if t.WireGuardPeerID != "" && t.TunnelID > 0 {
+			attemptTimeout = selfTestWireGuardAttemptTimeout
+		}
+		if readinessWindow > 0 {
+			remaining := readinessWindow - time.Since(startedAt)
+			if remaining <= 0 {
+				break
+			}
+			if attemptTimeout > remaining {
+				attemptTimeout = remaining
+			}
+		}
+		if t.WireGuardPeerID != "" && t.TunnelID > 0 {
+			latency, reachable = wireGuardTCPLatency(t.TunnelID, t.WireGuardPeerID, t.TargetPort, attemptTimeout)
+		} else {
+			latency, reachable, resolvedTarget = tcpLatencyResolved(t.TargetIP, t.TargetPort, attemptTimeout)
+		}
+		if reachable {
+			break
+		}
+		if attempt+1 >= minimumAttempts && (readinessWindow <= 0 || time.Since(startedAt) >= readinessWindow) {
+			break
+		}
+	}
+	target := net.JoinHostPort(t.TargetIP, strconv.Itoa(t.TargetPort))
+	msg := ""
+	if reachable {
+		msg = fmt.Sprintf("目标 %s TCP可达，延迟 %dms", target, latency)
+		if resolvedTarget != "" && resolvedTarget != normalizeNetworkTargetHost(t.TargetIP) {
+			msg = fmt.Sprintf("%s，解析到 %s", msg, resolvedTarget)
+		}
+	} else {
+		latency = 0
+		msg = fmt.Sprintf("目标 %s TCP不可达或超时", target)
+	}
+	payload := map[string]any{
+		"testId":          t.TestID,
+		"targetReachable": reachable,
+		"latencyMs":       latency,
+		"message":         msg,
+	}
+	if resolvedTarget != "" {
+		payload["resolvedTargetIp"] = resolvedTarget
+	}
+	if err := post(cfg, "/api/agent/selftest-result", payload, &map[string]any{}); err != nil {
+		logSelfTestReportError(t.TestID, target, err)
+	}
+}
+
+func selfTestTCPAttempts(t selfTest) int {
+	switch strings.ToLower(strings.TrimSpace(t.Kind)) {
+	case "tunnel", "tunnel-hop", "forward-via-tunnel", "forward-via-tunnel-entry", "forward-chain":
+		return 4
+	default:
+		return 1
+	}
+}
+
+func selfTestDependsOnRuntime(t selfTest) bool {
+	if strings.TrimSpace(t.WireGuardPeerID) != "" {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(t.Kind)) {
+	case "tunnel", "tunnel-hop", "forward-via-tunnel", "forward-via-tunnel-entry", "forward-chain":
+		return true
+	default:
+		return false
+	}
+}
+
+func selfTestTCPReadinessWindow(t selfTest) time.Duration {
+	if selfTestDependsOnRuntime(t) {
+		if t.runtimeActionsWaited {
+			return selfTestPostActionReadinessWindow
+		}
+		return selfTestRuntimeReadinessWindow
+	}
+	return 0
+}
+
+func selfTestRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		return 0
+	}
+	delay := time.Duration(attempt) * selfTestRetryBaseDelay
+	if delay > selfTestRetryMaxDelay {
+		return selfTestRetryMaxDelay
+	}
+	return delay
+}
+
+func logSelfTestReportError(testID int, target string, err error) {
+	if isTransientAgentCommError(err) {
+		logAgentCommError("selftest-result", err)
+		return
+	}
+	if shouldLogAgentReport("selftest-report-failed", agentReportLogInterval) {
+		logf("selftest report failed test=%d target=%s: %v", testID, target, err)
+	}
+}

@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "updatedAt": "2026-08-22",
+  "items": [
+    {
+      "id": "china-region-whitelist",
+      "name": "ForwardX 中国区域白名单",
+      "description": "按主机实时管理中国大陆全国、省级 CIDR 和 ASN 白名单规则。",
+      "detailsMarkdown": "ForwardX 中国区域白名单插件用于把中国大陆全国、省级 CIDR 和 ASN 白名单规则应用到 Agent 主机。\n\n启用后，插件程序和数据会自动同步到所有 Agent。左侧展示全部主机并支持筛选；点击主机后，可在右侧新增、查看、修改、删除和刷新实际白名单规则。每台 Agent 的配置与状态独立，切换主机不会混用数据。\n\n支持全国或按省份选择全局入站白名单、额外 ASN、端口优先白名单、nftables 或 iptables/ipset，并实时展示在线、执行、规则挂载和失败状态。",
+      "version": "0.7.1",
+      "releaseDate": "2026-08-22",
+      "updatedAt": "2026-08-22",
+      "changelog": "修复 nftables DNAT/FORWARD 端口匹配失败、应用错误吞掉及服务状态误报。",
+      "logo": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PGRlZnM+PGxpbmVhckdyYWRpZW50IGlkPSJnIiB4MT0iMTAiIHkxPSI4IiB4Mj0iNTYiIHkyPSI1OCI+PHN0b3Agc3RvcC1jb2xvcj0iIzM0ZDM5OSIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzBmNzY2ZSIvPjwvbGluZWFyR3JhZGllbnQ+PC9kZWZzPjxyZWN0IHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgcng9IjE4IiBmaWxsPSIjZWNmZWZmIi8+PHBhdGggZD0iTTMyIDggNTAgMTZ2MTRjMCAxMi41LTcuNCAyMC44LTE4IDI2LTEwLjYtNS4yLTE4LTEzLjUtMTgtMjZWMTZsMTgtOFoiIGZpbGw9InVybCgjZykiLz48cGF0aCBkPSJNMjMgMzRoOHYtOGgxMCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjZmZmIiBzdHJva2Utd2lkdGg9IjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxjaXJjbGUgY3g9IjIzIiBjeT0iMzQiIHI9IjQiIGZpbGw9IiNmZmYiLz48Y2lyY2xlIGN4PSIzMSIgY3k9IjI2IiByPSI0IiBmaWxsPSIjZmZmIi8+PGNpcmNsZSBjeD0iNDEiIGN5PSIyNiIgcj0iNCIgZmlsbD0iI2ZmZiIvPjwvc3ZnPg==",
+      "features": [
+        {
+          "title": "区域白名单",
+          "description": "支持全国 CN 或按省份选择入站白名单。"
+        },
+        {
+          "title": "端口策略",
+          "description": "支持为指定端口或端口范围设置独立白名单。"
+        },
+        {
+          "title": "Agent 下发",
+          "description": "按 Agent 实时读取、编辑、应用和清理独立配置。"
+        },
+        {
+          "title": "实时状态",
+          "description": "展示防火墙后端、规则数量、持久化状态和执行错误。"
+        }
+      ],
+      "tags": ["whitelist", "china-region", "firewall", "agent"],
+      "license": "AGPL-3.0-only",
+      "repository": "https://github.com/wzwys9/Forwardplus",
+      "branch": "main",
+      "manifestPath": "plugins/china-region-whitelist/forwardx-plugin.json",
+      "homepage": "https://github.com/wzwys9/Forwardplus",
+      "author": "poouo",
+      "packageRepository": "https://github.com/wzwys9/Forwardplus",
+      "packageBranch": "main",
+      "packagePath": "plugins/packages/china-region-whitelist.tar.gz",
+      "bundledPath": "plugins/china-region-whitelist",
+      "category": "data",
+      "permissions": ["data:whitelist", "read:hosts", "agent:read", "agent:write", "ui:interactive", "ui:page"],
+      "extensionPoints": ["data.whitelist", "sidebar.page"],
+      "official": true,
+      "builtIn": true
+    },
+    {
+      "id": "live2d-widget",
+      "name": "ForwardX Live2D 看板娘",
+      "description": "在面板中按需启用并配置 stevenjoezhang/live2d-widget 看板娘。",
+      "detailsMarkdown": "ForwardX Live2D 看板娘是 `stevenjoezhang/live2d-widget` 的官方适配插件。\n\n插件默认关闭；安装并启用后，浏览器才会按设置加载固定版本的上游运行时和模型资源。面板端不执行插件包内的任意 JavaScript。\n\n- 可设置显示范围、移动端显示、模型 CDN、默认模型和停靠位置。\n- 可选择一言、切换模型、换装、拍照、项目说明和关闭等工具。\n- 可设置拖动、关闭后的重新唤起方式和日志等级。\n- ForwardX 不打包 Live2D 模型；模型资源的许可由所配置的模型仓库单独决定。",
+      "version": "1.0.0",
+      "releaseDate": "2026-07-24",
+      "updatedAt": "2026-07-24",
+      "changelog": "首个版本：提供声明式配置、按需加载、桌面与移动端显示控制及许可证说明。",
+      "features": [
+        { "title": "按需加载", "description": "插件关闭时不加载 Live2D 脚本、模型或周期任务。" },
+        { "title": "完整配置", "description": "管理模型来源、默认模型、工具、拖动和关闭行为。" },
+        { "title": "显示控制", "description": "支持访问范围、移动端开关、左右停靠和模型尺寸。" },
+        { "title": "合规声明", "description": "明确区分上游运行时代码、Cubism 运行时和模型资源许可。" }
+      ],
+      "tags": ["live2d", "widget", "ui", "waifu"],
+      "license": "AGPL-3.0-only + GPL-3.0-or-later",
+      "repository": "https://github.com/wzwys9/Forwardplus",
+      "branch": "main",
+      "manifestPath": "plugins/live2d-widget/forwardx-plugin.json",
+      "homepage": "https://github.com/stevenjoezhang/live2d-widget",
+      "author": "stevenjoezhang / ForwardX",
+      "packageRepository": "https://github.com/wzwys9/Forwardplus",
+      "packageBranch": "main",
+      "packagePath": "plugins/packages/live2d-widget.tar.gz",
+      "bundledPath": "plugins/live2d-widget",
+      "category": "ui",
+      "permissions": ["ui:widget", "ui:settings"],
+      "extensionPoints": ["ui.widget", "settings.panel"],
+      "official": true,
+      "builtIn": true
+    }
+  ]
+}

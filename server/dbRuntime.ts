@@ -1,0 +1,861 @@
+import fs from "fs";
+import path from "path";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { drizzle as drizzleMysql } from "drizzle-orm/mysql2";
+import { drizzle as drizzleSqliteProxy } from "drizzle-orm/sqlite-proxy";
+import { drizzle as drizzlePostgres } from "drizzle-orm/node-postgres";
+import mysql, { Pool, PoolOptions, type ConnectionOptions } from "mysql2/promise";
+import pg from "pg";
+import Database from "better-sqlite3";
+import { SCHEMA_DIALECT } from "../drizzle/schema";
+import { ENV } from "./env";
+import { databasePoolSettingsForHostCount } from "./databasePoolSizing";
+
+export type DatabaseKind = "mysql" | "sqlite" | "postgresql";
+export const MYSQL_MIN_VERSION = "8.0.13";
+const MYSQL_MIN_VERSION_PARTS = [8, 0, 13] as const;
+
+export interface MysqlConfig {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+  database: string;
+  ssl?: boolean;
+}
+
+export interface SqliteConfig {
+  path: string;
+}
+
+export interface PostgresqlConfig {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+  database: string;
+  ssl?: boolean;
+}
+
+export type DatabaseConfig =
+  | { type: "mysql"; mysql: MysqlConfig }
+  | { type: "sqlite"; sqlite: SqliteConfig }
+  | { type: "postgresql"; postgresql: PostgresqlConfig };
+
+type Db = any;
+
+let _kind: DatabaseKind | null = null;
+let _pool: Pool | null = null;
+let _pgPool: pg.Pool | null = null;
+let _sqlite: Database.Database | null = null;
+let _db: Db | null = null;
+let _databasePoolHostCount = 0;
+let _databasePoolSettings = databasePoolSettingsForHostCount(0);
+
+type DatabaseTransactionContext = {
+  db: Db;
+  mysqlConnection?: any;
+  postgresClient?: any;
+  sqlite?: Database.Database;
+  afterCommit: Array<() => Promise<void> | void>;
+  afterSettled: Array<() => Promise<void> | void>;
+};
+
+const transactionContext = new AsyncLocalStorage<DatabaseTransactionContext>();
+
+type SqliteConnectionLockContext = {
+  sqlite: Database.Database;
+  active: boolean;
+};
+
+const sqliteConnectionLockContext = new AsyncLocalStorage<SqliteConnectionLockContext>();
+let sqliteConnectionQueue: Promise<void> = Promise.resolve();
+
+async function withSqliteConnectionLock<T>(sqlite: Database.Database, work: () => Promise<T> | T): Promise<T> {
+  const inherited = sqliteConnectionLockContext.getStore();
+  if (inherited?.active && inherited.sqlite === sqlite) return work();
+
+  const previous = sqliteConnectionQueue;
+  let release: () => void = () => {};
+  sqliteConnectionQueue = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+
+  const lock = { sqlite, active: true };
+  try {
+    return await sqliteConnectionLockContext.run(lock, work);
+  } finally {
+    lock.active = false;
+    release();
+  }
+}
+
+function createSqliteDrizzleDatabase(sqlite: Database.Database): Db {
+  const callback: any = (sqlText: string, params: any[], method: "run" | "all" | "get" | "values") => (
+    withSqliteConnectionLock(sqlite, () => {
+      const statement = sqlite.prepare(sqlText);
+      if (method === "run") return { rows: [], ...statement.run(...params) };
+      if (method === "get") return { rows: statement.raw().get(...params) };
+      return { rows: statement.raw().all(...params) };
+    })
+  );
+  return drizzleSqliteProxy(callback) as Db;
+}
+
+export class DatabaseNotConfiguredError extends Error {
+  constructor(message = "Database is not configured") {
+    super(message);
+    this.name = "DatabaseNotConfiguredError";
+  }
+}
+
+export class DatabaseDialectMismatchError extends Error {
+  constructor(
+    public configuredType: DatabaseKind,
+    public schemaType: DatabaseKind,
+  ) {
+    super(`Database type changed to ${configuredType}; server restart is required`);
+    this.name = "DatabaseDialectMismatchError";
+  }
+}
+
+function configFilePath() {
+  return ENV.databaseConfigPath || path.resolve(process.cwd(), "data", "database.json");
+}
+
+function legacyMysqlConfigPath() {
+  return ENV.mysqlConfigPath || path.resolve(process.cwd(), "data", "mysql.json");
+}
+
+export function getDatabaseConfigPath() {
+  return configFilePath();
+}
+
+export function isDatabaseSetupPendingConfig() {
+  try {
+    const file = configFilePath();
+    if (!fs.existsSync(file)) return false;
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return parsed?.setupPending === true || parsed?.setupPending === "true";
+  } catch {
+    return false;
+  }
+}
+
+export function defaultSqlitePath() {
+  return ENV.sqlitePath || "/data/forwardx.db";
+}
+
+function normalizeMysql(config: MysqlConfig): MysqlConfig {
+  return {
+    host: config.host.trim(),
+    port: Number(config.port || 3306),
+    user: config.user.trim(),
+    password: config.password || "",
+    database: config.database.trim(),
+    ssl: !!config.ssl,
+  };
+}
+
+function normalizePostgresql(config: PostgresqlConfig): PostgresqlConfig {
+  return {
+    host: config.host.trim(),
+    port: Number(config.port || 5432),
+    user: config.user.trim(),
+    password: config.password || "",
+    database: config.database.trim(),
+    ssl: !!config.ssl,
+  };
+}
+
+function parseMysqlVersion(version: unknown) {
+  const match = String(version || "").match(/(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])] as const;
+}
+
+function isMysqlVersionSupported(version: readonly [number, number, number]) {
+  for (let i = 0; i < MYSQL_MIN_VERSION_PARTS.length; i += 1) {
+    if (version[i] > MYSQL_MIN_VERSION_PARTS[i]) return true;
+    if (version[i] < MYSQL_MIN_VERSION_PARTS[i]) return false;
+  }
+  return true;
+}
+
+function mysqlVersionValue(queryResult: any) {
+  const rows = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+  const row = Array.isArray(rows) ? rows[0] : rows;
+  return row?.version ?? row?.["VERSION()"] ?? row?.["@@version"] ?? "";
+}
+
+export async function assertSupportedMysqlServer(query: (sqlText: string) => Promise<any>) {
+  const result = await query("SELECT VERSION() AS version");
+  const versionText = String(mysqlVersionValue(result) || "").trim();
+  const version = parseMysqlVersion(versionText);
+  if (!version || !isMysqlVersionSupported(version)) {
+    throw new Error(
+      `Unsupported MySQL server version ${versionText || "unknown"}. ForwardX requires MySQL ${MYSQL_MIN_VERSION} or later. MySQL 5.7 does not support the current metrics queries and default-value DDL syntax.`,
+    );
+  }
+}
+
+function normalizeSqlite(config: SqliteConfig): SqliteConfig {
+  return {
+    path: (config.path || defaultSqlitePath()).trim() || defaultSqlitePath(),
+  };
+}
+
+export function getDatabasePoolSettings() {
+  return { ..._databasePoolSettings };
+}
+
+export function setDatabasePoolHostCount(value: unknown) {
+  const hostCount = Math.max(0, Math.floor(Number(value) || 0));
+  const previous = _databasePoolSettings;
+  const next = databasePoolSettingsForHostCount(hostCount);
+  _databasePoolHostCount = hostCount;
+  _databasePoolSettings = next;
+
+  // Both drivers read these limits when checking out a connection, so active transactions stay intact.
+  const mysqlConfig = (_pool as any)?.pool?.config;
+  if (mysqlConfig) {
+    mysqlConfig.connectionLimit = next.maxOpen;
+    mysqlConfig.maxIdle = next.maxIdle;
+    mysqlConfig.idleTimeout = next.idleTimeoutMillis;
+    mysqlConfig.queueLimit = next.queueLimit;
+  }
+  if (_pgPool) {
+    _pgPool.options.max = next.maxOpen;
+    _pgPool.options.min = next.maxIdle;
+    _pgPool.options.idleTimeoutMillis = next.idleTimeoutMillis;
+    _pgPool.options.maxLifetimeSeconds = next.maxLifetimeSeconds;
+  }
+
+  if ((_pool || _pgPool) && (previous.maxOpen !== next.maxOpen || previous.maxIdle !== next.maxIdle)) {
+    console.info(`[Database] Pool capacity adjusted hosts=${hostCount} maxOpen=${next.maxOpen} maxIdle=${next.maxIdle} queueLimit=${next.queueLimit}`);
+  }
+  return getDatabasePoolSettings();
+}
+
+export async function refreshDatabasePoolSettings() {
+  if (_kind !== "mysql" && _kind !== "postgresql") return getDatabasePoolSettings();
+  const rows = await queryRaw<{ count: number | string }>("SELECT COUNT(*) AS count FROM hosts");
+  return setDatabasePoolHostCount(rows[0]?.count ?? _databasePoolHostCount);
+}
+
+function readMysqlFromEnv(): MysqlConfig | null {
+  if (ENV.mysqlUrl) {
+    const url = new URL(ENV.mysqlUrl);
+    return normalizeMysql({
+      host: url.hostname,
+      port: Number(url.port || 3306),
+      user: decodeURIComponent(url.username),
+      password: decodeURIComponent(url.password),
+      database: url.pathname.replace(/^\/+/, ""),
+      ssl: url.searchParams.get("ssl") === "true",
+    });
+  }
+  if (ENV.mysqlHost && ENV.mysqlUser && ENV.mysqlDatabase) {
+    return normalizeMysql({
+      host: ENV.mysqlHost,
+      port: ENV.mysqlPort,
+      user: ENV.mysqlUser,
+      password: ENV.mysqlPassword,
+      database: ENV.mysqlDatabase,
+      ssl: ENV.mysqlSsl,
+    });
+  }
+  return null;
+}
+
+function readPostgresqlFromEnv(): PostgresqlConfig | null {
+  if (ENV.postgresUrl) {
+    const url = new URL(ENV.postgresUrl);
+    return normalizePostgresql({
+      host: url.hostname,
+      port: Number(url.port || 5432),
+      user: decodeURIComponent(url.username),
+      password: decodeURIComponent(url.password),
+      database: url.pathname.replace(/^\/+/, ""),
+      ssl: url.searchParams.get("ssl") === "true" || url.searchParams.get("sslmode") === "require",
+    });
+  }
+  if (ENV.postgresHost && ENV.postgresUser && ENV.postgresDatabase) {
+    return normalizePostgresql({
+      host: ENV.postgresHost,
+      port: ENV.postgresPort,
+      user: ENV.postgresUser,
+      password: ENV.postgresPassword,
+      database: ENV.postgresDatabase,
+      ssl: ENV.postgresSsl,
+    });
+  }
+  return null;
+}
+
+function normalizeDatabaseType(value: string | null | undefined): DatabaseKind | "" {
+  const type = String(value || "").toLowerCase();
+  if (type === "postgresql" || type === "postgres" || type === "pg") return "postgresql";
+  if (type === "mysql" || type === "sqlite") return type;
+  return "";
+}
+
+export function readDatabaseConfig(): DatabaseConfig | null {
+  const explicitType = normalizeDatabaseType(ENV.databaseType);
+  const envMysql = readMysqlFromEnv();
+  const envPostgresql = readPostgresqlFromEnv();
+  if (explicitType === "sqlite") {
+    return { type: "sqlite", sqlite: normalizeSqlite({ path: defaultSqlitePath() }) };
+  }
+  if (explicitType === "mysql" && envMysql) {
+    return { type: "mysql", mysql: envMysql };
+  }
+  if (explicitType === "postgresql" && envPostgresql) {
+    return { type: "postgresql", postgresql: envPostgresql };
+  }
+  if (envPostgresql) return { type: "postgresql", postgresql: envPostgresql };
+  if (envMysql) return { type: "mysql", mysql: envMysql };
+
+  const file = configFilePath();
+  if (fs.existsSync(file)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+      const parsedType = normalizeDatabaseType(parsed?.type);
+      if (parsedType === "sqlite") {
+        return { type: "sqlite", sqlite: normalizeSqlite(parsed.sqlite || parsed) };
+      }
+      if (parsedType === "mysql") {
+        const mysqlConfig = parsed.mysql || parsed;
+        if (mysqlConfig?.host && mysqlConfig?.user && mysqlConfig?.database) {
+          return { type: "mysql", mysql: normalizeMysql(mysqlConfig) };
+        }
+      }
+      if (parsedType === "postgresql") {
+        const postgresqlConfig = parsed.postgresql || parsed.postgres || parsed.pg || parsed;
+        if (postgresqlConfig?.host && postgresqlConfig?.user && postgresqlConfig?.database) {
+          return { type: "postgresql", postgresql: normalizePostgresql(postgresqlConfig) };
+        }
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  const legacy = legacyMysqlConfigPath();
+  if (fs.existsSync(legacy)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(legacy, "utf8"));
+      if (parsed?.host && parsed?.user && parsed?.database) {
+        return { type: "mysql", mysql: normalizeMysql(parsed) };
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  if (ENV.sqlitePath && fs.existsSync(ENV.sqlitePath)) {
+    return { type: "sqlite", sqlite: normalizeSqlite({ path: ENV.sqlitePath }) };
+  }
+  return null;
+}
+
+export function readMysqlConfig(): MysqlConfig | null {
+  const config = readDatabaseConfig();
+  return config?.type === "mysql" ? config.mysql : null;
+}
+
+export function maskDatabaseConfig(config: DatabaseConfig | null) {
+  if (!config) return null;
+  if (config.type === "sqlite") {
+    return { type: "sqlite" as const, sqlite: { path: config.sqlite.path } };
+  }
+  if (config.type === "postgresql") {
+    return {
+      type: "postgresql" as const,
+      postgresql: {
+        ...config.postgresql,
+        password: config.postgresql.password ? "********" : "",
+      },
+    };
+  }
+  return {
+    type: "mysql" as const,
+    mysql: {
+      ...config.mysql,
+      password: config.mysql.password ? "********" : "",
+    },
+  };
+}
+
+export function maskMysqlConfig(config: MysqlConfig | null) {
+  if (!config) return null;
+  return { ...config, password: config.password ? "********" : "" };
+}
+
+export function writeDatabaseConfig(config: DatabaseConfig) {
+  const normalized: DatabaseConfig = config.type === "sqlite"
+    ? { type: "sqlite", sqlite: normalizeSqlite(config.sqlite) }
+    : config.type === "postgresql"
+      ? { type: "postgresql", postgresql: normalizePostgresql(config.postgresql) }
+      : { type: "mysql", mysql: normalizeMysql(config.mysql) };
+  if (isDatabaseSetupPendingConfig()) {
+    (normalized as any).setupPending = true;
+  }
+  const file = configFilePath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(normalized, null, 2), { mode: 0o600 });
+}
+
+export function clearDatabaseSetupPendingConfig() {
+  const file = configFilePath();
+  try {
+    if (!fs.existsSync(file)) return;
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!parsed || parsed.setupPending === undefined) return;
+    delete parsed.setupPending;
+    fs.writeFileSync(file, JSON.stringify(parsed, null, 2), { mode: 0o600 });
+  } catch {
+    // Ignore cleanup failures; setup locking also relies on the local marker.
+  }
+}
+
+export function writeMysqlConfig(config: MysqlConfig) {
+  writeDatabaseConfig({ type: "mysql", mysql: config });
+}
+
+function mysqlConnectionOptions(config: MysqlConfig): ConnectionOptions {
+  const pool = getDatabasePoolSettings();
+  return {
+    host: config.host,
+    port: config.port,
+    user: config.user,
+    password: config.password,
+    database: config.database,
+    connectTimeout: pool.connectTimeoutMillis,
+    timezone: "+00:00",
+    dateStrings: false,
+    ssl: config.ssl ? {} : undefined,
+  };
+}
+
+function poolOptions(config: MysqlConfig): PoolOptions {
+  const pool = getDatabasePoolSettings();
+  return {
+    ...mysqlConnectionOptions(config),
+    waitForConnections: true,
+    connectionLimit: pool.maxOpen,
+    maxIdle: pool.maxIdle,
+    idleTimeout: pool.idleTimeoutMillis,
+    queueLimit: pool.queueLimit,
+  };
+}
+
+function pgPoolOptions(config: PostgresqlConfig): pg.PoolConfig {
+  const pool = getDatabasePoolSettings();
+  const options: pg.PoolConfig & { min?: number; maxLifetimeSeconds?: number } = {
+    host: config.host,
+    port: config.port,
+    user: config.user,
+    password: config.password,
+    database: config.database,
+    max: pool.maxOpen,
+    min: pool.maxIdle,
+    idleTimeoutMillis: pool.idleTimeoutMillis,
+    connectionTimeoutMillis: pool.connectTimeoutMillis,
+    maxLifetimeSeconds: pool.maxLifetimeSeconds,
+    // Let node-postgres use its default CA validation when TLS is enabled.
+    // Passing rejectUnauthorized=false would allow a man-in-the-middle attack.
+    ssl: config.ssl ? true : undefined,
+  };
+  return options;
+}
+
+export async function testMysqlConnection(config: MysqlConfig) {
+  const normalized = normalizeMysql(config);
+  const conn = await mysql.createConnection(mysqlConnectionOptions(normalized));
+  try {
+    await conn.ping();
+    await assertSupportedMysqlServer((sqlText) => conn.query(sqlText));
+  } finally {
+    await conn.end();
+  }
+}
+
+export async function testPostgresqlConnection(config: PostgresqlConfig) {
+  const normalized = normalizePostgresql(config);
+  const pool = new pg.Pool(pgPoolOptions(normalized));
+  try {
+    await pool.query("SELECT 1");
+  } finally {
+    await pool.end().catch(() => undefined);
+  }
+}
+
+export function testSqliteConnection(config: SqliteConfig) {
+  const normalized = normalizeSqlite(config);
+  fs.mkdirSync(path.dirname(normalized.path), { recursive: true });
+  const sqlite = new Database(normalized.path);
+  try {
+    sqlite.pragma("journal_mode = WAL");
+    sqlite.pragma("foreign_keys = ON");
+    sqlite.prepare("SELECT 1").get();
+  } finally {
+    sqlite.close();
+  }
+}
+
+export async function testDatabaseConnection(config: DatabaseConfig) {
+  if (config.type === "mysql") {
+    await testMysqlConnection(config.mysql);
+  } else if (config.type === "postgresql") {
+    await testPostgresqlConnection(config.postgresql);
+  } else {
+    testSqliteConnection(config.sqlite);
+  }
+}
+
+export async function connectDatabase(config = readDatabaseConfig()) {
+  if (!config) {
+    _kind = null;
+    _pool = null;
+    _pgPool = null;
+    _sqlite = null;
+    _db = null;
+    return null;
+  }
+  if (_db && _kind === config.type) return _db;
+  if (config.type !== SCHEMA_DIALECT) {
+    throw new DatabaseDialectMismatchError(config.type, SCHEMA_DIALECT);
+  }
+  await closeDatabase();
+
+  if (config.type === "mysql") {
+    const normalized = normalizeMysql(config.mysql);
+    _pool = mysql.createPool(poolOptions(normalized));
+    await _pool.query("SELECT 1");
+    await assertSupportedMysqlServer((sqlText) => _pool!.query(sqlText));
+    _db = drizzleMysql(_pool) as Db;
+    _kind = "mysql";
+    console.log(`[Database] MySQL connected at ${normalized.host}:${normalized.port}/${normalized.database}`);
+    return _db;
+  }
+
+  if (config.type === "postgresql") {
+    const normalized = normalizePostgresql(config.postgresql);
+    _pgPool = new pg.Pool(pgPoolOptions(normalized));
+    await _pgPool.query("SELECT 1");
+    _db = drizzlePostgres(_pgPool) as Db;
+    _kind = "postgresql";
+    console.log(`[Database] PostgreSQL connected at ${normalized.host}:${normalized.port}/${normalized.database}`);
+    return _db;
+  }
+
+  const normalized = normalizeSqlite(config.sqlite);
+  fs.mkdirSync(path.dirname(normalized.path), { recursive: true });
+  _sqlite = new Database(normalized.path);
+  _sqlite.pragma("journal_mode = WAL");
+  _sqlite.pragma("foreign_keys = ON");
+  _db = createSqliteDrizzleDatabase(_sqlite);
+  _kind = "sqlite";
+  console.log(`[Database] SQLite opened at ${normalized.path}`);
+  return _db;
+}
+
+export async function closeDatabase() {
+  if (_pool) {
+    await _pool.end().catch(() => undefined);
+  }
+  if (_pgPool) {
+    await _pgPool.end().catch(() => undefined);
+  }
+  if (_sqlite) {
+    try {
+      _sqlite.close();
+    } catch {
+      // ignore close failures during reconnect
+    }
+  }
+  _pool = null;
+  _pgPool = null;
+  _sqlite = null;
+  _db = null;
+  _kind = null;
+}
+
+export async function reconnectDatabase() {
+  await closeDatabase();
+  return connectDatabase();
+}
+
+export async function getDb() {
+  const active = transactionContext.getStore();
+  if (active) return active.db;
+  if (_db) return _db;
+  return connectDatabase();
+}
+
+export function isDatabaseTransactionActive() {
+  return !!transactionContext.getStore();
+}
+
+export async function afterDatabaseCommit(work: () => Promise<void> | void) {
+  const active = transactionContext.getStore();
+  if (active) {
+    active.afterCommit.push(work);
+    return;
+  }
+  await work();
+}
+
+export async function afterDatabaseTransactionSettled(work: () => Promise<void> | void) {
+  const active = transactionContext.getStore();
+  if (active) {
+    active.afterSettled.push(work);
+    return;
+  }
+  await work();
+}
+
+async function runAfterCommitCallbacks(callbacks: Array<() => Promise<void> | void>) {
+  for (const callback of callbacks) await callback();
+}
+
+async function runAfterSettledCallbacks(callbacks: Array<() => Promise<void> | void>) {
+  for (const callback of callbacks) await callback();
+}
+
+export async function withDatabaseTransaction<T>(work: () => Promise<T>): Promise<T> {
+  if (transactionContext.getStore()) return work();
+  if (!_db || !_kind) await connectDatabase();
+  if (_kind === "mysql") {
+    if (!_pool) throw new DatabaseNotConfiguredError("MySQL database is not connected");
+    const connection = await _pool.getConnection();
+    const afterCommit: Array<() => Promise<void> | void> = [];
+    const afterSettled: Array<() => Promise<void> | void> = [];
+    let result: T;
+    try {
+      try {
+        await connection.beginTransaction();
+        const db = drizzleMysql(connection as any) as Db;
+        result = await transactionContext.run({ db, mysqlConnection: connection, afterCommit, afterSettled }, work);
+        await connection.commit();
+      } catch (error) {
+        await connection.rollback().catch(() => undefined);
+        throw error;
+      } finally {
+        connection.release();
+      }
+    } finally {
+      await runAfterSettledCallbacks(afterSettled);
+    }
+    await runAfterCommitCallbacks(afterCommit);
+    return result;
+  }
+  if (_kind === "postgresql") {
+    if (!_pgPool) throw new DatabaseNotConfiguredError("PostgreSQL database is not connected");
+    const client = await _pgPool.connect();
+    const afterCommit: Array<() => Promise<void> | void> = [];
+    const afterSettled: Array<() => Promise<void> | void> = [];
+    let result: T;
+    try {
+      try {
+        await client.query("BEGIN");
+        const db = drizzlePostgres(client as any) as Db;
+        result = await transactionContext.run({ db, postgresClient: client, afterCommit, afterSettled }, work);
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    } finally {
+      await runAfterSettledCallbacks(afterSettled);
+    }
+    await runAfterCommitCallbacks(afterCommit);
+    return result;
+  }
+  if (_kind === "sqlite") {
+    if (!_sqlite || !_db) throw new DatabaseNotConfiguredError("SQLite database is not connected");
+    const sqlite = _sqlite;
+    const db = _db;
+    const afterCommit: Array<() => Promise<void> | void> = [];
+    const afterSettled: Array<() => Promise<void> | void> = [];
+    let result: T;
+    try {
+      result = await withSqliteConnectionLock(sqlite, async () => {
+        let transactionResult: T;
+        try {
+          sqlite.exec("BEGIN IMMEDIATE");
+          transactionResult = await transactionContext.run({ db, sqlite, afterCommit, afterSettled }, work);
+          sqlite.exec("COMMIT");
+        } catch (error) {
+          try { sqlite.exec("ROLLBACK"); } catch { /* transaction may already be closed */ }
+          throw error;
+        }
+        return transactionResult;
+      });
+    } finally {
+      await runAfterSettledCallbacks(afterSettled);
+    }
+    await runAfterCommitCallbacks(afterCommit);
+    return result;
+  }
+  throw new DatabaseNotConfiguredError();
+}
+
+export async function withSqliteExclusive<T>(work: (sqlite: Database.Database) => Promise<T> | T): Promise<T> {
+  if (transactionContext.getStore()) throw new Error("SQLite exclusive work cannot start inside a database transaction");
+  if (!_db || !_kind) await connectDatabase();
+  if (_kind !== "sqlite" || !_sqlite) throw new Error("SQLite direct migration requires an active SQLite database");
+  const sqlite = _sqlite;
+  return withSqliteConnectionLock(sqlite, () => work(sqlite));
+}
+
+export function getDatabaseKind() {
+  return _kind;
+}
+
+export function getConfiguredDatabaseKind() {
+  return readDatabaseConfig()?.type ?? null;
+}
+
+export function getSchemaDialect() {
+  return SCHEMA_DIALECT;
+}
+
+export function getPool() {
+  return _pool;
+}
+
+export function getPostgresPool() {
+  return _pgPool;
+}
+
+export function getSqlite() {
+  return _sqlite;
+}
+
+export function requirePool() {
+  if (!_pool) throw new DatabaseNotConfiguredError("MySQL database is not connected");
+  return _pool;
+}
+
+export function requirePostgresPool() {
+  if (!_pgPool) throw new DatabaseNotConfiguredError("PostgreSQL database is not connected");
+  return _pgPool;
+}
+
+export function requireSqlite() {
+  if (!_sqlite) throw new DatabaseNotConfiguredError("SQLite database is not connected");
+  return _sqlite;
+}
+
+export function requireConnectedDatabase() {
+  if (!_kind || !_db) throw new DatabaseNotConfiguredError();
+  return { kind: _kind, db: _db, pool: _pool, pgPool: _pgPool, sqlite: _sqlite };
+}
+
+function postgresSql(sqlText: string, params: any[] = []) {
+  let index = 0;
+  return {
+    text: sqlText.replace(/\?/g, () => `$${++index}`),
+    values: params,
+  };
+}
+
+export async function executeRaw(sqlText: string, params: any[] = []) {
+  const active = transactionContext.getStore();
+  const normalizedParams = params.map((value) => normalizeRawValue(value, _kind));
+  if (_kind === "mysql") {
+    const executor = active?.mysqlConnection || _pool;
+    if (!executor) throw new DatabaseNotConfiguredError("MySQL database is not connected");
+    const [result] = await executor.execute(sqlText, normalizedParams);
+    return result as any;
+  }
+  if (_kind === "sqlite") {
+    const sqlite = active?.sqlite || _sqlite;
+    if (!sqlite) throw new DatabaseNotConfiguredError("SQLite database is not connected");
+    return withSqliteConnectionLock(sqlite, () => sqlite.prepare(sqlText).run(...normalizedParams));
+  }
+  if (_kind === "postgresql") {
+    const executor = active?.postgresClient || _pgPool;
+    if (!executor) throw new DatabaseNotConfiguredError("PostgreSQL database is not connected");
+    const result = await executor.query(postgresSql(sqlText, normalizedParams));
+    return result as any;
+  }
+  throw new DatabaseNotConfiguredError();
+}
+
+export async function queryRaw<T = Record<string, any>>(sqlText: string, params: any[] = []): Promise<T[]> {
+  const active = transactionContext.getStore();
+  const normalizedParams = params.map((value) => normalizeRawValue(value, _kind));
+  if (_kind === "mysql") {
+    const executor = active?.mysqlConnection || _pool;
+    if (!executor) throw new DatabaseNotConfiguredError("MySQL database is not connected");
+    const [rows] = await executor.query(sqlText, normalizedParams);
+    return rows as T[];
+  }
+  if (_kind === "sqlite") {
+    const sqlite = active?.sqlite || _sqlite;
+    if (!sqlite) throw new DatabaseNotConfiguredError("SQLite database is not connected");
+    return withSqliteConnectionLock(sqlite, () => sqlite.prepare(sqlText).all(...normalizedParams) as T[]);
+  }
+  if (_kind === "postgresql") {
+    const executor = active?.postgresClient || _pgPool;
+    if (!executor) throw new DatabaseNotConfiguredError("PostgreSQL database is not connected");
+    const result = await executor.query(postgresSql(sqlText, normalizedParams));
+    return result.rows as T[];
+  }
+  throw new DatabaseNotConfiguredError();
+}
+
+function normalizeRawValue(value: any, kind = _kind) {
+  if (value instanceof Date) return Math.floor(value.getTime() / 1000);
+  if (typeof value === "boolean" && kind !== "postgresql") return value ? 1 : 0;
+  return value;
+}
+
+function quoteIdentifier(kind: DatabaseKind, id: string) {
+  if (kind === "mysql") return `\`${id.replace(/`/g, "``")}\``;
+  return `"${id.replace(/"/g, "\"\"")}"`;
+}
+
+export function quoteDbIdentifier(id: string) {
+  if (!_kind) return `"${id}"`;
+  return quoteIdentifier(_kind, id);
+}
+
+export function rawAffectedRows(result: any) {
+  return Number(result?.affectedRows ?? result?.changes ?? result?.rowCount ?? 0);
+}
+
+export async function insertAndGetId(tableName: string, values: Record<string, any>): Promise<number> {
+  if (_kind === "mysql" || _kind === "postgresql") {
+    const columns = Object.keys(values).filter((key) => values[key] !== undefined);
+    const placeholders = columns.map(() => "?").join(", ");
+    const quoted = columns.map((key) => quoteIdentifier(_kind as DatabaseKind, key)).join(", ");
+    const table = quoteIdentifier(_kind as DatabaseKind, tableName);
+    const returning = _kind === "postgresql" ? " RETURNING id" : "";
+    const result: any = await executeRaw(
+      `INSERT INTO ${table} (${quoted}) VALUES (${placeholders})${returning}`,
+      columns.map((key) => normalizeRawValue(values[key], _kind)),
+    );
+    if (_kind === "postgresql") return Number(result?.rows?.[0]?.id || 0);
+    return Number(result?.insertId || 0);
+  }
+  if (_kind === "sqlite") {
+    const columns = Object.keys(values).filter((key) => values[key] !== undefined);
+    const placeholders = columns.map(() => "?").join(", ");
+    const quoted = columns.map((key) => `"${key}"`).join(", ");
+    const result: any = await executeRaw(
+      `INSERT INTO "${tableName}" (${quoted}) VALUES (${placeholders})`,
+      columns.map((key) => normalizeRawValue(values[key], _kind)),
+    );
+    return Number(result?.lastInsertRowid || 0);
+  }
+  throw new DatabaseNotConfiguredError();
+}
+
+export function nowDate() {
+  return new Date();
+}

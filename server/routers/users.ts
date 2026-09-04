@@ -1,0 +1,405 @@
+import { protectedProcedure, adminProcedure, router } from "../_core/trpc";
+import { z } from "zod";
+import * as db from "../db";
+import { FORWARD_TYPES } from "../../shared/forwardTypes";
+import { isValidAvatarValue } from "../../shared/avatar";
+import { ensureAdminOrSelf, refreshUserForwardEndpoints } from "./helpers";
+import { clearLinkAccessScopeCache } from "../linkAccessView";
+import { getEmailConfig, sendMail } from "../email";
+import {
+  resetUserTrafficCommand,
+  setUserAccountEnabledCommand,
+  setUserForwardAccessCommand,
+} from "../services/userCommandService";
+import { withKeyedTaskLock } from "../keyedTaskLock";
+import { reconcileUserRuleResourceAuthorization } from "../ruleResourceAuthorization";
+
+const DISPLAY_NAME_MAX_LENGTH = 24;
+
+function actorLabel(ctx: { user?: { id: number; username?: string } | null }) {
+  return ctx.user ? `adminId=${ctx.user.id}` : "adminId=unknown";
+}
+
+function maskIdentifier(value?: string | null) {
+  const text = String(value || "").trim();
+  if (!text) return "unknown";
+  const [name, domain] = text.split("@");
+  if (domain) {
+    const visible = name.length <= 2 ? `${name[0] || "*"}*` : `${name.slice(0, 2)}***`;
+    return `${visible}@${domain}`;
+  }
+  if (text.length <= 3) return `${text[0] || "*"}***`;
+  return `${text.slice(0, 2)}***${text.slice(-1)}`;
+}
+
+export const usersRouter = router({
+    list: adminProcedure.query(async () => {
+      return db.getAllUsers();
+    }),
+    options: adminProcedure.query(async () => {
+      return db.getUserOptions();
+    }),
+    listPage: adminProcedure
+      .input(z.object({
+        page: z.number().int().positive().default(1),
+        pageSize: z.number().int().min(1).max(100).default(12),
+      }))
+      .query(async ({ input }) => {
+        return db.getUsersPage(input);
+      }),
+    summary: adminProcedure.query(async () => {
+      const [counts, stats] = await Promise.all([
+        db.getUserManagementCounts(),
+        db.getDashboardStats(),
+      ]);
+      return {
+        ...counts,
+        totalRules: stats.totalRules,
+        activeRules: stats.activeRules,
+        totalTrafficIn: stats.totalTrafficIn,
+        totalTrafficOut: stats.totalTrafficOut,
+      };
+    }),
+    create: adminProcedure
+      .input(z.object({
+        username: z.string().min(1).max(64),
+        password: z.string().min(6),
+        name: z.string().trim().max(DISPLAY_NAME_MAX_LENGTH).optional(),
+        email: z.string().email().optional(),
+        canAddRules: z.boolean().default(false),
+      }))
+      .mutation(async ({ input, ctx }) => {
+        const existing = await db.getUserByUsername(input.username);
+        if (existing) {
+          console.warn(`[Users] Create user rejected duplicate username=${maskIdentifier(input.username)} ${actorLabel(ctx)}`);
+          throw new Error("用户名已存在");
+        }
+        // 安全限制：通过后台创建的用户一律为普通用户，不允许创建新管理员
+        const id = await db.createUser({ ...input, role: "user" });
+        console.info(`[Users] Created user userId=${id} username=${maskIdentifier(input.username)} ${actorLabel(ctx)}`);
+        return { id };
+      }),
+    updateRole: adminProcedure
+      .input(z.object({ userId: z.number(), role: z.enum(["user", "admin"]) }))
+      .mutation(async ({ input, ctx }) => {
+        // 安全限制：不允许提升用户为管理员，也不允许修改已有管理员的角色
+        if (input.role === "admin") {
+          console.warn(`[Users] Role update rejected userId=${input.userId} requestedRole=admin ${actorLabel(ctx)}`);
+          throw new Error("出于安全考虑，不允许将用户提升为管理员");
+        }
+        const target = await db.getUserById(input.userId);
+        if (target?.role === "admin") {
+          console.warn(`[Users] Role update rejected target is admin userId=${input.userId} ${actorLabel(ctx)}`);
+          throw new Error("不允许修改管理员账户的角色");
+        }
+        await db.updateUserRole(input.userId, input.role);
+        await db.setUserForwardAccess(input.userId, false);
+        await refreshUserForwardEndpoints(input.userId, "user-role-updated");
+        console.info(`[Users] Updated role userId=${input.userId} role=${input.role} ${actorLabel(ctx)}`);
+        return { success: true };
+      }),
+    resetPassword: adminProcedure
+      .input(z.object({
+        userId: z.number(),
+        username: z.string().trim().min(1).max(64).optional(),
+        name: z.string().trim().max(DISPLAY_NAME_MAX_LENGTH).nullable().optional(),
+        avatar: z.string().max(90 * 1024).optional(),
+        newPassword: z.string().max(128).optional(),
+      }))
+      .mutation(async ({ input, ctx }) => {
+        const target = await db.getUserById(input.userId);
+        if (!target) throw new Error("用户不存在");
+        const username = input.username?.trim();
+        if (username && username !== target.username) {
+          const existing = await db.getUserByUsername(username);
+          if (existing && existing.id !== input.userId) throw new Error("账号已存在");
+        }
+        const password = input.newPassword?.trim() || "";
+        if (password && password.length < 6) throw new Error("密码至少6个字符");
+        if (input.avatar !== undefined && !isValidAvatarValue(input.avatar)) throw new Error("头像格式不支持或超过 50K");
+        if (!username && input.name === undefined && input.avatar === undefined && !password) throw new Error("没有需要保存的修改");
+        await db.updateUserAccount(input.userId, {
+          username,
+          name: input.name,
+          avatar: input.avatar,
+          password: password || undefined,
+        });
+        console.info(`[Users] Updated account userId=${input.userId} usernameChanged=${!!username && username !== target.username} passwordChanged=${!!password} ${actorLabel(ctx)}`);
+        return { success: true };
+      }),
+    updateAvatar: protectedProcedure
+      .input(z.object({
+        userId: z.number().optional(),
+        avatar: z.string().max(90 * 1024),
+      }))
+      .mutation(async ({ input, ctx }) => {
+        const userId = input.userId ?? ctx.user.id;
+        ensureAdminOrSelf(ctx, userId);
+        if (!isValidAvatarValue(input.avatar)) throw new Error("头像格式不支持或超过 50K");
+        const target = await db.getUserById(userId);
+        if (!target) throw new Error("用户不存在");
+        const quota = await db.updateUserAvatarWithQuota(userId, input.avatar, { actorRole: ctx.user.role, countQuota: userId === ctx.user.id });
+        console.info(`[Users] Updated avatar userId=${userId} ${actorLabel(ctx)}`);
+        return { success: true, quota };
+      }),
+    randomAvatar: protectedProcedure
+      .input(z.object({ userId: z.number().optional() }).optional())
+      .mutation(async ({ input, ctx }) => {
+        const userId = input?.userId ?? ctx.user.id;
+        ensureAdminOrSelf(ctx, userId);
+        const target = await db.getUserById(userId);
+        if (!target) throw new Error("用户不存在");
+        const result = await db.updateUserAvatarRandomWithQuota(userId, { actorRole: ctx.user.role, countQuota: userId === ctx.user.id });
+        console.info(`[Users] Randomized avatar userId=${userId} ${actorLabel(ctx)}`);
+        return { success: true, ...result };
+      }),
+    avatarQuota: protectedProcedure
+      .input(z.object({ userId: z.number().optional() }).optional())
+      .query(async ({ input, ctx }) => {
+        const userId = input?.userId ?? ctx.user.id;
+        ensureAdminOrSelf(ctx, userId);
+        return db.getUserAvatarQuota(userId);
+      }),
+    delete: adminProcedure
+      .input(z.object({ userId: z.number() }))
+      .mutation(async ({ input, ctx }) => {
+        if (input.userId === ctx.user.id) throw new Error("不能删除当前登录账户");
+        await db.deleteUserPermissions(input.userId);
+        clearLinkAccessScopeCache();
+        await db.deleteUser(input.userId);
+        console.info(`[Users] Deleted user userId=${input.userId} ${actorLabel(ctx)}`);
+        return { success: true };
+      }),
+    removeTwoFactor: adminProcedure
+      .input(z.object({ userId: z.number() }))
+      .mutation(async ({ input, ctx }) => {
+        const target = await db.getUserById(input.userId);
+        if (!target) throw new Error("用户不存在");
+        if (!target.twoFactorEnabled && !target.twoFactorSecret) {
+          return { success: true, removed: false };
+        }
+        await db.disableUserTwoFactor(input.userId);
+        console.info(`[Users] Removed 2FA userId=${input.userId} ${actorLabel(ctx)}`);
+        return { success: true, removed: true };
+      }),
+    /** 获取某用户的主机权限列表 */
+    getHostPermissions: adminProcedure
+      .input(z.object({ userId: z.number() }))
+      .query(async ({ input }) => {
+        // 管理编辑页只展示管理员手动授权；套餐绑定资源在订阅管理中体现。
+        return db.getUserAllowedHostIds(input.userId);
+      }),
+    /** 设置某用户的主机权限（全量替换） */
+    setHostPermissions: adminProcedure
+      .input(z.object({ userId: z.number(), hostIds: z.array(z.number()) }))
+      .mutation(async ({ input, ctx }) => {
+        await withKeyedTaskLock(`user-resource-permissions:${input.userId}`, async () => {
+          await db.setUserHostPermissions(input.userId, input.hostIds);
+          clearLinkAccessScopeCache();
+          await reconcileUserRuleResourceAuthorization(input.userId);
+        });
+        console.info(`[Users] Updated host permissions userId=${input.userId} count=${input.hostIds.length} ${actorLabel(ctx)}`);
+        return { success: true };
+      }),
+
+    getForwardGroupPermissions: adminProcedure
+      .input(z.object({ userId: z.number() }))
+      .query(async ({ input }) => {
+        return db.getUserManualAllowedForwardGroupIds(input.userId);
+      }),
+    setForwardGroupPermissions: adminProcedure
+      .input(z.object({ userId: z.number(), forwardGroupIds: z.array(z.number()) }))
+      .mutation(async ({ input, ctx }) => {
+        await withKeyedTaskLock(`user-resource-permissions:${input.userId}`, async () => {
+          await db.setUserForwardGroupPermissions(input.userId, input.forwardGroupIds);
+          clearLinkAccessScopeCache();
+          await reconcileUserRuleResourceAuthorization(input.userId);
+        });
+        console.info(`[Users] Updated forward group permissions userId=${input.userId} count=${input.forwardGroupIds.length} ${actorLabel(ctx)}`);
+        return { success: true };
+      }),
+    /** 获取所有用户的主机权限映射 */
+    allHostPermissions: adminProcedure.query(async () => {
+      return db.getAllUserHostPermissions();
+    }),
+    getTrafficBillingPermissions: adminProcedure
+      .input(z.object({ userId: z.number() }))
+      .query(async ({ input }) => {
+        return db.getUserTrafficBillingPermissions(input.userId);
+      }),
+    setTrafficBillingPermissions: adminProcedure
+      .input(z.object({
+        userId: z.number(),
+        hostIds: z.array(z.number()),
+        tunnelIds: z.array(z.number()),
+        forwardGroupIds: z.array(z.number()).optional().default([]),
+      }))
+      .mutation(async ({ input, ctx }) => {
+        const recovery = await withKeyedTaskLock(`user-resource-permissions:${input.userId}`, async () => {
+          await db.setUserTrafficBillingPermissions(input.userId, input.hostIds, input.tunnelIds, input.forwardGroupIds);
+          clearLinkAccessScopeCache();
+          const nextRecovery = await db.recoverUserForwardAccessIfEligible(input.userId);
+          await reconcileUserRuleResourceAuthorization(input.userId);
+          return nextRecovery;
+        });
+        if (recovery.restored) {
+          await refreshUserForwardEndpoints(input.userId, "traffic-billing-permission-forward-restored");
+        }
+        console.info(`[Users] Updated traffic billing permissions userId=${input.userId} hosts=${input.hostIds.length} tunnels=${input.tunnelIds.length} forwardGroups=${input.forwardGroupIds.length} ${actorLabel(ctx)}`);
+        return { success: true, forwardAccessRestored: recovery.restored };
+      }),
+    getTunnelPermissions: adminProcedure
+      .input(z.object({ userId: z.number() }))
+      .query(async ({ input }) => {
+        // 管理编辑页只展示管理员手动授权；套餐绑定资源在订阅管理中体现。
+        return db.getUserAllowedTunnelIds(input.userId);
+      }),
+    setTunnelPermissions: adminProcedure
+      .input(z.object({ userId: z.number(), tunnelIds: z.array(z.number()) }))
+      .mutation(async ({ input, ctx }) => {
+        await withKeyedTaskLock(`user-resource-permissions:${input.userId}`, async () => {
+          await db.setUserTunnelPermissions(input.userId, input.tunnelIds);
+          clearLinkAccessScopeCache();
+          await reconcileUserRuleResourceAuthorization(input.userId);
+        });
+        console.info(`[Users] Updated tunnel permissions userId=${input.userId} count=${input.tunnelIds.length} ${actorLabel(ctx)}`);
+        return { success: true };
+      }),
+    sendEmail: adminProcedure
+      .input(z.object({
+        userId: z.number(),
+        subject: z.string().trim().min(1).max(120),
+        content: z.string().trim().min(1).max(4000),
+      }))
+      .mutation(async ({ input, ctx }) => {
+        const config = await getEmailConfig();
+        if (!config.enabled) throw new Error("邮箱服务未启用");
+        const user = await db.getUserById(input.userId);
+        if (!user) throw new Error("用户不存在");
+        if (!user.email || !user.emailVerified) throw new Error("该用户邮箱尚未验证，不能发送邮件");
+        await sendMail({
+          to: user.email,
+          subject: input.subject.trim(),
+          text: input.content.trim(),
+          html: input.content.trim().replace(/\n/g, "<br />"),
+        });
+        console.info(`[Users] Sent email userId=${input.userId} subjectLength=${input.subject.trim().length} ${actorLabel(ctx)}`);
+        return { success: true };
+      }),
+    allTunnelPermissions: adminProcedure.query(async () => {
+      return db.getAllUserTunnelPermissions();
+    }),
+    /** 获取某用户的规则数和端口数 */
+    getUserQuotaUsage: protectedProcedure
+      .input(z.object({ userId: z.number() }))
+      .query(async ({ input, ctx }) => {
+        ensureAdminOrSelf(ctx, input.userId);
+        const [ruleCount, portCount] = await Promise.all([
+          db.getUserRuleCount(input.userId),
+          db.getUserPortCount(input.userId),
+        ]);
+        return { ruleCount, portCount };
+      }),
+    /** 更新用户流量管理和权限设置 */
+    updateTrafficSettings: adminProcedure
+      .input(z.object({
+        userId: z.number(),
+        trafficLimit: z.number().min(0).optional(),
+        gostRateLimitIn: z.number().int().min(0).max(1_000_000).optional(),
+        gostRateLimitOut: z.number().int().min(0).max(1_000_000).optional(),
+        expiresAt: z.string().nullable().optional(), // ISO date string or null
+        trafficAutoReset: z.boolean().optional(),
+        trafficResetDay: z.number().min(1).max(28).optional(),
+        canAddRules: z.boolean().optional(),
+        displayRemark: z.string().trim().max(24).nullable().optional(),
+        maxRules: z.number().min(0).optional(),
+        maxPorts: z.number().min(0).optional(),
+        maxConnections: z.number().min(0).optional(),
+        maxIPs: z.number().min(0).optional(),
+        // 逗号分隔的转发方式列表；null 为全部允许
+        allowedForwardTypes: z.string().nullable().optional(),
+        allowForwardXTunnel: z.boolean().optional(),
+      }))
+      .mutation(async ({ input, ctx }) => {
+        const { userId, expiresAt, allowedForwardTypes, ...rest } = input;
+        const data: any = { ...rest };
+        if (data.trafficLimit !== undefined) {
+          data.manualTrafficLimit = Math.max(0, Math.floor(Number(data.trafficLimit) || 0));
+          delete data.trafficLimit;
+        }
+        if (data.gostRateLimitIn !== undefined) {
+          data.manualGostRateLimitIn = Math.max(0, Math.floor(Number(data.gostRateLimitIn) || 0));
+          delete data.gostRateLimitIn;
+        }
+        if (data.gostRateLimitOut !== undefined) {
+          data.manualGostRateLimitOut = Math.max(0, Math.floor(Number(data.gostRateLimitOut) || 0));
+          delete data.gostRateLimitOut;
+        }
+        if (data.maxRules !== undefined) {
+          data.manualMaxRules = Math.max(0, Math.floor(Number(data.maxRules) || 0));
+          delete data.maxRules;
+        }
+        if (data.maxPorts !== undefined) {
+          data.manualMaxPorts = Math.max(0, Math.floor(Number(data.maxPorts) || 0));
+          delete data.maxPorts;
+        }
+        if (data.maxConnections !== undefined) {
+          data.manualMaxConnections = Math.max(0, Math.floor(Number(data.maxConnections) || 0));
+          delete data.maxConnections;
+        }
+        if (data.maxIPs !== undefined) {
+          data.manualMaxIPs = Math.max(0, Math.floor(Number(data.maxIPs) || 0));
+          delete data.maxIPs;
+        }
+        if (expiresAt !== undefined) {
+          data.manualExpiresAt = expiresAt ? new Date(expiresAt) : null;
+        }
+        if (allowedForwardTypes !== undefined) {
+          // null 表示全部允许；空字符串表示全部禁用。
+          const set = new Set((allowedForwardTypes ?? "").split(",").map(s => s.trim()).filter(Boolean));
+          const valid = FORWARD_TYPES.filter(t => set.has(t));
+          data.allowedForwardTypes = allowedForwardTypes === null || valid.length === FORWARD_TYPES.length ? null : valid.join(",");
+        }
+        if (input.displayRemark !== undefined) {
+          data.displayRemark = input.displayRemark?.trim() || null;
+        }
+        if (input.canAddRules !== undefined) {
+          data.manualCanAddRules = input.canAddRules;
+          data.forwardAccessPauseReason = input.canAddRules ? null : "manual";
+          data.manualAllowForwardXTunnel = input.canAddRules ? (data.allowForwardXTunnel ?? true) : false;
+          delete data.canAddRules;
+          delete data.allowForwardXTunnel;
+        }
+        const shouldRefreshRuntime = ["manualGostRateLimitIn", "manualGostRateLimitOut", "manualMaxConnections", "manualMaxIPs"].some((key) =>
+          Object.prototype.hasOwnProperty.call(data, key)
+        );
+        await db.updateUserManualEntitlements(userId, data);
+        if (shouldRefreshRuntime) {
+          await refreshUserForwardEndpoints(userId, "user-runtime-limits-updated");
+        }
+        console.info(`[Users] Updated traffic settings userId=${userId} keys=${Object.keys(data).join(",") || "none"} ${actorLabel(ctx)}`);
+        return { success: true };
+      }),
+    setForwardAccess: adminProcedure
+      .input(z.object({ userId: z.number(), enabled: z.boolean() }))
+      .mutation(async ({ input, ctx }) => {
+        await setUserForwardAccessCommand({ actor: ctx.user, targetUserId: input.userId, enabled: input.enabled });
+        console.info(`[Users] Forward access ${input.enabled ? "enabled" : "disabled"} userId=${input.userId} ${actorLabel(ctx)}`);
+        return { success: true };
+      }),
+    setAccountEnabled: adminProcedure
+      .input(z.object({ userId: z.number(), enabled: z.boolean() }))
+      .mutation(async ({ input, ctx }) => {
+        const result = await setUserAccountEnabledCommand({ actor: ctx.user, targetUserId: input.userId, enabled: input.enabled });
+        console.info(`[Users] Account ${input.enabled ? "enabled" : "disabled"} userId=${input.userId} ${actorLabel(ctx)}`);
+        return { success: true, forwardAccessRestored: result.forwardAccessRestored };
+      }),
+    /** 手动重置用户流量 */
+    resetTraffic: adminProcedure
+      .input(z.object({ userId: z.number() }))
+      .mutation(async ({ input, ctx }) => {
+        const result = await resetUserTrafficCommand({ actor: ctx.user, targetUserId: input.userId });
+        console.info(`[Users] Reset traffic userId=${input.userId} ${actorLabel(ctx)}`);
+        return { success: true, forwardAccessRestored: result.forwardAccessRestored };
+      }),
+  });

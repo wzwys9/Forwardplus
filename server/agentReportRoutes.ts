@@ -1,0 +1,1282 @@
+import { Router, Request, Response } from "express";
+import * as db from "./db";
+import { isHostMetricsWatching, pushAgentRefresh } from "./agentEvents";
+import {
+  isAgentForwardGroupLatencyResult,
+  isAgentHostProbeServiceResult,
+  isAgentHostTrafficStat,
+  isAgentTcpingResult,
+  isAgentTrafficStat,
+  isAgentTunnelTcpingResult,
+  type AgentForwardGroupLatencyResult,
+  type AgentHostProbeServiceResult,
+  type AgentHostTrafficStat,
+  type AgentTcpingResult,
+  type AgentTrafficStat,
+  type AgentTunnelTcpingResult,
+} from "../shared/agentDtos";
+import { recordForwardGroupAutoHopLatency } from "./forwardGroupAutoLatencyState";
+import { getTunnelAutoHopAggregate, recordTunnelAutoHopLatency } from "./tunnelAutoLatencyState";
+import { getTunnelMultiEntryLatency, recordTunnelMultiEntryLatency } from "./tunnelMultiEntryLatencyState";
+import { completeLookingGlassAgentTask, updateLookingGlassAgentTaskProgress, type LookingGlassMethod } from "./lookingGlassAgentTasks";
+import { completeIperf3AgentTask } from "./iperf3AgentTasks";
+import { completePluginAgentTask } from "./pluginAgentTasks";
+import { getAgentHostIdentityFromRequest } from "./agentAuth";
+import { applyTrafficMultiplier, normalizeTrafficMultiplier } from "../shared/trafficMultiplier";
+import { mapWithConcurrency } from "./asyncPool";
+import { forwardGroupProbeTopologyKey, tunnelProbeTopologyKey } from "./probeTopology";
+import { trafficBillingUserLockKey, withKeyedTaskLock } from "./keyedTaskLock";
+import { isTunnelRelayFailover, tunnelRelayCandidates } from "../shared/tunnelRelay";
+import { exitGroupUsesMultipleExits } from "../shared/exitStrategy";
+import { isRuleLatencyReportMethodCompatible } from "../shared/latencyProbe";
+import { completeSupportBundleHost } from "./supportBundle";
+import {
+  combineTunnelRuleLatencySample,
+  validateTunnelRuleLatencyReport,
+} from "./ruleLatency";
+import { clearRuleLatencyQueryCaches } from "./ruleLatencyQueryCache";
+import { agentTcpingReportGate } from "./agentTcpingReportGate";
+import { selectAgentTrafficReportInterval } from "./agentHeartbeatGate";
+
+const VERBOSE_AGENT_REPORTS = /^(1|true|yes|on)$/i.test(String(process.env.FORWARDX_VERBOSE_AGENT_REPORTS || ""));
+
+async function refreshUserRuleAgents(userId: number, reason: string) {
+  const rules = await db.getForwardRulesForUserSync(userId);
+  const hostIds = new Set<number>();
+  const tunnelIds = new Set<number>();
+  for (const rule of rules as any[]) {
+    if (rule.hostId) hostIds.add(Number(rule.hostId));
+    if (rule.tunnelId) tunnelIds.add(Number(rule.tunnelId));
+  }
+  for (const tunnelId of tunnelIds) {
+    const tunnel = await db.getTunnelById(tunnelId);
+    if (!tunnel) continue;
+    await db.updateTunnel(tunnelId, { isRunning: false } as any);
+    hostIds.add(Number(tunnel.entryHostId));
+    hostIds.add(Number(tunnel.exitHostId));
+  }
+  for (const hostId of hostIds) {
+    if (hostId > 0) pushAgentRefresh(hostId, reason);
+  }
+}
+
+function cleanTunnelSeriesKey(value: unknown) {
+  const key = String(value || "").trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return key.slice(0, 64);
+}
+
+function cleanTunnelSeriesLabel(value: unknown, fallback: string) {
+  const label = String(value || "").trim().replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ");
+  return (label || fallback).slice(0, 96);
+}
+function isForwardXTunnel(tunnel: any) {
+  return String(tunnel?.mode || "").toLowerCase() === "forwardx";
+}
+
+function tunnelUsesExtraExitHosts(tunnel: any) {
+  return !!tunnel?.loadBalanceEnabled
+    && String(tunnel?.loadBalanceStrategy || "").trim().toLowerCase() !== "none";
+}
+
+async function withTrafficAccountingUserLocks<T>(userIds: number[], task: () => Promise<T>): Promise<T> {
+  const keys = Array.from(new Set(userIds
+    .map((id) => Math.floor(Number(id) || 0))
+    .filter((id) => id > 0)))
+    .sort((left, right) => left - right)
+    .map(trafficBillingUserLockKey);
+  const run = (index: number): Promise<T> => index >= keys.length
+    ? task()
+    : withKeyedTaskLock(keys[index], () => run(index + 1));
+  return run(0);
+}
+
+export function trafficAccountingHostIds(
+  rule: any,
+  tunnel: any | null,
+  entryHostIds: Set<number> | undefined,
+  extraExitHostIds: Set<number> | undefined,
+) {
+  if (!tunnel) return new Set([Number(rule.hostId || 0)]);
+  if (isForwardXTunnel(tunnel)) {
+    return entryHostIds && entryHostIds.size > 0
+      ? new Set(entryHostIds)
+      : new Set([Number(tunnel.entryHostId || 0)]);
+  }
+  const ids = new Set<number>([Number(tunnel.exitHostId || 0)]);
+  if (tunnelUsesExtraExitHosts(tunnel)) {
+    for (const hostId of extraExitHostIds || []) ids.add(Number(hostId));
+  }
+  return ids;
+}
+
+export function shouldAccountForwardRuleTraffic(rule: any, group: any | null) {
+  const groupId = Number(rule?.forwardGroupId || 0);
+  const templateId = Number(rule?.forwardGroupRuleId || 0);
+  const memberId = Number(rule?.forwardGroupMemberId || 0);
+  if (!groupId || !templateId || !memberId) return true;
+  if (String(group?.groupMode || "failover") !== "chain") return true;
+  const members = [...(group.members || [])]
+    .filter((member: any) => !!member.isEnabled)
+    .sort((a: any, b: any) => Number(a.priority) - Number(b.priority));
+  const firstMember = members[0] as any;
+  if (Number(firstMember?.id || 0) !== memberId) return false;
+  const firstHostId = Number(firstMember?.hostId || 0);
+  if (!firstHostId) return true;
+  return Number(rule?.hostId || 0) === firstHostId;
+}
+
+function quotaTrafficMultiplierForRule(rule: any, tunnel: any | null, group: any | null) {
+  const groupId = Number(rule?.forwardGroupId || 0);
+  if (groupId > 0) {
+    if (group && ["port", "chain", "failover"].includes(String(group?.groupMode || "failover"))) {
+      return normalizeTrafficMultiplier(group?.trafficMultiplier);
+    }
+  }
+  if (tunnel) return normalizeTrafficMultiplier((tunnel as any).trafficMultiplier);
+  return 100;
+}
+
+const trafficReportLogIntervalMs = 10_000;
+const tcpingReportLogIntervalMs = 30_000;
+
+type TrafficReportLogBucket = {
+  lastLoggedAt: number;
+  samples: number;
+  bytesIn: number;
+  bytesOut: number;
+  connectionsMax: number;
+};
+
+const trafficReportLogBuckets = new Map<string, TrafficReportLogBucket>();
+const reportLogTimes = new Map<string, number>();
+
+function logTrafficReportSample(key: string, label: string, bytesIn: number, bytesOut: number, connections: number) {
+  if (!VERBOSE_AGENT_REPORTS) return;
+  const now = Date.now();
+  const bucket = trafficReportLogBuckets.get(key) || {
+    lastLoggedAt: 0,
+    samples: 0,
+    bytesIn: 0,
+    bytesOut: 0,
+    connectionsMax: 0,
+  };
+  bucket.samples += 1;
+  bucket.bytesIn += Math.max(0, Number(bytesIn) || 0);
+  bucket.bytesOut += Math.max(0, Number(bytesOut) || 0);
+  bucket.connectionsMax = Math.max(bucket.connectionsMax, Number(connections) || 0);
+  if (bucket.lastLoggedAt === 0 || now - bucket.lastLoggedAt >= trafficReportLogIntervalMs) {
+    console.log(`${label} samples=${bucket.samples} in=${bucket.bytesIn} out=${bucket.bytesOut} connectionsMax=${bucket.connectionsMax}`);
+    trafficReportLogBuckets.set(key, {
+      lastLoggedAt: now,
+      samples: 0,
+      bytesIn: 0,
+      bytesOut: 0,
+      connectionsMax: 0,
+    });
+    return;
+  }
+  trafficReportLogBuckets.set(key, bucket);
+}
+
+function shouldLogReport(key: string, intervalMs: number) {
+  const now = Date.now();
+  const last = reportLogTimes.get(key) || 0;
+  if (now - last < intervalMs) return false;
+  reportLogTimes.set(key, now);
+  return true;
+}
+
+function logTcpingReportSummary(
+  hostId: number,
+  results: AgentTcpingResult[],
+  tunnelResults: AgentTunnelTcpingResult[],
+  forwardGroupResults: AgentForwardGroupLatencyResult[],
+  serviceResults: AgentHostProbeServiceResult[],
+) {
+  if (!VERBOSE_AGENT_REPORTS) return;
+  if (!shouldLogReport(`tcping:${hostId}`, tcpingReportLogIntervalMs)) return;
+  const all = [...results, ...tunnelResults, ...forwardGroupResults, ...serviceResults] as Array<{ latencyMs?: unknown; isTimeout?: unknown }>;
+  const timeouts = all.filter((item) => !!item.isTimeout).length;
+  const latencies = all
+    .map((item) => Number(item.latencyMs))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const avgLatency = latencies.length
+    ? `${Math.round(latencies.reduce((sum, value) => sum + value, 0) / latencies.length)}ms`
+    : "-";
+  console.info(`[Agent TCPing] host=${hostId} rules=${results.length} tunnels=${tunnelResults.length} groups=${forwardGroupResults.length} services=${serviceResults.length} timeouts=${timeouts}/${all.length} avg=${avgLatency}`);
+}
+
+function compactTrafficStats(value: unknown): AgentTrafficStat[] {
+  if (!Array.isArray(value)) return [];
+  const stats: AgentTrafficStat[] = [];
+  for (const row of value) {
+    if (!Array.isArray(row)) continue;
+    const ruleId = Number(row[0]);
+    if (!Number.isFinite(ruleId)) continue;
+    stats.push({
+      ruleId,
+      bytesIn: Number(row[1]) || 0,
+      bytesOut: Number(row[2]) || 0,
+      connections: Number(row[3]) || 0,
+    });
+  }
+  return stats;
+}
+
+async function tunnelEntryHostIds(tunnel: any) {
+  const ids = new Set<number>();
+  const primary = Number(tunnel?.entryHostId || 0);
+  if (primary > 0) ids.add(primary);
+  const entryGroupId = Number(tunnel?.entryGroupId || 0);
+  if (entryGroupId > 0) {
+    const group = await db.getForwardGroupById(entryGroupId) as any;
+    if (group?.isEnabled && String(group.groupMode || "") === "entry") {
+      for (const member of group.members || []) {
+        const hostId = member?.isEnabled !== false && member?.memberType === "host" ? Number(member.hostId || 0) : 0;
+        if (hostId > 0) ids.add(hostId);
+      }
+    }
+  }
+  return ids;
+}
+
+export function tunnelProbeTargetHostId(
+  tunnel: any,
+  hops: any[],
+  exitNodes: any[],
+  report: AgentTunnelTcpingResult,
+  seriesKey = "",
+) {
+  const hopIndex = Number(report.hopIndex);
+  const hopCount = Number(report.hopCount);
+  if (Number.isInteger(hopIndex) && Number.isInteger(hopCount) && hopCount > 0) {
+    if (isTunnelRelayFailover(tunnel, hops) && /^relay-\d+$/.test(seriesKey)) {
+      const relayIndex = Number(seriesKey.slice("relay-".length)) - 1;
+      const relay = tunnelRelayCandidates(hops)[relayIndex] as any;
+      if (relay && hopIndex === 0) return Number(relay.hostId || 0) || null;
+      if (relay && hopIndex === 1) return Number(hops[hops.length - 1]?.hostId || 0) || null;
+    }
+    return Number(hops[hopIndex + 1]?.hostId || 0) || null;
+  }
+  if (seriesKey === "primary") return Number(tunnel?.exitHostId || 0) || null;
+  const exitMatch = seriesKey.match(/^exit-(\d+)$/);
+  if (exitMatch && tunnel?.loadBalanceEnabled && exitGroupUsesMultipleExits(tunnel?.loadBalanceStrategy)) {
+    const exitIndex = Number(exitMatch[1]) - 2;
+    const activeExits = [...(exitNodes || [])]
+      .filter((node) => node?.isEnabled !== false && Number(node?.hostId || 0) > 0 && Number(node?.listenPort || 0) > 0)
+      .sort((left, right) => Number(left?.seq || 0) - Number(right?.seq || 0));
+    if (exitIndex >= 0) return Number(activeExits[exitIndex]?.hostId || 0) || null;
+  }
+  return Number(tunnel?.exitHostId || 0) || null;
+}
+
+type TunnelRelayAggregate = {
+  key: string;
+  label: string;
+  aggregate: { success: boolean; latencyMs: number | null } | null;
+};
+
+export function readyTunnelRelayAggregates(aggregates: TunnelRelayAggregate[]) {
+  const completed = aggregates.filter((item): item is TunnelRelayAggregate & {
+    aggregate: { success: boolean; latencyMs: number | null };
+  } => item.aggregate !== null);
+  return completed.some((item) => item.aggregate.success) || completed.length === aggregates.length
+    ? completed
+    : [];
+}
+
+export async function validateTunnelProbeSource(
+  hostId: number,
+  tunnel: any,
+  report: AgentTunnelTcpingResult,
+  context?: { hops: any[]; exitNodes: any[]; entryHostIds?: Set<number>; topologyKey?: string },
+) {
+  if (!tunnel?.isEnabled) return false;
+  const hops = context?.hops || await db.getTunnelHops(Number(tunnel.id)) as any[];
+  const exitNodes = context?.exitNodes || await db.getTunnelExitNodes(Number(tunnel.id)) as any[];
+  const topologyKey = String((report as any).topologyKey || "");
+  const expectedTopologyKey = context?.topologyKey || tunnelProbeTopologyKey(tunnel, hops, exitNodes);
+  if (topologyKey && topologyKey !== expectedTopologyKey) return false;
+  const hopIndex = Number(report.hopIndex);
+  const hopCount = Number(report.hopCount);
+  if (Number.isInteger(hopIndex) && Number.isInteger(hopCount) && hopCount > 0) {
+    if (isTunnelRelayFailover(tunnel, hops)) {
+      const relayMatch = String(report.seriesKey || "").match(/^relay-(\d+)$/);
+      const relayIndex = Number(relayMatch?.[1] || 0);
+      const relays = tunnelRelayCandidates(hops) as any[];
+      if (!relayMatch || relayIndex <= 0 || relayIndex > relays.length || hopCount !== 2 || hopIndex < 0 || hopIndex > 1) return false;
+      const relay = relays[relayIndex - 1] as any;
+      if (hopIndex === 0) {
+        const entryHostIds = context?.entryHostIds || await tunnelEntryHostIds(tunnel);
+        return entryHostIds.has(Number(hostId))
+          && (!report.targetPort || Number(relay?.listenPort || 0) === Number(report.targetPort));
+      }
+      const finalExit = hops[hops.length - 1] as any;
+      return Number(relay?.hostId || 0) === Number(hostId)
+        && (!report.targetPort || Number(finalExit?.listenPort || 0) === Number(report.targetPort));
+    }
+    if (!Array.isArray(hops) || hops.length - 1 !== hopCount || hopIndex < 0 || hopIndex >= hopCount) return false;
+    if (hopIndex === 0) {
+      const entryHostIds = context?.entryHostIds || await tunnelEntryHostIds(tunnel);
+      if (!entryHostIds.has(Number(hostId))) return false;
+    } else if (Number(hops[hopIndex]?.hostId || 0) !== Number(hostId)) {
+      return false;
+    }
+    const expectedPort = Number(hops[hopIndex + 1]?.listenPort || 0);
+    return !report.targetPort || expectedPort === Number(report.targetPort);
+  }
+  const entryHostIds = context?.entryHostIds || await tunnelEntryHostIds(tunnel);
+  if (!entryHostIds.has(Number(hostId))) return false;
+  const expectedPorts = new Set<number>([Number(tunnel.listenPort || 0)]);
+  for (const node of exitNodes) {
+    if (node?.isEnabled !== false && Number(node?.listenPort || 0) > 0) expectedPorts.add(Number(node.listenPort));
+  }
+  return !report.targetPort || expectedPorts.has(Number(report.targetPort));
+}
+
+function sameProbeTarget(left: unknown, right: unknown) {
+  return String(left || "").trim().replace(/^\[|\]$/g, "").toLowerCase()
+    === String(right || "").trim().replace(/^\[|\]$/g, "").toLowerCase();
+}
+
+export function summarizeTunnelBranches(branches: Array<{ latencyMs: number | null; isTimeout: boolean }>) {
+  const successful = branches.filter((branch) => !branch.isTimeout && Number(branch.latencyMs || 0) > 0);
+  return {
+    unavailable: successful.length === 0,
+    partial: successful.length > 0 && successful.length < branches.length,
+    latencyMs: successful.length > 0 ? Math.max(...successful.map((branch) => Number(branch.latencyMs))) : null,
+  };
+}
+
+function compactHostTraffic(value: unknown): AgentHostTrafficStat | null {
+  if (!Array.isArray(value)) return null;
+  const bytesIn = Number(value[0]) || 0;
+  const bytesOut = Number(value[1]) || 0;
+  if (!Number.isFinite(bytesIn) && !Number.isFinite(bytesOut)) return null;
+  return { bytesIn, bytesOut };
+}
+
+export function registerAgentReportRoutes(agentRouter: Router) {
+agentRouter.post("/api/agent/support-bundle-result", async (req: Request, res: Response) => {
+  try {
+    const host = await getAgentHostIdentityFromRequest(req);
+    if (!host) {
+      res.status(401).json({ error: "Invalid token" });
+      return;
+    }
+    const taskId = String(req.body?.taskId || "").trim();
+    if (!taskId) {
+      res.status(400).json({ error: "taskId is required" });
+      return;
+    }
+    const accepted = completeSupportBundleHost(taskId, Number(host.id), {
+      diagnostics: req.body?.diagnostics,
+      error: req.body?.error,
+    });
+    res.json({ success: accepted });
+  } catch {
+    console.error("[SupportBundle] Agent report failed");
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+agentRouter.post("/api/agent/looking-glass-result", async (req: Request, res: Response) => {
+  try {
+    const host = await getAgentHostIdentityFromRequest(req);
+    if (!host) {
+      res.status(401).json({ error: "Invalid token" });
+      return;
+    }
+
+    const result = req.body?.result;
+    if (!result?.taskId) {
+      res.status(400).json({ error: "result.taskId is required" });
+      return;
+    }
+    const ok = completeLookingGlassAgentTask(host.id, {
+      taskId: String(result.taskId),
+      method: result.method as LookingGlassMethod,
+      target: String(result.target || ""),
+      port: result.port === undefined || result.port === null ? undefined : Number(result.port),
+      resolvedAddress: String(result.resolvedAddress || ""),
+      resolvedAddresses: Array.isArray(result.resolvedAddresses) ? result.resolvedAddresses.map(String) : [],
+      output: String(result.output || ""),
+      exitCode: result.exitCode === undefined || result.exitCode === null ? null : Number(result.exitCode),
+      timedOut: !!result.timedOut,
+      durationMs: Number(result.durationMs || 0),
+      startedAt: String(result.startedAt || new Date().toISOString()),
+      finishedAt: String(result.finishedAt || new Date().toISOString()),
+      error: result.error ? String(result.error) : undefined,
+    });
+    res.json({ success: ok });
+  } catch (error) {
+    console.error("[Agent LookingGlass] Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+agentRouter.post("/api/agent/looking-glass-progress", async (req: Request, res: Response) => {
+  try {
+    const host = await getAgentHostIdentityFromRequest(req);
+    if (!host) {
+      res.status(401).json({ error: "Invalid token" });
+      return;
+    }
+
+    const result = req.body?.result;
+    if (!result?.taskId) {
+      res.status(400).json({ error: "result.taskId is required" });
+      return;
+    }
+    const ok = updateLookingGlassAgentTaskProgress(host.id, {
+      taskId: String(result.taskId),
+      output: String(result.output || ""),
+      durationMs: Number(result.durationMs || 0),
+      startedAt: String(result.startedAt || new Date().toISOString()),
+      error: result.error ? String(result.error) : undefined,
+    });
+    res.json({ success: ok });
+  } catch (error) {
+    console.error("[Agent LookingGlassProgress] Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+agentRouter.post("/api/agent/iperf3-result", async (req: Request, res: Response) => {
+  try {
+    const host = await getAgentHostIdentityFromRequest(req);
+    if (!host) {
+      res.status(401).json({ error: "Invalid token" });
+      return;
+    }
+
+    const result = req.body?.result;
+    if (!result?.taskId) {
+      res.status(400).json({ error: "result.taskId is required" });
+      return;
+    }
+    const ok = completeIperf3AgentTask(host.id, {
+      taskId: String(result.taskId),
+      op: result.op === "stop" ? "stop" : "start",
+      port: Number(result.port || 5201),
+      status: result.status === "stopped" ? "stopped" : result.status === "error" ? "error" : "running",
+      output: String(result.output || ""),
+      pid: result.pid === undefined || result.pid === null ? null : Number(result.pid),
+      startedAt: result.startedAt ? String(result.startedAt) : undefined,
+      updatedAt: result.updatedAt ? String(result.updatedAt) : undefined,
+      error: result.error ? String(result.error) : undefined,
+    });
+    res.json({ success: ok });
+  } catch (error) {
+    console.error("[Agent Iperf3] Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+agentRouter.post("/api/agent/plugin-action-result", async (req: Request, res: Response) => {
+  try {
+    const host = await getAgentHostIdentityFromRequest(req);
+    if (!host) {
+      res.status(401).json({ error: "Invalid token" });
+      return;
+    }
+    const result = req.body?.result;
+    if (!result?.taskId || !result?.groupId || !result?.pluginId || !result?.actionId) {
+      res.status(400).json({ error: "plugin action result identifiers are required" });
+      return;
+    }
+    let data = result.data;
+    if (data !== undefined) {
+      try {
+        if (Buffer.byteLength(JSON.stringify(data), "utf8") > 256 * 1024) {
+          res.status(400).json({ error: "plugin action result data is too large" });
+          return;
+        }
+      } catch {
+        res.status(400).json({ error: "plugin action result data is invalid" });
+        return;
+      }
+    }
+    const ok = completePluginAgentTask(host.id, {
+      taskId: String(result.taskId),
+      groupId: String(result.groupId),
+      pluginId: String(result.pluginId),
+      actionId: String(result.actionId),
+      success: !!result.success,
+      output: String(result.output || "").slice(0, 256 * 1024),
+      stderr: String(result.stderr || "").slice(0, 256 * 1024),
+      data,
+      exitCode: result.exitCode === undefined || result.exitCode === null ? null : Number(result.exitCode),
+      timedOut: !!result.timedOut,
+      durationMs: Math.max(0, Number(result.durationMs || 0)),
+      startedAt: result.startedAt ? String(result.startedAt) : undefined,
+      finishedAt: result.finishedAt ? String(result.finishedAt) : undefined,
+      error: result.error ? String(result.error).slice(0, 4000) : undefined,
+      errorDetail: result.errorDetail ? String(result.errorDetail).slice(0, 4000) : undefined,
+      advice: result.advice ? String(result.advice).slice(0, 4000) : undefined,
+      processError: result.processError ? String(result.processError).slice(0, 4000) : undefined,
+    });
+    if (ok) await db.syncPluginAgentActionState(String(result.pluginId), String(result.groupId));
+    res.json({ success: ok });
+  } catch (error) {
+    console.error("[Agent Plugin Action] Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+agentRouter.post("/api/agent/traffic", async (req: Request, res: Response) => {
+  const requestStartedAt = Date.now();
+  let logHostId = 0;
+  let logHostName = "";
+  let reportedStatCount = 0;
+  let strictTrafficAccounting = false;
+  let trafficReportId = "";
+  let trafficReportProducerId = "";
+  let duplicateTrafficReport = false;
+  try {
+    const host = await getAgentHostIdentityFromRequest(req);
+    if (!host) {
+      res.status(401).json({ error: "Invalid token" });
+      return;
+    }
+    logHostId = Number((host as any).id || 0);
+    logHostName = String((host as any).name || "").trim();
+    trafficReportId = typeof req.body?.reportId === "string"
+      ? req.body.reportId.trim().slice(0, 128)
+      : "";
+    trafficReportProducerId = typeof req.body?.reportProducerId === "string"
+      ? req.body.reportProducerId.trim().slice(0, 128)
+      : "";
+
+    const objectStats = Array.isArray(req.body?.stats)
+      ? req.body.stats.filter(isAgentTrafficStat)
+      : [];
+    const compactStats = compactTrafficStats(req.body?.s);
+    const stats: AgentTrafficStat[] = objectStats.length > 0 ? objectStats : compactStats;
+    reportedStatCount = stats.length;
+    const hostTraffic: AgentHostTrafficStat | null = isAgentHostTrafficStat(req.body?.hostTraffic)
+      ? req.body.hostTraffic
+      : compactHostTraffic(req.body?.h);
+    if (!Array.isArray(req.body?.stats) && !Array.isArray(req.body?.s) && !hostTraffic) {
+      res.status(400).json({ error: "stats array or hostTraffic is required" });
+      return;
+    }
+    // An idle Agent may only report the host-wide network counters. Avoid
+    // opening the full traffic transaction and querying billing/rule/tunnel
+    // context when there are no rule deltas to account.
+    if (stats.length === 0) {
+      await db.withDatabaseTransaction(async () => {
+        if (trafficReportId && !await db.claimAgentTrafficReport(host.id, trafficReportId, trafficReportProducerId)) {
+          duplicateTrafficReport = true;
+          return;
+        }
+        if (hostTraffic) {
+          await db.recordHostTrafficSample(host.id, {
+            bytesIn: Number(hostTraffic.bytesIn) || 0,
+            bytesOut: Number(hostTraffic.bytesOut) || 0,
+          });
+        }
+      });
+      if (duplicateTrafficReport) {
+        res.json({ success: true, duplicate: true });
+        return;
+      }
+      const durationMs = Date.now() - requestStartedAt;
+      if (durationMs >= 2_000 && shouldLogReport(`traffic-slow:${logHostId}`, 60_000)) {
+        console.warn(`[Agent Traffic] slow host=${logHostId} name=${logHostName || "-"} stats=0 duration=${durationMs}ms`);
+      }
+      // No rule delta means the panel cannot infer whether this host is on a
+      // strict quota/billing path. Preserve the Agent's last confirmed policy.
+      res.json({ success: true });
+      return;
+    }
+
+    const preliminaryTrafficContexts = await db.getForwardRuleTrafficContextsByIds(
+      stats.map((stat) => Number(stat.ruleId)),
+    );
+    const accountingUserIds = (preliminaryTrafficContexts as any[])
+      .map((context) => Number(context?.rule?.userId || 0))
+      .filter((userId) => userId > 0);
+    await withTrafficAccountingUserLocks(accountingUserIds, () => db.withDatabaseTransaction(async () => {
+      // Lock database rows in the same deterministic order as the in-process
+      // keyed locks. This protects quota/billing counters when reports arrive
+      // concurrently on different panel instances.
+      await db.lockTrafficBillingUserRows(accountingUserIds);
+      if (trafficReportId && !await db.claimAgentTrafficReport(host.id, trafficReportId, trafficReportProducerId)) {
+        duplicateTrafficReport = true;
+        return;
+      }
+      if (hostTraffic) {
+        await db.recordHostTrafficSample(host.id, {
+          bytesIn: Number(hostTraffic.bytesIn) || 0,
+          bytesOut: Number(hostTraffic.bytesOut) || 0,
+        });
+      }
+
+    const quotaTrafficByUser = new Map<number, number>();
+    const trafficBatch: db.TrafficStatBatchItem[] = [];
+    const runningRuleIds = new Set<number>();
+    const billingEntries: Array<{
+      rule: any;
+      ruleBytes: number;
+      billingResource: NonNullable<Awaited<ReturnType<typeof db.findTrafficBillingResourceForRule>>>;
+    }> = [];
+    const trafficBillingEnabled = await db.getTrafficBillingEnabledForWrite();
+    const trafficContexts = await db.getForwardRuleTrafficContextsByIds(stats.map((stat) => Number(stat.ruleId)));
+    const contextsByRuleId = new Map((trafficContexts as any[]).map((context) => [Number(context.rule.id), context]));
+    const tunnelContextsById = new Map<number, any>();
+    for (const context of trafficContexts as any[]) {
+      const tunnelId = Number(context?.tunnel?.id || 0);
+      if (tunnelId > 0 && !tunnelContextsById.has(tunnelId)) {
+        tunnelContextsById.set(tunnelId, context.tunnel);
+      }
+    }
+    const tunnelContexts = Array.from(tunnelContextsById.values());
+    const tunnelIds = Array.from(tunnelContextsById.keys());
+    const [entryHostIdPairs, tunnelExitNodes] = await Promise.all([
+      Promise.all(tunnelContexts.map(async (tunnel) => [Number(tunnel.id), await tunnelEntryHostIds(tunnel)] as const)),
+      tunnelIds.length > 0
+        ? db.getTunnelExitNodesByTunnelIds(tunnelIds)
+        : Promise.resolve([]),
+    ]);
+    const entryHostsByTunnelId = new Map<number, Set<number>>(entryHostIdPairs);
+    const extraExitHostsByTunnelId = new Map<number, Set<number>>();
+    for (const node of tunnelExitNodes as any[]) {
+      const tunnelId = Number(node?.tunnelId || 0);
+      const hostId = Number(node?.hostId || 0);
+      if (tunnelId <= 0 || hostId <= 0 || node?.isEnabled === false) continue;
+      const hosts = extraExitHostsByTunnelId.get(tunnelId) || new Set<number>();
+      hosts.add(hostId);
+      extraExitHostsByTunnelId.set(tunnelId, hosts);
+    }
+    const rulesWithBytes = new Set(stats
+      .filter((stat) => (Number(stat.bytesIn) || 0) + (Number(stat.bytesOut) || 0) > 0)
+      .map((stat) => Number(stat.ruleId)));
+    const billingResourcesByRuleId = trafficBillingEnabled
+      ? await db.findTrafficBillingResourcesForRules((trafficContexts as any[])
+        .map((context) => context.rule)
+        .filter((rule) => rulesWithBytes.has(Number(rule.id))))
+      : new Map();
+    for (const stat of stats) {
+      const bytesIn = Number(stat.bytesIn) || 0;
+      const bytesOut = Number(stat.bytesOut) || 0;
+      const context = contextsByRuleId.get(Number(stat.ruleId)) as any;
+      if (!context) {
+        continue;
+      }
+      const { rule, tunnel, group } = context;
+      if ((rule as any).pendingDelete || !(rule as any).isEnabled) {
+        continue;
+      }
+      if (!shouldAccountForwardRuleTraffic(rule, group)) {
+        continue;
+      }
+      const tunnelId = Number((rule as any).tunnelId || 0);
+      const accountingHostIds = trafficAccountingHostIds(
+        rule,
+        tunnel,
+        entryHostsByTunnelId.get(Number(tunnel?.id || tunnelId)),
+        extraExitHostsByTunnelId.get(Number(tunnel?.id || tunnelId)),
+      );
+      if (!accountingHostIds.has(Number(host.id))) {
+        const ruleBytes = bytesIn + bytesOut;
+        if (ruleBytes > 0 && tunnel && !isForwardXTunnel(tunnel)) {
+          logTrafficReportSample(
+            `tunnel:${host.id}:${tunnelId}:${rule.id}`,
+            `[TunnelTraffic] host=${host.id} tunnel=${tunnelId} rule=${rule.id}`,
+            bytesIn,
+            bytesOut,
+            stat.connections || 0,
+          );
+        }
+        continue;
+      }
+      trafficBatch.push({
+        stat: {
+          ruleId: stat.ruleId,
+          hostId: host.id,
+          bytesIn,
+          bytesOut,
+          connections: stat.connections || 0,
+        },
+        userId: Number(rule.userId),
+      });
+      const ruleBytes = bytesIn + bytesOut;
+      if (ruleBytes > 0) {
+        if (!(rule as any).isRunning) runningRuleIds.add(Number(rule.id));
+        logTrafficReportSample(
+          `rule:${host.id}:${rule.id}`,
+          `[Traffic] host=${host.id} rule=${rule.id}`,
+          bytesIn,
+          bytesOut,
+          stat.connections || 0,
+        );
+        const billingResource = billingResourcesByRuleId.get(Number(rule.id));
+        if (billingResource?.config) {
+          billingEntries.push({ rule, ruleBytes, billingResource });
+        } else {
+          const quotaBytes = applyTrafficMultiplier(ruleBytes, quotaTrafficMultiplierForRule(rule, tunnel, group));
+          quotaTrafficByUser.set(rule.userId, (quotaTrafficByUser.get(rule.userId) || 0) + quotaBytes);
+        }
+      }
+    }
+
+    await db.insertTrafficStatsBatch(trafficBatch);
+    await db.markForwardRulesRunning(Array.from(runningRuleIds));
+
+    for (const { rule, ruleBytes, billingResource } of billingEntries) {
+      strictTrafficAccounting = true;
+      const user = await db.getUserById(Number(rule.userId));
+      if (user && Number((user as any).balanceCents || 0) <= 0) {
+        console.warn(`[TrafficBilling] user=${rule.userId} balance unavailable, disabling rules`);
+        await db.setUserForwardAccess(rule.userId, false, "traffic_billing_balance");
+        await refreshUserRuleAgents(rule.userId, "traffic-billing-balance-unavailable");
+        continue;
+      }
+      const billed = await db.billTrafficUsage({
+        userId: Number(rule.userId),
+        ruleId: Number(rule.id),
+        bytes: ruleBytes,
+        resourceType: billingResource.resourceType,
+        resourceId: billingResource.resourceId,
+      });
+      if (billed && billed.balanceAfterCents < 0) {
+        console.warn(`[TrafficBilling] user=${rule.userId} balance negative, disabling rules`);
+        await db.setUserForwardAccess(rule.userId, false, "traffic_billing_balance");
+        await refreshUserRuleAgents(rule.userId, "traffic-billing-balance-negative");
+      }
+    }
+
+    // 累加用户已用流量
+    await mapWithConcurrency(Array.from(quotaTrafficByUser.entries()), 8, async ([userId, totalBytes]) => {
+      if (totalBytes <= 0) return;
+      const user = await db.addUserTraffic(userId, totalBytes);
+
+      // 检查用户流量配额
+      if (user) {
+        if (Number(user.trafficLimit || 0) > 0) strictTrafficAccounting = true;
+        // 流量超额：自动禁用该用户所有规则
+        if (user.trafficLimit > 0 && user.trafficUsed >= user.trafficLimit) {
+          console.log(`[Traffic] User ${user.id} traffic exceeded limit, disabling rules`);
+          await db.setUserForwardAccess(user.id, false, "traffic_limit");
+          await refreshUserRuleAgents(user.id, "traffic-limit-exceeded");
+        }
+        // 账户到期：自动禁用该用户所有规则
+        if (user.expiresAt && new Date(user.expiresAt) <= new Date()) {
+          console.log(`[Traffic] User ${user.id} account expired, disabling rules`);
+          await db.setUserForwardAccess(user.id, false, "expired");
+          await refreshUserRuleAgents(user.id, "user-expired");
+        }
+      }
+    });
+    }));
+
+    if (duplicateTrafficReport) {
+      res.json({ success: true, duplicate: true });
+      return;
+    }
+
+    const durationMs = Date.now() - requestStartedAt;
+    if (durationMs >= 2_000 && shouldLogReport(`traffic-slow:${logHostId}`, 60_000)) {
+      console.warn(`[Agent Traffic] slow host=${logHostId} name=${logHostName || "-"} stats=${reportedStatCount} duration=${durationMs}ms`);
+    }
+
+    res.json({
+      success: true,
+      trafficReportInterval: selectAgentTrafficReportInterval({
+        metricsWatching: isHostMetricsWatching(Number(host.id)),
+        strictAccounting: strictTrafficAccounting,
+      }),
+    });
+  } catch (error) {
+    console.error(`[Agent Traffic] Error host=${logHostId || "-"} name=${logHostName || "-"}:`, error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Agent TCPing 上报接口
+agentRouter.post("/api/agent/tcping", async (req: Request, res: Response) => {
+  try {
+    const host = await getAgentHostIdentityFromRequest(req);
+    if (!host) {
+      res.status(401).json({ error: "Invalid token" });
+      return;
+    }
+
+    const parsedResults: AgentTcpingResult[] = Array.isArray(req.body?.results)
+      ? req.body.results.filter(isAgentTcpingResult)
+      : [];
+    const rawTunnelResults = Array.isArray(req.body?.tunnels)
+      ? req.body.tunnels
+      : (Array.isArray(req.body?.tunnelResults) ? req.body.tunnelResults : []);
+    const parsedTunnelResults: AgentTunnelTcpingResult[] = rawTunnelResults.filter(isAgentTunnelTcpingResult);
+    const rawForwardGroupResults = Array.isArray(req.body?.forwardGroups)
+      ? req.body.forwardGroups
+      : (Array.isArray(req.body?.forwardGroupResults) ? req.body.forwardGroupResults : []);
+    const parsedForwardGroupResults: AgentForwardGroupLatencyResult[] = rawForwardGroupResults.filter(isAgentForwardGroupLatencyResult);
+    const rawServiceResults = Array.isArray(req.body?.services)
+      ? req.body.services
+      : (Array.isArray(req.body?.serviceResults) ? req.body.serviceResults : []);
+    const parsedServiceResults: AgentHostProbeServiceResult[] = rawServiceResults.filter(isAgentHostProbeServiceResult);
+    if (parsedResults.length === 0 && parsedTunnelResults.length === 0 && parsedForwardGroupResults.length === 0 && parsedServiceResults.length === 0) {
+      res.status(400).json({ error: "results, tunnels, forwardGroups or services array is required" });
+      return;
+    }
+    const force = req.body?.force === true;
+    const topologyGatePlan = agentTcpingReportGate.plan({
+      hostId: Number(host.id),
+      force,
+      gateRules: false,
+      results: parsedResults,
+      tunnels: parsedTunnelResults,
+      forwardGroups: parsedForwardGroupResults,
+      services: parsedServiceResults,
+    });
+    const {
+      results,
+      tunnels: tunnelResults,
+      forwardGroups: forwardGroupResults,
+      services: serviceResults,
+    } = topologyGatePlan;
+    if (results.length === 0 && tunnelResults.length === 0 && forwardGroupResults.length === 0 && serviceResults.length === 0) {
+      res.json({ success: true });
+      return;
+    }
+    logTcpingReportSummary(host.id, results, tunnelResults, forwardGroupResults, serviceResults);
+
+    const tunnelResultsById = new Map<number, AgentTunnelTcpingResult[]>();
+    for (const report of tunnelResults) {
+      const tunnelId = Number(report.tunnelId || 0);
+      if (tunnelId <= 0) continue;
+      const rows = tunnelResultsById.get(tunnelId) || [];
+      rows.push(report);
+      tunnelResultsById.set(tunnelId, rows);
+    }
+    await mapWithConcurrency(Array.from(tunnelResultsById.entries()), 12, async ([tunnelId, reports]) => withKeyedTaskLock(`tunnel-latency:${tunnelId}`, async () => {
+      const [tunnel, hops, exitNodes] = await Promise.all([
+        db.getTunnelById(tunnelId),
+        db.getTunnelHops(tunnelId),
+        db.getTunnelExitNodes(tunnelId),
+      ]) as [any, any[], any[]];
+      if (!tunnel) return;
+      const entryHostIds = await tunnelEntryHostIds(tunnel);
+      const topologyKey = tunnelProbeTopologyKey(tunnel, hops, exitNodes);
+      const orderedEntryHostIds = Array.from(entryHostIds).sort((left, right) => left - right);
+      const multiEntry = orderedEntryHostIds.length > 1;
+      const multiEntryGeneration = `${topologyKey}:entries:${orderedEntryHostIds.join(",")}`;
+      const relayFailover = isTunnelRelayFailover(tunnel, hops);
+      const relayCandidateCount = relayFailover ? tunnelRelayCandidates(hops).length : 0;
+      const branchByKey = new Map<string, { key: string; label: string; latencyMs: number | null; isTimeout: boolean }>();
+      for (const report of reports) {
+        if (!await validateTunnelProbeSource(Number(host.id), tunnel, report, { hops, exitNodes, entryHostIds, topologyKey })) continue;
+        const latencyValue = typeof report.latencyMs === "number" && report.latencyMs > 0 ? report.latencyMs : null;
+        const isTimeout = !!report.isTimeout || latencyValue === null;
+        const seriesKey = cleanTunnelSeriesKey(report.seriesKey);
+        const hopIndex = Number(report.hopIndex);
+        const hopCount = Number(report.hopCount);
+        const hasHop = Number.isInteger(hopIndex) && Number.isInteger(hopCount) && hopCount > 0;
+        if (multiEntry) {
+          const aggregate = recordTunnelMultiEntryLatency({
+            tunnelId,
+            sourceHostId: Number(host.id),
+            sourceLabel: String((host as any).name || `入口 ${host.id}`),
+            expectedEntryHostIds: orderedEntryHostIds,
+            hopIndex: hasHop ? hopIndex : 0,
+            hopCount: hasHop ? hopCount : 1,
+            latencyMs: latencyValue,
+            isTimeout,
+            generation: multiEntryGeneration,
+            pathKey: seriesKey || "default",
+            toHostId: tunnelProbeTargetHostId(tunnel, hops, exitNodes, report, seriesKey),
+          });
+          if (!aggregate) continue;
+          const recordedAt = new Date();
+          await mapWithConcurrency(aggregate.details, 4, async (detail) => {
+            const detailSeriesKey = cleanTunnelSeriesKey(`entry-${detail.hostId}${seriesKey ? `-${seriesKey}` : ""}`);
+            const branchLabel = seriesKey ? cleanTunnelSeriesLabel(report.seriesLabel, seriesKey) : "";
+            await db.insertTunnelLatencyStat({
+              tunnelId,
+              latencyMs: detail.isTimeout ? null : detail.latencyMs,
+              isTimeout: detail.isTimeout,
+              seriesKey: detailSeriesKey,
+              seriesLabel: cleanTunnelSeriesLabel(
+                branchLabel ? `${detail.label} / ${branchLabel}` : detail.label,
+                `入口 ${detail.hostId}`,
+              ),
+              recordedAt,
+            }, { preserveMessage: true, updateTunnel: false });
+          });
+          if (seriesKey) {
+            const label = cleanTunnelSeriesLabel(report.seriesLabel, seriesKey === "primary" ? "主出口" : seriesKey);
+            branchByKey.set(seriesKey, {
+              key: seriesKey,
+              label,
+              latencyMs: aggregate.success ? aggregate.latencyMs : null,
+              isTimeout: !aggregate.success,
+            });
+            continue;
+          }
+          await db.insertTunnelLatencyStat({
+            tunnelId,
+            latencyMs: aggregate.success ? aggregate.latencyMs : null,
+            isTimeout: !aggregate.success,
+            seriesKey: "total",
+            seriesLabel: aggregate.partial ? "可用入口最大延迟" : "多入口最大延迟",
+            recordedAt,
+          }, { preserveMessage: true });
+          if (aggregate.success && !tunnel.isRunning) {
+            await db.updateTunnelRunningStatus(tunnelId, true);
+            tunnel.isRunning = true;
+          }
+          continue;
+        }
+        if (relayFailover && seriesKey && /^relay-\d+$/.test(seriesKey)) {
+          recordTunnelAutoHopLatency({
+            tunnelId,
+            hopIndex: Number(report.hopIndex),
+            hopCount: 2,
+            latencyMs: latencyValue,
+            isTimeout,
+            generation: topologyKey,
+            pathKey: seriesKey,
+            allowEarlyFailure: true,
+            fromHostId: Number(host.id),
+            toHostId: tunnelProbeTargetHostId(tunnel, hops, exitNodes, report, seriesKey),
+          });
+          continue;
+        }
+        if (seriesKey) {
+          recordTunnelAutoHopLatency({
+            tunnelId,
+            hopIndex: hasHop ? hopIndex : 0,
+            hopCount: hasHop ? hopCount : 1,
+            latencyMs: latencyValue,
+            isTimeout,
+            generation: topologyKey,
+            pathKey: seriesKey,
+            fromHostId: Number(host.id),
+            toHostId: tunnelProbeTargetHostId(tunnel, hops, exitNodes, report, seriesKey),
+          });
+          const label = cleanTunnelSeriesLabel(report.seriesLabel, seriesKey === "primary" ? "主出口" : seriesKey);
+          branchByKey.set(seriesKey, { key: seriesKey, label, latencyMs: latencyValue, isTimeout });
+          continue;
+        }
+        if (hasHop) {
+          const aggregate = recordTunnelAutoHopLatency({
+            tunnelId,
+            hopIndex,
+            hopCount,
+            latencyMs: latencyValue,
+            isTimeout,
+            generation: topologyKey,
+            fromHostId: Number(host.id),
+            toHostId: tunnelProbeTargetHostId(tunnel, hops, exitNodes, report, seriesKey),
+          });
+          if (!aggregate) continue;
+          await db.insertTunnelLatencyStat({
+            tunnelId,
+            latencyMs: aggregate.success ? aggregate.latencyMs : null,
+            isTimeout: !aggregate.success,
+            seriesKey: "total",
+            seriesLabel: "总延迟",
+          }, { preserveMessage: true });
+          if (aggregate.success && !tunnel.isRunning) {
+            await db.updateTunnelRunningStatus(tunnelId, true);
+            tunnel.isRunning = true;
+          }
+          continue;
+        }
+        await db.insertTunnelLatencyStat({
+          tunnelId,
+          latencyMs: latencyValue,
+          isTimeout,
+          seriesKey: "total",
+          seriesLabel: "总延迟",
+        }, { preserveMessage: true });
+        if (!isTimeout && !tunnel.isRunning) {
+          await db.updateTunnelRunningStatus(tunnelId, true);
+          tunnel.isRunning = true;
+        }
+      }
+
+      if (relayFailover) {
+        const aggregates = Array.from({ length: relayCandidateCount }, (_, index) => {
+          const key = `relay-${index + 1}`;
+          return {
+            key,
+            label: `中转 ${index + 1}`,
+            aggregate: multiEntry
+              ? getTunnelMultiEntryLatency({
+                tunnelId,
+                expectedEntryHostIds: orderedEntryHostIds,
+                hopCount: 2,
+                generation: multiEntryGeneration,
+                pathKey: key,
+              })
+              : getTunnelAutoHopAggregate(tunnelId, 2, topologyKey, key, true),
+          };
+        });
+        const readyAggregates = readyTunnelRelayAggregates(aggregates);
+        if (readyAggregates.length > 0) {
+          for (const item of readyAggregates) {
+            branchByKey.set(item.key, {
+              key: item.key,
+              label: item.label,
+              latencyMs: item.aggregate.success ? item.aggregate.latencyMs : null,
+              isTimeout: !item.aggregate.success,
+            });
+          }
+        }
+      }
+
+      const branches = Array.from(branchByKey.values());
+      if (branches.length === 0) return;
+      const recordedAt = new Date();
+      await mapWithConcurrency(branches, 4, async (branch) => {
+        await db.insertTunnelLatencyStat({
+          tunnelId,
+          latencyMs: branch.isTimeout ? null : branch.latencyMs,
+          isTimeout: branch.isTimeout,
+          seriesKey: branch.key,
+          seriesLabel: branch.label,
+          recordedAt,
+        }, { preserveMessage: true, updateTunnel: false });
+      });
+      const summary = summarizeTunnelBranches(branches);
+      await db.insertTunnelLatencyStat({
+        tunnelId,
+        latencyMs: summary.latencyMs,
+        isTimeout: summary.unavailable,
+        seriesKey: "total",
+        seriesLabel: summary.partial ? "可用出口最大延迟" : "最大延迟",
+        recordedAt,
+      }, { preserveMessage: true });
+      if (!summary.unavailable && !tunnel.isRunning) await db.updateTunnelRunningStatus(tunnelId, true);
+    }));
+    const needsForwardGroupHealthTopology = forwardGroupResults.some((report) => {
+      const type = String(report.probeType || "");
+      return type === "china" || type === "entry";
+    });
+    const healthTopology = needsForwardGroupHealthTopology
+      ? await db.getForwardGroupProbeTopologyForHost(Number(host.id)) as any
+      : { chinaHealthProbes: [], entryHealthProbes: [] };
+    const chinaExpected = healthTopology.chinaHealthProbes || [];
+    const chinaExpectedByKey = new Map(chinaExpected.map((probe: any) => [
+      `${Number(probe.groupId)}:${Number(probe.memberId)}`,
+      probe,
+    ]));
+    const entryExpectedByKey = new Map((healthTopology.entryHealthProbes || []).map((probe: any) => [
+      `${Number(probe.groupId)}:${Number(probe.memberId)}`,
+      probe,
+    ]));
+    const forwardGroupResultsById = new Map<number, AgentForwardGroupLatencyResult[]>();
+    for (const report of forwardGroupResults) {
+      const groupId = Number(report.groupId || 0);
+      if (groupId <= 0) continue;
+      const rows = forwardGroupResultsById.get(groupId) || [];
+      rows.push(report);
+      forwardGroupResultsById.set(groupId, rows);
+    }
+    await mapWithConcurrency(Array.from(forwardGroupResultsById.entries()), 12, async ([groupId, reports]) => {
+      const group = await db.getForwardGroupById(groupId) as any;
+      if (!group?.isEnabled) return;
+      const chainProbes = String(group.groupMode || "failover") === "chain"
+        ? await db.getForwardGroupChainProbes(groupId)
+        : [];
+      const topologyKey = forwardGroupProbeTopologyKey(groupId, chainProbes);
+      for (const report of reports) {
+        if (String(report.probeType || "") === "china") {
+          const expected = chinaExpectedByKey.get(`${groupId}:${Number(report.memberId || 0)}`) as any;
+          if (!expected) continue;
+          if (report.targetIp && !sameProbeTarget(report.targetIp, expected.targetIp)) continue;
+          if (report.targetPort && Number(report.targetPort) !== Number(expected.targetPort)) continue;
+          await db.updateForwardGroupMemberChinaHealth({
+            groupId,
+            memberId: Number(report.memberId || 0),
+            hostId: Number(host.id),
+            latencyMs: typeof report.latencyMs === "number" && report.latencyMs > 0 ? report.latencyMs : null,
+            isTimeout: !!report.isTimeout,
+            healthStatus: report.healthStatus,
+          });
+          continue;
+        }
+        if (String(report.probeType || "") === "entry") {
+          const expected = entryExpectedByKey.get(`${groupId}:${Number(report.memberId || 0)}`) as any;
+          if (!expected || report.healthStatus === undefined) continue;
+          await db.updateForwardGroupMemberAgentHealth({
+            groupId,
+            memberId: Number(report.memberId || 0),
+            hostId: Number(host.id),
+            healthStatus: report.healthStatus,
+          });
+          continue;
+        }
+        if (String(group.groupMode || "failover") !== "chain") continue;
+        if (report.topologyKey && report.topologyKey !== topologyKey) continue;
+        const hopIndex = Number(report.hopIndex);
+        const hopCount = Number(report.hopCount);
+        if (!Number.isInteger(hopIndex) || !Number.isInteger(hopCount) || hopCount <= 0) continue;
+        const expected = (chainProbes as any[]).find((probe: any) => (
+          Number(probe.fromHostId) === Number(host.id)
+          && Number(probe.hopIndex) === hopIndex
+          && Number(probe.hopCount) === hopCount
+          && (!report.targetIp || sameProbeTarget(report.targetIp, probe.targetIp))
+          && (!report.targetPort || Number(report.targetPort) === Number(probe.targetPort))
+        ));
+        if (!expected) continue;
+        const aggregate = recordForwardGroupAutoHopLatency({
+          groupId,
+          hopIndex,
+          hopCount,
+          latencyMs: typeof report.latencyMs === "number" && report.latencyMs > 0 ? report.latencyMs : null,
+          isTimeout: !!report.isTimeout,
+          generation: topologyKey,
+        });
+        if (!aggregate) continue;
+        await db.insertForwardGroupLatencyStat({
+          groupId,
+          latencyMs: aggregate.success ? aggregate.latencyMs : null,
+          isTimeout: !aggregate.success,
+        });
+      }
+    });
+
+    const expectedServices = serviceResults.length > 0 ? await db.getHostProbeTasksForHost(Number(host.id)) as any[] : [];
+    const expectedServiceById = new Map(expectedServices.map((service: any) => [Number(service.serviceId), service]));
+    const serviceStats = serviceResults.flatMap((report) => {
+      const serviceId = Number(report.serviceId || 0);
+      const expected = expectedServiceById.get(serviceId) as any;
+      if (!expected) return [];
+      if (report.targetIp && !sameProbeTarget(report.targetIp, expected.targetIp)) return [];
+      if (report.targetPort && Number(report.targetPort) !== Number(expected.targetPort || 0)) return [];
+      return [{
+        serviceId,
+        hostId: host.id,
+        latencyMs: typeof report.latencyMs === "number" && report.latencyMs > 0 ? report.latencyMs : null,
+        isTimeout: !!report.isTimeout,
+      }];
+    });
+    if (serviceStats.length > 0) {
+      await db.insertHostProbeServiceStats(serviceStats);
+    }
+
+    const reportedRuleRows = await db.getForwardRulesByIds(results.map((report) => Number(report.ruleId || 0))) as any[];
+    const reportedRuleById = new Map(reportedRuleRows.map((rule: any) => [Number(rule.id), rule]));
+    const tunnelLatencyById = new Map<number, Promise<any>>();
+    const tunnelContextById = new Map<number, Promise<{ tunnel: any } | null>>();
+    const getTunnelContext = (tunnelId: number) => {
+      let work = tunnelContextById.get(tunnelId);
+      if (!work) {
+        work = (async () => {
+          const tunnel = await db.getTunnelById(tunnelId) as any;
+          if (!tunnel) return null;
+          return { tunnel };
+        })();
+        tunnelContextById.set(tunnelId, work);
+      }
+      return work;
+    };
+    const getLatestTunnelLatency = (tunnelId: number) => {
+      let work = tunnelLatencyById.get(tunnelId);
+      if (!work) {
+        work = db.getLatestTunnelLatency(tunnelId);
+        tunnelLatencyById.set(tunnelId, work);
+      }
+      return work;
+    };
+    const ruleStats = await mapWithConcurrency(results, 16, async (report) => {
+      const ruleId = Number(report.ruleId);
+      if (ruleId <= 0) return null;
+      const rule = reportedRuleById.get(ruleId) as any;
+      if (!rule || rule.pendingDelete || !rule.isEnabled) return null;
+      const tunnelId = Number(rule.tunnelId || 0);
+      const baseLatency = typeof report.latencyMs === "number" && Number.isFinite(report.latencyMs) && report.latencyMs >= 0
+        ? Number(report.latencyMs)
+        : null;
+      if (tunnelId <= 0) {
+        if (Number(rule.hostId || 0) !== Number(host.id)) return null;
+        if (report.sourcePort && Number(report.sourcePort) !== Number(rule.sourcePort || 0)) return null;
+        if (report.targetPort && Number(report.targetPort) !== Number(rule.targetPort || 0)) return null;
+        if (!isRuleLatencyReportMethodCompatible(rule.protocol, report.method)) return null;
+        const isTimeout = !!report.isTimeout || baseLatency === null;
+        const latencyMs = isTimeout ? null : baseLatency;
+        return {
+          stat: {
+            ruleId,
+            hostId: host.id,
+            latencyMs,
+            isTimeout,
+            healthStatus: report.healthStatus || null,
+            healthPending: !!report.healthPending,
+          },
+          gateReport: { ...report, latencyMs, isTimeout },
+        };
+      }
+
+      const tunnelContext = await getTunnelContext(tunnelId);
+      if (!tunnelContext || !validateTunnelRuleLatencyReport({
+        hostId: host.id,
+        rule,
+        tunnel: tunnelContext.tunnel,
+        report,
+      })) return null;
+      const latestTunnelLatency = report.isTimeout ? null : await getLatestTunnelLatency(tunnelId);
+      const combined = combineTunnelRuleLatencySample({
+        targetLatencyMs: baseLatency,
+        targetIsTimeout: !!report.isTimeout,
+        tunnelLatencyMs: latestTunnelLatency?.latencyMs,
+        tunnelIsTimeout: !!latestTunnelLatency?.isTimeout,
+        tunnelRecordedAt: latestTunnelLatency?.recordedAt,
+      });
+      if (!combined) return null;
+      const tunnelIntroducedTimeout = combined.isTimeout && !report.isTimeout;
+      return {
+        stat: {
+          ruleId,
+          hostId: host.id,
+          latencyMs: combined.latencyMs,
+          isTimeout: combined.isTimeout,
+          healthStatus: tunnelIntroducedTimeout ? null : report.healthStatus || null,
+          healthPending: tunnelIntroducedTimeout ? false : !!report.healthPending,
+        },
+        gateReport: {
+          ...report,
+          tunnelId,
+          latencyMs: combined.latencyMs,
+          isTimeout: combined.isTimeout,
+        },
+      };
+    });
+    const validRuleStats = ruleStats.filter((entry): entry is NonNullable<typeof entry> => !!entry);
+    const ruleGatePlan = agentTcpingReportGate.plan({
+      hostId: Number(host.id),
+      force,
+      results: validRuleStats.map((entry) => entry.gateReport),
+      tunnels: [],
+      forwardGroups: [],
+      services: [],
+    });
+    const acceptedRuleIds = new Set(ruleGatePlan.results.map((report) => Number(report.ruleId)));
+    const stats = validRuleStats
+      .filter((entry) => acceptedRuleIds.has(Number(entry.stat.ruleId)))
+      .map((entry) => entry.stat);
+
+    if (stats.length > 0) {
+      await db.insertTcpingStats(stats);
+      clearRuleLatencyQueryCaches();
+      db.scheduleForwardGroupFailover(Array.from(new Set(stats
+        .filter((stat) => ruleGatePlan.transitionRuleIds.has(Number(stat.ruleId)))
+        .map((stat) => Number(reportedRuleById.get(stat.ruleId)?.forwardGroupId || 0))
+        .filter((groupId) => Number.isInteger(groupId) && groupId > 0))));
+    }
+
+    topologyGatePlan.commit();
+    ruleGatePlan.commit();
+    res.json({ success: true });
+  } catch (error) {
+    console.error("[Agent TCPing] Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+}

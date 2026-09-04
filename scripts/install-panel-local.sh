@@ -1,0 +1,976 @@
+#!/bin/bash
+set -euo pipefail
+
+ACTION="install"
+APP_DIR="${FORWARDX_PANEL_DIR:-/opt/forwardx-panel}"
+SERVICE_NAME="${FORWARDX_SERVICE_NAME:-forwardx-panel}"
+PORT="${PORT:-9810}"
+REPO_SLUG="${FORWARDX_GITHUB_REPO:-wzwys9/Forwardplus}"
+GITHUB_TOKEN="${FORWARDPLUS_GITHUB_TOKEN:-${FORWARDX_GITHUB_TOKEN:-}}"
+unset FORWARDPLUS_GITHUB_TOKEN FORWARDX_GITHUB_TOKEN
+PANEL_BUNDLE_PREFIX="${FORWARDX_PANEL_BUNDLE_PREFIX:-forwardx-panel-v}"
+PNPM_VERSION="${FORWARDX_PNPM_VERSION:-10.28.1}"
+ASSETS_PENDING_EXIT_CODE=12
+ENABLE_ADMIN_ACCOUNT="false"
+GITHUB_ACCELERATOR_URL=""
+GITHUB_ACCELERATOR_EXPLICIT="false"
+cleanup_github_curl_configs() {
+  local config=""
+  for config in "${TMPDIR:-/tmp}"/forwardplus-github-curl."$$".*; do
+    [ ! -f "$config" ] || rm -f -- "$config"
+  done
+}
+trap cleanup_github_curl_configs EXIT
+trap 'cleanup_github_curl_configs; exit 1' HUP INT TERM
+if [ "${FORWARDX_GITHUB_ACCELERATOR_URL+x}" = "x" ]; then
+  GITHUB_ACCELERATOR_URL="$FORWARDX_GITHUB_ACCELERATOR_URL"
+  GITHUB_ACCELERATOR_EXPLICIT="true"
+fi
+
+usage() {
+  cat <<EOF
+Usage: $0 install|upgrade|uninstall|reset-admin|reset-password [--github-accelerator URL] [--enable-account]
+
+Options:
+  --github-accelerator URL   Prefix GitHub API/raw/release URLs with this HTTP(S) accelerator.
+  --enable-account           With reset-admin, enable the selected administrator account.
+
+Environment:
+  FORWARDX_GITHUB_ACCELERATOR_URL   Same as --github-accelerator; an explicit empty value disables it.
+  FORWARDPLUS_GITHUB_TOKEN          Optional read-only token for the private Forwardplus repository.
+EOF
+}
+
+parse_args() {
+  local action_seen="false"
+  local value=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      install|upgrade|update|uninstall|remove|reset-admin|reset-password)
+        if [ "$action_seen" = "true" ]; then
+          echo "[ERROR] Multiple actions were provided: $1" >&2
+          usage >&2
+          exit 1
+        fi
+        ACTION="$1"
+        action_seen="true"
+        shift
+        ;;
+      --github-accelerator)
+        if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+          echo "[ERROR] --github-accelerator requires an HTTP(S) URL" >&2
+          usage >&2
+          exit 1
+        fi
+        GITHUB_ACCELERATOR_URL="$2"
+        GITHUB_ACCELERATOR_EXPLICIT="true"
+        shift 2
+        ;;
+      --github-accelerator=*)
+        value="${1#*=}"
+        if [ -z "$value" ]; then
+          echo "[ERROR] --github-accelerator requires an HTTP(S) URL" >&2
+          usage >&2
+          exit 1
+        fi
+        GITHUB_ACCELERATOR_URL="$value"
+        GITHUB_ACCELERATOR_EXPLICIT="true"
+        shift
+        ;;
+      --enable-account)
+        ENABLE_ADMIN_ACCOUNT="true"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "[ERROR] Unknown argument: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
+}
+
+parse_args "$@"
+
+if [ "$ENABLE_ADMIN_ACCOUNT" = "true" ] && [ "$ACTION" != "reset-admin" ] && [ "$ACTION" != "reset-password" ]; then
+  echo "[ERROR] --enable-account is only valid with reset-admin" >&2
+  exit 1
+fi
+
+valid_port() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+normalize_version() {
+  local raw="${1:-}"
+  raw="${raw#v}"
+  printf "%s\n" "$raw"
+}
+
+get_env_value() {
+  local key="$1"
+  local file="$APP_DIR/.env"
+  if [ ! -f "$file" ]; then
+    return 0
+  fi
+  grep -E "^${key}=" "$file" | tail -1 | sed -E "s/^${key}=//; s/^\"//; s/\"$//"
+}
+
+normalize_github_accelerator_url() {
+  local value="${1:-}"
+  local pattern='^https?://[^/?#[:space:]]+(/[^?#[:space:]]*)?$'
+  value="$(printf "%s" "$value" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s#/*$##')"
+  if [[ ! "$value" =~ $pattern ]]; then
+    return 1
+  fi
+  case "$value" in
+    *'$'*|*'`'*|*'\'*|*'"'*) return 1 ;;
+  esac
+  if [ -z "$value" ]; then
+    return 1
+  fi
+  printf "%s\n" "$value"
+}
+
+resolve_github_accelerator() {
+  local existing=""
+  local normalized=""
+  if [ "$GITHUB_ACCELERATOR_EXPLICIT" != "true" ]; then
+    existing="$(get_env_value FORWARDX_GITHUB_ACCELERATOR_URL || true)"
+    if [ -n "$existing" ]; then
+      GITHUB_ACCELERATOR_URL="$existing"
+    fi
+  fi
+  if [ -z "$GITHUB_ACCELERATOR_URL" ]; then
+    export FORWARDX_GITHUB_ACCELERATOR_URL=""
+    return
+  fi
+  if ! normalized="$(normalize_github_accelerator_url "$GITHUB_ACCELERATOR_URL")"; then
+    echo "[ERROR] Invalid GitHub accelerator URL: $GITHUB_ACCELERATOR_URL" >&2
+    echo "[INFO] Use an HTTP(S) base URL, for example: https://mirror.example.com" >&2
+    exit 1
+  fi
+  GITHUB_ACCELERATOR_URL="$normalized"
+  export FORWARDX_GITHUB_ACCELERATOR_URL="$GITHUB_ACCELERATOR_URL"
+}
+
+is_github_url() {
+  local url="${1:-}"
+  [[ "$url" =~ ^https?://([^/]+\.)?github\.com(/|$) ]] \
+    || [[ "$url" =~ ^https?://raw\.githubusercontent\.com(/|$) ]] \
+    || [[ "$url" =~ ^https?://([^/]+\.)?githubusercontent\.com(/|$) ]]
+}
+
+is_official_github_url() {
+  local url="${1:-}"
+  [[ "$url" =~ ^https://(api\.)?github\.com(/|$) ]] \
+    || [[ "$url" =~ ^https://raw\.githubusercontent\.com(/|$) ]] \
+    || [[ "$url" =~ ^https://codeload\.github\.com(/|$) ]]
+}
+
+github_curl_config_for_url() {
+  local url="${1:-}"
+  local config=""
+  if [ -z "$GITHUB_TOKEN" ] || ! is_official_github_url "$url"; then
+    return 0
+  fi
+  if [[ ! "$GITHUB_TOKEN" =~ ^[A-Za-z0-9_]+$ ]]; then
+    echo "[ERROR] FORWARDPLUS_GITHUB_TOKEN contains unsupported characters" >&2
+    return 1
+  fi
+  trap - EXIT HUP INT TERM
+  config="$(umask 077; mktemp "${TMPDIR:-/tmp}/forwardplus-github-curl.$$.XXXXXX")"
+  printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN" > "$config"
+  chmod 600 "$config"
+  printf '%s\n' "$config"
+}
+
+github_get_text() {
+  local url="$1"
+  local auth_config=""
+  local curl_args=()
+  auth_config="$(github_curl_config_for_url "$url")"
+  if [ -n "$auth_config" ]; then
+    curl_args=(--config "$auth_config")
+  fi
+  if ! curl -fsSL --retry 3 --connect-timeout 10 "${curl_args[@]}" "$url"; then
+    if [ -n "$auth_config" ]; then rm -f "$auth_config"; fi
+    return 1
+  fi
+  if [ -n "$auth_config" ]; then rm -f "$auth_config"; fi
+}
+
+accelerated_github_url() {
+  local url="$1"
+  if [ -n "$GITHUB_ACCELERATOR_URL" ] && is_github_url "$url"; then
+    printf "%s/%s\n" "$GITHUB_ACCELERATOR_URL" "$url"
+  else
+    printf "%s\n" "$url"
+  fi
+}
+
+release_tag_from_url() {
+  local url="$1"
+  github_get_text "$url" \
+    | sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v?([^"]+)".*/\1/p' \
+    | head -1 || true
+}
+
+download_url_to_file() {
+  local url="$1"
+  local output="$2"
+  local partial="${output}.part"
+  local http_code=""
+  local auth_config=""
+  local curl_args=()
+  auth_config="$(github_curl_config_for_url "$url")"
+  if [ -n "$auth_config" ]; then
+    curl_args=(--config "$auth_config")
+  fi
+  rm -f "$partial"
+  http_code="$(curl -fsSL --retry 3 --connect-timeout 10 "${curl_args[@]}" -H "Accept: application/octet-stream" --write-out "%{http_code}" --output "$partial" "$url" 2>/dev/null || true)"
+  if [ -n "$auth_config" ]; then rm -f "$auth_config"; fi
+  if [ "$http_code" = "200" ]; then
+    mv -f "$partial" "$output"
+  else
+    rm -f "$partial"
+  fi
+  printf "%s\n" "$http_code"
+}
+
+download_github_archive() {
+  local url="$1"
+  local output="$2"
+  local accelerated=""
+  local http_code=""
+  accelerated="$(accelerated_github_url "$url")"
+  if [ "$accelerated" != "$url" ]; then
+    echo "[INFO] Trying GitHub accelerator: $accelerated" >&2
+    http_code="$(download_url_to_file "$accelerated" "$output")"
+    if [ "$http_code" = "200" ] && tar -tzf "$output" >/dev/null 2>&1; then
+      printf "%s\n" "$http_code"
+      return
+    fi
+    if [ "$http_code" = "200" ]; then
+      http_code="invalid-archive"
+      rm -f "$output"
+    fi
+    echo "[WARN] GitHub accelerator request failed (HTTP ${http_code:-unknown}); falling back to GitHub." >&2
+  fi
+  http_code="$(download_url_to_file "$url" "$output")"
+  if [ "$http_code" = "200" ] && ! tar -tzf "$output" >/dev/null 2>&1; then
+    rm -f "$output"
+    http_code="invalid-archive"
+  fi
+  printf "%s\n" "$http_code"
+}
+
+read_install_port() {
+  local default_port="${PORT:-9810}"
+  local input=""
+
+  if ! valid_port "$default_port"; then
+    default_port="9810"
+  fi
+
+  if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+    PORT="$default_port"
+    echo "[INFO] Non-interactive environment, use default web port: $PORT"
+    return
+  fi
+
+  while true; do
+    printf "Enter web listen port [default %s]: " "$default_port" > /dev/tty
+    IFS= read -r input < /dev/tty || input=""
+    input="${input//[[:space:]]/}"
+    if [ -z "$input" ]; then
+      PORT="$default_port"
+      return
+    fi
+    if valid_port "$input"; then
+      PORT="$input"
+      return
+    fi
+    echo "[ERROR] Port must be a number in 1-65535, please retry." > /dev/tty
+  done
+}
+
+json_escape() {
+  printf "%s" "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+read_secret() {
+  local prompt="$1"
+  local value=""
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    printf "%s" "$prompt" > /dev/tty
+    stty -echo < /dev/tty 2>/dev/null || true
+    IFS= read -r value < /dev/tty || value=""
+    stty echo < /dev/tty 2>/dev/null || true
+    printf "\n" > /dev/tty
+  fi
+  printf "%s" "$value"
+}
+
+read_database_port() {
+  local prompt="$1"
+  local default_port="$2"
+  local value=""
+  while true; do
+    printf "%s [%s]: " "$prompt" "$default_port" > /dev/tty
+    IFS= read -r value < /dev/tty || value=""
+    value="${value//[[:space:]]/}"
+    [ -z "$value" ] && value="$default_port"
+    if valid_port "$value"; then
+      printf "%s" "$value"
+      return
+    fi
+    echo "[ERROR] Port must be a number in 1-65535, please retry." > /dev/tty
+  done
+}
+
+read_database_config() {
+  local config_file="$APP_DIR/data/database.json"
+  local choice host port user password database ssl
+  if [ "$ACTION" != "install" ] || [ -f "$config_file" ]; then
+    return
+  fi
+  if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+    echo "[INFO] Non-interactive environment, database can be selected on first panel visit."
+    return
+  fi
+
+  echo "Select database type:" > /dev/tty
+  echo "  1) SQLite local database (default)" > /dev/tty
+  echo "  2) MySQL external database" > /dev/tty
+  echo "  3) PostgreSQL external database" > /dev/tty
+  printf "Enter choice [1]: " > /dev/tty
+  IFS= read -r choice < /dev/tty || choice=""
+  choice="${choice//[[:space:]]/}"
+  [ -z "$choice" ] && choice="1"
+  if [ "$choice" = "1" ]; then
+    mkdir -p "$APP_DIR/data"
+    cat > "$config_file" <<EOF
+{
+  "type": "sqlite",
+  "setupPending": true,
+  "sqlite": {
+    "path": "$(json_escape "$APP_DIR/data/forwardx.db")"
+  }
+}
+EOF
+    chmod 600 "$config_file" 2>/dev/null || true
+    return
+  fi
+  if [ "$choice" != "2" ] && [ "$choice" != "3" ]; then
+    echo "[INFO] Unknown database choice, database can be selected on first panel visit." > /dev/tty
+    return
+  fi
+
+  if [ "$choice" = "2" ]; then
+    printf "MySQL host [127.0.0.1]: " > /dev/tty
+    IFS= read -r host < /dev/tty || host=""
+    host="${host:-127.0.0.1}"
+    port="$(read_database_port "MySQL port" "3306")"
+  else
+    printf "PostgreSQL host [127.0.0.1]: " > /dev/tty
+    IFS= read -r host < /dev/tty || host=""
+    host="${host:-127.0.0.1}"
+    port="$(read_database_port "PostgreSQL port" "5432")"
+  fi
+  printf "Database name [forwardx]: " > /dev/tty
+  IFS= read -r database < /dev/tty || database=""
+  database="${database:-forwardx}"
+  printf "Database user [forwardx]: " > /dev/tty
+  IFS= read -r user < /dev/tty || user=""
+  user="${user:-forwardx}"
+  password="$(read_secret "Database password: ")"
+  printf "Enable SSL? [y/N]: " > /dev/tty
+  IFS= read -r ssl < /dev/tty || ssl=""
+  case "$ssl" in y|Y|yes|YES) ssl="true" ;; *) ssl="false" ;; esac
+
+  mkdir -p "$APP_DIR/data"
+  if [ "$choice" = "2" ]; then
+    cat > "$config_file" <<EOF
+{
+  "type": "mysql",
+  "setupPending": true,
+  "mysql": {
+    "host": "$(json_escape "$host")",
+    "port": $port,
+    "user": "$(json_escape "$user")",
+    "password": "$(json_escape "$password")",
+    "database": "$(json_escape "$database")",
+    "ssl": $ssl
+  }
+}
+EOF
+  else
+    cat > "$config_file" <<EOF
+{
+  "type": "postgresql",
+  "setupPending": true,
+  "postgresql": {
+    "host": "$(json_escape "$host")",
+    "port": $port,
+    "user": "$(json_escape "$user")",
+    "password": "$(json_escape "$password")",
+    "database": "$(json_escape "$database")",
+    "ssl": $ssl
+  }
+}
+EOF
+  fi
+  chmod 600 "$config_file" 2>/dev/null || true
+}
+
+resolve_runtime_env() {
+  local existing_port existing_jwt existing_github_token
+  existing_port="$(get_env_value PORT || true)"
+  existing_jwt="$(get_env_value JWT_SECRET || true)"
+  existing_github_token="$(get_env_value FORWARDPLUS_GITHUB_TOKEN || true)"
+
+  if [ -n "$existing_port" ] && valid_port "$existing_port"; then
+    PORT="$existing_port"
+  elif ! valid_port "$PORT"; then
+    PORT="9810"
+  fi
+
+  if [ -z "${JWT_SECRET:-}" ] && [ -n "$existing_jwt" ]; then
+    JWT_SECRET="$existing_jwt"
+  fi
+  if [ -z "$GITHUB_TOKEN" ] && [ -n "$existing_github_token" ]; then
+    GITHUB_TOKEN="$existing_github_token"
+  fi
+  resolve_github_accelerator
+}
+
+ensure_xray_master_key() {
+  local key_file="${XRAY_MASTER_KEY_PATH:-$APP_DIR/data/xray-master.key}"
+  local temporary=""
+  local permissions=""
+  XRAY_MASTER_KEY_PATH="$key_file"
+  mkdir -p "$(dirname "$key_file")"
+
+  if [ -L "$key_file" ] || { [ -e "$key_file" ] && [ ! -f "$key_file" ]; }; then
+    echo "[ERROR] Xray master key path must be a regular file" >&2
+    return 1
+  fi
+  if [ -f "$key_file" ]; then
+    permissions="$(stat -c '%a' "$key_file" 2>/dev/null || true)"
+    if [ "$permissions" != "600" ] || [ "$(wc -l < "$key_file")" -ne 1 ] \
+      || ! grep -Eq '^[0-9a-fA-F]{64}$' "$key_file"; then
+      echo "[ERROR] Existing Xray master key is invalid or does not have mode 0600" >&2
+      return 1
+    fi
+    echo "[INFO] Preserving existing Xray master key"
+    return 0
+  fi
+
+  temporary="$(mktemp "$key_file.tmp.XXXXXX")"
+  if ! (umask 077; openssl rand -hex 32 > "$temporary"); then
+    rm -f "$temporary"
+    echo "[ERROR] Failed to generate Xray master key" >&2
+    return 1
+  fi
+  chmod 600 "$temporary"
+  if ! ln "$temporary" "$key_file"; then
+    rm -f "$temporary"
+    if [ -f "$key_file" ] && [ ! -L "$key_file" ] \
+      && [ "$(stat -c '%a' "$key_file" 2>/dev/null || true)" = "600" ] \
+      && [ "$(wc -l < "$key_file")" -eq 1 ] \
+      && grep -Eq '^[0-9a-fA-F]{64}$' "$key_file"; then
+      echo "[INFO] Preserving existing Xray master key"
+      return 0
+    fi
+    echo "[ERROR] Failed to atomically create Xray master key" >&2
+    return 1
+  fi
+  rm -f "$temporary"
+  chmod 600 "$key_file"
+}
+
+require_root() {
+  if [ "$(id -u)" != "0" ]; then
+    echo "[ERROR] Please run as root"
+    exit 1
+  fi
+}
+
+shell_quote() {
+  printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"
+}
+
+is_systemd_host() {
+  command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+
+write_openrc_service() {
+  local node_bin="$1"
+  cat > "/etc/init.d/$SERVICE_NAME" <<EOF
+#!/sbin/openrc-run
+name="$SERVICE_NAME"
+description="ForwardX Panel"
+command="/bin/sh"
+# The Node entrypoint loads .env through dotenv/config; do not source it in a shell.
+command_args="-lc $(shell_quote "cd \"$APP_DIR\" && exec env DOTENV_CONFIG_PATH=\"$APP_DIR/.env\" DOTENV_CONFIG_OVERRIDE=true \"$node_bin\" dist/index.js")"
+command_background=true
+pidfile="/run/\${RC_SVCNAME}.pid"
+output_log="$APP_DIR/data/panel.log"
+error_log="$APP_DIR/data/panel.log"
+depend() {
+  need net
+}
+EOF
+  chmod 755 "/etc/init.d/$SERVICE_NAME"
+}
+
+write_sysv_service() {
+  local node_bin="$1"
+  cat > "/etc/init.d/$SERVICE_NAME" <<EOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          $SERVICE_NAME
+# Required-Start:    \$network
+# Required-Stop:     \$network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: ForwardX Panel
+### END INIT INFO
+PIDFILE=/run/$SERVICE_NAME.pid
+LOGFILE=$APP_DIR/data/panel.log
+# The Node entrypoint loads .env through dotenv/config; do not source it in a shell.
+CMD=$(shell_quote "cd \"$APP_DIR\" && exec env DOTENV_CONFIG_PATH=\"$APP_DIR/.env\" DOTENV_CONFIG_OVERRIDE=true \"$node_bin\" dist/index.js")
+start() {
+  mkdir -p /run "$APP_DIR/data"
+  if [ -s "\$PIDFILE" ] && kill -0 "\$(cat "\$PIDFILE")" 2>/dev/null; then return 0; fi
+  nohup sh -lc "\$CMD" >> "\$LOGFILE" 2>&1 &
+  echo \$! > "\$PIDFILE"
+}
+stop() {
+  if [ -s "\$PIDFILE" ]; then kill "\$(cat "\$PIDFILE")" 2>/dev/null || true; rm -f "\$PIDFILE"; fi
+}
+case "\$1" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; sleep 1; start ;;
+  status) [ -s "\$PIDFILE" ] && kill -0 "\$(cat "\$PIDFILE")" 2>/dev/null ;;
+  *) echo "Usage: \$0 {start|stop|restart|status}"; exit 1 ;;
+esac
+EOF
+  chmod 755 "/etc/init.d/$SERVICE_NAME"
+}
+
+write_service() {
+  local node_bin
+  node_bin="$(command -v node)"
+  mkdir -p "$APP_DIR/data"
+  if is_systemd_host; then
+    cat > "/etc/systemd/system/$SERVICE_NAME.service" <<EOF
+[Unit]
+Description=ForwardX Panel
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$APP_DIR
+EnvironmentFile=$APP_DIR/.env
+ExecStart=$node_bin dist/index.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME"
+  elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+    write_openrc_service "$node_bin"
+    rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
+  elif [ -d /etc/init.d ]; then
+    write_sysv_service "$node_bin"
+    command -v update-rc.d >/dev/null 2>&1 && update-rc.d "$SERVICE_NAME" defaults >/dev/null 2>&1 || true
+    command -v chkconfig >/dev/null 2>&1 && chkconfig "$SERVICE_NAME" on >/dev/null 2>&1 || true
+  else
+    echo "[ERROR] Unsupported init system, please install systemd/OpenRC/SysV init support"
+    exit 1
+  fi
+}
+
+restart_service() {
+  if is_systemd_host; then
+    systemctl restart "$SERVICE_NAME"
+  elif command -v rc-service >/dev/null 2>&1; then
+    rc-service "$SERVICE_NAME" restart
+  elif [ -x "/etc/init.d/$SERVICE_NAME" ]; then
+    "/etc/init.d/$SERVICE_NAME" restart
+  else
+    echo "[ERROR] Service manager not found for $SERVICE_NAME"
+    exit 1
+  fi
+}
+
+remove_service() {
+  if is_systemd_host; then
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+    rm -f "/etc/systemd/system/$SERVICE_NAME.service"
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+  if command -v rc-service >/dev/null 2>&1; then
+    rc-service "$SERVICE_NAME" stop 2>/dev/null || true
+  fi
+  if command -v rc-update >/dev/null 2>&1; then
+    rc-update del "$SERVICE_NAME" default 2>/dev/null || true
+  fi
+  if [ -x "/etc/init.d/$SERVICE_NAME" ]; then
+    "/etc/init.d/$SERVICE_NAME" stop 2>/dev/null || true
+  fi
+  command -v update-rc.d >/dev/null 2>&1 && update-rc.d -f "$SERVICE_NAME" remove >/dev/null 2>&1 || true
+  command -v chkconfig >/dev/null 2>&1 && chkconfig "$SERVICE_NAME" off >/dev/null 2>&1 || true
+  rm -f "/etc/init.d/$SERVICE_NAME"
+}
+
+confirm_yes() {
+  local prompt="$1"
+  local answer=""
+
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    printf "%s" "$prompt" > /dev/tty
+    IFS= read -r answer < /dev/tty || answer=""
+  else
+    echo "[INFO] Non-interactive environment, defaulting to N: $prompt"
+  fi
+
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+latest_release_version() {
+  local api_url="${FORWARDX_GITHUB_API_URL:-https://api.github.com/repos/${REPO_SLUG}/releases/latest}"
+  local accelerated_url=""
+  local tag=""
+  accelerated_url="$(accelerated_github_url "$api_url")"
+  if [ "$accelerated_url" != "$api_url" ]; then
+    tag="$(release_tag_from_url "$accelerated_url")"
+    if [ -n "$tag" ]; then
+      printf "%s\n" "$tag"
+      return
+    fi
+    echo "[WARN] GitHub accelerator version check failed; falling back to GitHub." >&2
+  fi
+  tag="$(release_tag_from_url "$api_url")"
+
+  if [ -z "$tag" ]; then
+    echo "[ERROR] Failed to resolve latest release version from GitHub API: $api_url"
+    return 1
+  fi
+  printf "%s\n" "$tag"
+}
+
+resolve_release_version() {
+  local requested="${FORWARDX_TARGET_VERSION:-}"
+  local normalized=""
+
+  if [ -n "$requested" ]; then
+    normalized="$(normalize_version "$requested")"
+  else
+    normalized="$(latest_release_version)"
+  fi
+
+  if [[ ! "$normalized" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "[ERROR] Invalid release version: ${normalized:-<empty>}"
+    return 1
+  fi
+  printf "%s\n" "$normalized"
+}
+
+panel_bundle_url() {
+  local version="$1"
+  local filename="${PANEL_BUNDLE_PREFIX}${version}.tar.gz"
+  local api_url="https://api.github.com/repos/${REPO_SLUG}/releases/tags/v${version}"
+  local response=""
+  local asset_url=""
+  if ! response="$(github_get_text "$api_url")"; then
+    return 1
+  fi
+  asset_url="$(printf '%s' "$response" | ASSET_NAME="$filename" node -e '
+    let text = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { text += chunk; });
+    process.stdin.on("end", () => {
+      const release = JSON.parse(text);
+      const asset = Array.isArray(release.assets) ? release.assets.find((item) => item && item.name === process.env.ASSET_NAME) : null;
+      if (asset && typeof asset.url === "string") process.stdout.write(asset.url);
+    });
+  ' 2>/dev/null || true)"
+  if [ -z "$asset_url" ]; then
+    return 1
+  fi
+  printf '%s\n' "$asset_url"
+}
+
+node_major_version() {
+  if ! command -v node >/dev/null 2>&1; then
+    echo "0"
+    return
+  fi
+  node -p "Number(process.versions.node.split('.')[0] || 0)" 2>/dev/null || echo "0"
+}
+
+has_local_base_deps() {
+  command -v curl >/dev/null 2>&1 \
+    && command -v tar >/dev/null 2>&1 \
+    && command -v openssl >/dev/null 2>&1 \
+    && { command -v xz >/dev/null 2>&1 || command -v unxz >/dev/null 2>&1; }
+}
+
+ensure_node_runtime() {
+  local major="0"
+  major="$(node_major_version)"
+  if [ "$major" -ge 22 ]; then
+    return
+  fi
+
+  echo "[INFO] Installing Node.js 22+ ..."
+  if command -v apt-get >/dev/null 2>&1; then
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+    apt-get install -y -qq nodejs >/dev/null
+  elif command -v dnf >/dev/null 2>&1; then
+    curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+    dnf install -y -q nodejs
+  elif command -v yum >/dev/null 2>&1; then
+    curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+    yum install -y -q nodejs
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper -n install nodejs22 npm22 || zypper -n install nodejs npm
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache nodejs npm
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm nodejs npm
+  else
+    echo "[ERROR] Unsupported package manager, please install Node.js 22+ manually"
+    exit 1
+  fi
+
+  major="$(node_major_version)"
+  if [ "$major" -lt 22 ]; then
+    echo "[ERROR] Node.js 22+ is required, current major version is $major"
+    exit 1
+  fi
+}
+
+install_deps() {
+  if has_local_base_deps; then
+    echo "[INFO] Runtime base dependencies are already installed, skip package manager update."
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq
+    apt-get install -y -qq curl ca-certificates tar xz-utils openssl >/dev/null
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q curl ca-certificates tar xz openssl
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q curl ca-certificates tar xz openssl
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper -n install curl ca-certificates tar xz openssl
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache curl ca-certificates tar xz openssl
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm curl ca-certificates tar xz openssl
+  fi
+
+  ensure_node_runtime
+
+  if command -v corepack >/dev/null 2>&1; then
+    corepack enable >/dev/null 2>&1 || true
+    corepack prepare "pnpm@${PNPM_VERSION}" --activate >/dev/null 2>&1 || npm install -g "pnpm@${PNPM_VERSION}"
+  else
+    npm install -g "pnpm@${PNPM_VERSION}"
+  fi
+}
+
+download_panel_bundle() {
+  local version="$1"
+  local tmp_dir url archive http_code
+  tmp_dir="$(mktemp -d)"
+  archive="$tmp_dir/panel.tar.gz"
+  if ! url="$(panel_bundle_url "$version")"; then
+    echo "[INFO] Panel bundle for v$version is not available yet."
+    echo "[INFO] GitHub Actions may still be building or uploading release assets. Please retry later."
+    exit "$ASSETS_PENDING_EXIT_CODE"
+  fi
+
+  echo "[INFO] Downloading panel bundle: $url"
+  http_code="$(download_github_archive "$url" "$archive")"
+  if [ "$http_code" = "404" ]; then
+    rm -rf "$tmp_dir"
+    echo "[INFO] Panel bundle for v$version is not available yet."
+    echo "[INFO] GitHub Actions may still be building or uploading release assets. Please retry later."
+    exit "$ASSETS_PENDING_EXIT_CODE"
+  fi
+  if [ "$http_code" != "200" ]; then
+    rm -rf "$tmp_dir"
+    if [ "$http_code" = "invalid-archive" ]; then
+      echo "[ERROR] Downloaded panel bundle is not a valid tar.gz archive"
+    else
+      echo "[ERROR] Failed to download panel bundle from GitHub release (HTTP ${http_code:-unknown})"
+    fi
+    exit 1
+  fi
+
+  mkdir -p "$APP_DIR"
+  rm -rf "$APP_DIR/dist" "$APP_DIR/client" "$APP_DIR/drizzle" "$APP_DIR/plugins" "$APP_DIR/scripts"
+  rm -f "$APP_DIR/package.json" "$APP_DIR/pnpm-lock.yaml" "$APP_DIR/pnpm-workspace.yaml"
+
+  if ! tar -xzf "$archive" -C "$APP_DIR"; then
+    rm -rf "$tmp_dir"
+    echo "[ERROR] Failed to extract panel bundle"
+    exit 1
+  fi
+  rm -rf "$tmp_dir"
+}
+
+install_runtime_dependencies() {
+  cd "$APP_DIR"
+  rm -rf node_modules
+  if [ -f pnpm-lock.yaml ]; then
+    pnpm install --prod --frozen-lockfile
+  else
+    npm install --omit=dev
+  fi
+}
+
+write_env() {
+  local jwt_secret="${JWT_SECRET:-}"
+  if [ -z "$jwt_secret" ]; then
+    jwt_secret="$(openssl rand -hex 32 2>/dev/null || date +%s%N | sha256sum | awk '{print $1}')"
+  fi
+  mkdir -p "$APP_DIR/data"
+  ensure_xray_master_key
+  umask 077
+  cat > "$APP_DIR/.env" <<EOF
+NODE_ENV=production
+PORT=$PORT
+DATABASE_CONFIG_PATH=$APP_DIR/data/database.json
+SQLITE_PATH=$APP_DIR/data/forwardx.db
+MYSQL_CONFIG_PATH=$APP_DIR/data/mysql.json
+JWT_SECRET=$jwt_secret
+XRAY_MASTER_KEY_PATH=$XRAY_MASTER_KEY_PATH
+FORWARDX_PORT_CONFIG_PATH=$APP_DIR/.env
+FORWARDX_PORT_MANAGEMENT=local
+FORWARDX_GITHUB_ACCELERATOR_URL="$GITHUB_ACCELERATOR_URL"
+FORWARDPLUS_GITHUB_TOKEN=$GITHUB_TOKEN
+FORWARDX_UPGRADE_COMMAND="/bin/bash $APP_DIR/scripts/install-panel-local.sh upgrade"
+EOF
+  chmod 600 "$APP_DIR/.env"
+}
+
+install_panel() {
+  local release_version
+  require_root
+  resolve_runtime_env
+  read_install_port
+  install_deps
+  release_version="$(resolve_release_version)"
+  download_panel_bundle "$release_version"
+  install_runtime_dependencies
+  write_env
+  read_database_config
+  write_service
+  restart_service
+  echo "[DONE] ForwardX panel started (release v$release_version): http://SERVER_IP:$PORT"
+}
+
+upgrade_panel() {
+  local release_version
+  require_root
+  resolve_runtime_env
+  install_deps
+  release_version="$(resolve_release_version)"
+  download_panel_bundle "$release_version"
+  install_runtime_dependencies
+  write_env
+  write_service
+  restart_service
+  echo "[DONE] ForwardX panel upgraded to release v$release_version and restarted"
+}
+
+uninstall_panel() {
+  require_root
+  if ! confirm_yes "Confirm uninstall ForwardX local panel and remove service files? [y/N] "; then
+    echo "[INFO] Uninstall cancelled"
+    return
+  fi
+  remove_service
+
+  if confirm_yes "Remove panel directory $APP_DIR ? [y/N] "; then
+    rm -rf "$APP_DIR"
+    echo "[DONE] Removed $APP_DIR"
+  else
+    echo "[DONE] Service uninstalled, kept $APP_DIR"
+  fi
+}
+
+reset_admin_password() {
+  require_root
+  local node_bin password confirmation selector status
+  node_bin="$(command -v node || true)"
+  if [ -z "$node_bin" ]; then
+    echo "[ERROR] Node.js is not installed on this host."
+    return 1
+  fi
+  if [ ! -f "$APP_DIR/dist/reset-admin-password.js" ]; then
+    echo "[ERROR] Password reset CLI is missing from $APP_DIR. Upgrade the panel first."
+    return 1
+  fi
+  if [ ! -f "$APP_DIR/.env" ]; then
+    echo "[ERROR] Panel environment file not found: $APP_DIR/.env"
+    return 1
+  fi
+  if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+    echo "[ERROR] reset-admin requires an interactive SSH terminal."
+    return 1
+  fi
+
+  echo "[WARN] This revokes all existing administrator sessions. Back up the database first."
+  printf "Administrator username or email (blank if only one): " > /dev/tty
+  IFS= read -r selector < /dev/tty || selector=""
+  password="$(read_secret "New administrator password: ")"
+  confirmation="$(read_secret "Confirm administrator password: ")"
+  if [ "$password" != "$confirmation" ]; then
+    echo "[ERROR] Password confirmation does not match."
+    unset password confirmation selector
+    return 1
+  fi
+
+  set +e
+  (
+    cd "$APP_DIR" || exit 1
+    cli_args=(--stdin)
+    if [ "$ENABLE_ADMIN_ACCOUNT" = "true" ]; then cli_args+=(--enable-account); fi
+    printf '%s\n%s\n%s\n' "$selector" "$password" "$confirmation" \
+      | env DOTENV_CONFIG_PATH="$APP_DIR/.env" DOTENV_CONFIG_OVERRIDE=true \
+        "$node_bin" dist/reset-admin-password.js "${cli_args[@]}"
+  )
+  status=$?
+  set -e
+  unset password confirmation selector
+  return "$status"
+}
+
+case "$ACTION" in
+  install) install_panel ;;
+  upgrade|update) upgrade_panel ;;
+  uninstall|remove) uninstall_panel ;;
+  reset-admin|reset-password) reset_admin_password ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

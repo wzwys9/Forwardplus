@@ -1,0 +1,202 @@
+import { exitGroupUsesMultipleExits } from "../shared/exitStrategy";
+
+export type TunnelRuntimeFamily = "forwardx" | "gost" | "nginx";
+export type TunnelRuntimeForwardType = "forwardx-tunnel" | "gost-tunnel" | "nginx-tunnel-exit";
+export type TunnelRuleRuntimeForwardType = "forwardx" | "gost" | "nginx-tunnel";
+export type GostTunnelTransportType = "tls" | "wss" | "tcp" | "mtls" | "mwss" | "mtcp";
+
+/**
+ * A multi-hop ForwardX entry host does not own a tunnel FXP listener. Its
+ * entry rule owns that process, while the tunnel action only persists a
+ * bookkeeping marker so the panel can track the hop. The Agent therefore
+ * reports this marker as not-ready even though that is the expected state.
+ */
+export function isPassiveForwardXFirstHopMarker(input: {
+  isFirstHop?: unknown;
+  tunnelId?: unknown;
+  port?: unknown;
+  local?: {
+    tunnelId?: unknown;
+    port?: unknown;
+    forwardType?: unknown;
+    transportVersion?: unknown;
+    ready?: unknown;
+  } | null;
+}) {
+  const local = input.local;
+  const tunnelId = Number(input.tunnelId || 0);
+  const port = Number(input.port || 0);
+  const localTunnelId = Number(local?.tunnelId || 0);
+  const localPort = Number(local?.port || 0);
+  const forwardType = String(local?.forwardType || "").trim().toLowerCase();
+  const transportVersion = String(local?.transportVersion || "").trim().toLowerCase();
+  return !!input.isFirstHop
+    && tunnelId > 0
+    && port > 0
+    && !!local
+    && localTunnelId === tunnelId
+    && localPort === port
+    && forwardType === "forwardx-tunnel"
+    && local.ready === false
+    && transportVersion === "";
+}
+
+const GOST_TUNNEL_MODES: ReadonlySet<string> = new Set<GostTunnelTransportType>([
+  "tls",
+  "wss",
+  "tcp",
+  "mtls",
+  "mwss",
+  "mtcp",
+]);
+
+export type GostTunnelProbeListener = {
+  tunnelId: number;
+  mode: string;
+  listenPort: number;
+  name: string;
+};
+
+type GostTunnelProbeInput = {
+  id?: unknown;
+  mode?: unknown;
+  isEnabled?: unknown;
+  protocolEnabled?: unknown;
+  exitHostId?: unknown;
+  listenPort?: unknown;
+  loadBalanceEnabled?: unknown;
+  loadBalanceStrategy?: unknown;
+};
+
+type GostTunnelProbeExitInput = {
+  id?: unknown;
+  seq?: unknown;
+  hostId?: unknown;
+  listenPort?: unknown;
+  isEnabled?: unknown;
+};
+
+export function gostTunnelTransportType(mode: unknown): GostTunnelTransportType {
+  const normalized = String(mode || "").trim().toLowerCase();
+  return GOST_TUNNEL_MODES.has(normalized)
+    ? normalized as GostTunnelTransportType
+    : "tls";
+}
+
+export function tunnelRuntimeFamily(tunnel: any): TunnelRuntimeFamily | null {
+  const mode = String(tunnel?.mode || "").trim().toLowerCase();
+  if (mode === "forwardx") return "forwardx";
+  if (mode === "nginx_stream") return "nginx";
+  if (GOST_TUNNEL_MODES.has(mode)) return "gost";
+  return null;
+}
+
+export function tunnelExitRuntimeForwardType(tunnel: any): TunnelRuntimeForwardType | null {
+  const family = tunnelRuntimeFamily(tunnel);
+  if (family === "forwardx") return "forwardx-tunnel";
+  if (family === "nginx") return "nginx-tunnel-exit";
+  return family === "gost" ? "gost-tunnel" : null;
+}
+
+export function tunnelHopRuntimeForwardType(tunnel: any): Exclude<TunnelRuntimeForwardType, "nginx-tunnel-exit"> | null {
+  const family = tunnelRuntimeFamily(tunnel);
+  if (family === "nginx") return null;
+  if (family === "forwardx") return "forwardx-tunnel";
+  return family === "gost" ? "gost-tunnel" : null;
+}
+
+export function tunnelRuleRuntimeForwardType(tunnel: any): TunnelRuleRuntimeForwardType | null {
+  const family = tunnelRuntimeFamily(tunnel);
+  if (family === "forwardx") return "forwardx";
+  if (family === "nginx") return "nginx-tunnel";
+  return family === "gost" ? "gost" : null;
+}
+
+export function planGostTunnelProbeListeners(
+  hostIdValue: unknown,
+  tunnels: readonly GostTunnelProbeInput[],
+  exitNodesByTunnelId: ReadonlyMap<number, readonly GostTunnelProbeExitInput[]>,
+  businessListenKeys: ReadonlySet<string>,
+): GostTunnelProbeListener[] {
+  const hostId = Number(hostIdValue);
+  if (!Number.isFinite(hostId) || hostId <= 0) return [];
+
+  const listeners: GostTunnelProbeListener[] = [];
+  const plannedKeys = new Set<string>();
+  const addListener = (tunnel: GostTunnelProbeInput, listenPortValue: unknown, name: string) => {
+    const tunnelId = Number(tunnel.id);
+    const listenPort = Number(listenPortValue);
+    if (!Number.isFinite(tunnelId) || tunnelId <= 0 || !Number.isInteger(listenPort) || listenPort <= 0 || listenPort > 65535) return;
+    const listenKey = `${hostId}:${listenPort}`;
+    if (businessListenKeys.has(listenKey) || plannedKeys.has(listenKey)) return;
+    plannedKeys.add(listenKey);
+    listeners.push({
+      tunnelId,
+      mode: String(tunnel.mode || "tls").trim().toLowerCase() || "tls",
+      listenPort,
+      name,
+    });
+  };
+
+  for (const tunnel of tunnels || []) {
+    const tunnelEnabled = tunnel?.isEnabled === true || Number(tunnel?.isEnabled) === 1;
+    const protocolEnabled = tunnel?.protocolEnabled === true || Number(tunnel?.protocolEnabled) === 1;
+    if (!tunnel || !tunnelEnabled || !protocolEnabled || tunnelRuntimeFamily(tunnel) !== "gost") continue;
+    const tunnelId = Number(tunnel.id);
+    if (!Number.isFinite(tunnelId) || tunnelId <= 0) continue;
+    if (Number(tunnel.exitHostId) === hostId) {
+      addListener(tunnel, tunnel.listenPort, `fwx-tunnel-probe-${tunnelId}`);
+    }
+    if (tunnel.loadBalanceEnabled !== true && Number(tunnel.loadBalanceEnabled) !== 1) continue;
+    if (!exitGroupUsesMultipleExits(tunnel.loadBalanceStrategy)) continue;
+    for (const exitNode of exitNodesByTunnelId.get(tunnelId) || []) {
+      if (!exitNode || exitNode.isEnabled === false || Number(exitNode.isEnabled) === 0 || Number(exitNode.hostId) !== hostId) continue;
+      const listenPort = Number(exitNode.listenPort);
+      const exitKey = Number(exitNode.id) || Number(exitNode.seq) || listenPort;
+      addListener(tunnel, listenPort, `fwx-tunnel-probe-${tunnelId}-exit-${exitKey}`);
+    }
+  }
+  return listeners;
+}
+
+export type SharedRuntimeReconcileInput = {
+  configChanged: boolean;
+  serviceUnhealthy: boolean;
+  bootstrap: boolean;
+  desiredRelevant: boolean;
+  reportedHasWork: boolean;
+};
+
+export type ManualTunnelTestRefreshMode = "none" | "coordinated" | "endpoint";
+
+export function planManualTunnelTestRefresh(input: {
+  isRunning?: unknown;
+  hopHostCount?: unknown;
+  loadBalanceEnabled?: unknown;
+  extraExitCount?: unknown;
+}): ManualTunnelTestRefreshMode {
+  const isRunning = input.isRunning === true || Number(input.isRunning) === 1;
+  if (isRunning) return "none";
+  const hopHostCount = Math.max(0, Math.floor(Number(input.hopHostCount) || 0));
+  const extraExitCount = Math.max(0, Math.floor(Number(input.extraExitCount) || 0));
+  const loadBalanceEnabled = input.loadBalanceEnabled === true || Number(input.loadBalanceEnabled) === 1;
+  return hopHostCount >= 3 || (loadBalanceEnabled && extraExitCount > 0)
+    ? "coordinated"
+    : "endpoint";
+}
+
+function shouldReconcileSharedRuntime(input: SharedRuntimeReconcileInput) {
+  return input.configChanged
+    || input.serviceUnhealthy
+    || input.bootstrap
+    || input.desiredRelevant
+    || input.reportedHasWork;
+}
+
+export function shouldReconcileNginxRuntime(input: SharedRuntimeReconcileInput) {
+  return shouldReconcileSharedRuntime(input);
+}
+
+export function shouldReconcileGostRuntime(input: SharedRuntimeReconcileInput) {
+  return shouldReconcileSharedRuntime(input);
+}

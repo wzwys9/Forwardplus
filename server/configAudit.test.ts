@@ -1,0 +1,135 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { hashConfig } from "./configAudit";
+
+test("config hashes are stable and exclude volatile runtime fields", () => {
+  const left = hashConfig({ name: "rule", updatedAt: 1, isRunning: false, password: "first" });
+  const right = hashConfig({ password: "first", isRunning: true, updatedAt: 2, name: "rule" });
+  assert.equal(left, right);
+  assert.notEqual(left, hashConfig({ name: "rule", password: "second" }));
+  assert.notEqual(hashConfig({ message: "token=embedded-first" }), hashConfig({ message: "token=embedded-second" }));
+  assert.notEqual(
+    hashConfig({ message: "uuid=03103103-1031-4031-8031-031031031031" }),
+    hashConfig({ message: "uuid=04104104-1041-4041-8041-041041041041" }),
+  );
+});
+
+test("SQLite schema records a redacted monotonic configuration audit", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forwardx-config-audit-"));
+  const databasePath = path.join(directory, "panel.db");
+  const script = String.raw`
+    import assert from "node:assert/strict";
+    import path from "node:path";
+    import { pathToFileURL } from "node:url";
+    const moduleUrl = (file) => pathToFileURL(path.join(process.cwd(), file)).href;
+    const runtime = await import(moduleUrl("server/dbRuntime.ts"));
+    const schema = await import(moduleUrl("server/dbSchema.ts"));
+    const audit = await import(moduleUrl("server/configAudit.ts"));
+    const hosts = await import(moduleUrl("server/repositories/hostRepository.ts"));
+    try {
+      await runtime.connectDatabase({ type: "sqlite", sqlite: { path: process.env.FORWARDX_TEST_DB } });
+      await schema.ensureDatabaseSchema();
+      let hostId = 0;
+      await audit.runWithConfigAuditContext({ actorUserId: 7, actorName: "admin", source: "test" }, async () => {
+        hostId = await hosts.createHost({ name: "edge", ip: "127.0.0.1", userId: 7, agentToken: "top-secret" });
+        await hosts.updateHost(hostId, { name: "edge-2" });
+      });
+      const rows = await runtime.queryRaw('SELECT "id", "actorUserId", "afterJson" FROM "config_audit_events" ORDER BY "id"');
+      assert.equal(rows.length, 2);
+      assert.equal(rows[0].actorUserId, 7);
+      assert.ok(rows[1].id > rows[0].id);
+      assert.match(rows[0].afterJson, /\[REDACTED\]/);
+      assert.doesNotMatch(rows[0].afterJson, /top-secret/);
+
+      const xraySecrets = {
+        token: "xray-token-UNIQUE-031-audit",
+        uuid: "03103103-1031-4031-8031-031031031031",
+        privateKey: "PRIVATEKEYUNIQUE031-audit",
+        shortId: "0310310310310310",
+      };
+      await audit.recordConfigAuditEvent({
+        resourceType: "xray_inbound",
+        resourceId: 31,
+        hostId,
+        action: "create",
+        after: {
+          hostId,
+          runtimeTag: "forwardx-inbound-safe",
+          nested: { configJson: JSON.stringify(xraySecrets) },
+          commandOutput: "Authorization: Bearer " + xraySecrets.token + " uuid=" + xraySecrets.uuid,
+          privateKey: xraySecrets.privateKey,
+          shortId: xraySecrets.shortId,
+        },
+      });
+      const xrayRows = await runtime.queryRaw(
+        'SELECT "afterJson", "diffJson" FROM "config_audit_events" WHERE "resourceType" = ?',
+        ["xray_inbound"],
+      );
+      assert.equal(xrayRows.length, 1);
+      const xrayAuditText = JSON.stringify(xrayRows[0]);
+      for (const secret of Object.values(xraySecrets)) assert.doesNotMatch(xrayAuditText, new RegExp(secret));
+      assert.match(xrayAuditText, /forwardx-inbound-safe/);
+
+      await audit.recordConfigAuditEvent({
+        resourceType: "tunnel",
+        resourceId: 91,
+        hostId: 1,
+        action: "create",
+        after: { id: 91, name: "mimic", isEnabled: true, udpOverTcp: true },
+      });
+      await audit.recordConfigAuditEvent({
+        resourceType: "tunnel",
+        resourceId: 91,
+        hostId: 1,
+        action: "update",
+        before: { id: 91, name: "mimic", isEnabled: true, udpOverTcp: true },
+        after: { id: 91, name: "renamed", isEnabled: true, udpOverTcp: true },
+      });
+      await audit.recordConfigAuditEvent({
+        resourceType: "tunnel",
+        resourceId: 91,
+        hostId: 1,
+        action: "update",
+        before: { id: 91, name: "renamed", isEnabled: true, udpOverTcp: true },
+        after: { id: 91, name: "renamed", isEnabled: false, udpOverTcp: true },
+      });
+      const enabledRevision = await audit.recordConfigAuditEvent({
+        resourceType: "tunnel",
+        resourceId: 91,
+        hostId: 1,
+        action: "update",
+        before: { id: 91, name: "renamed", isEnabled: false, udpOverTcp: true },
+        after: { id: 91, name: "renamed", isEnabled: true, udpOverTcp: true },
+      });
+      await audit.recordConfigAuditEvent({
+        resourceType: "tunnel",
+        resourceId: 91,
+        hostId: 1,
+        action: "update",
+        before: { id: 91, name: "renamed", isEnabled: true, udpOverTcp: true },
+        after: { id: 91, name: "renamed-again", isEnabled: true, udpOverTcp: true },
+      });
+      assert.equal(
+        await audit.getMimicLifecycleRevisionSignature([{ resourceType: "tunnel", resourceId: 91 }]),
+        "tunnel:91:" + enabledRevision,
+      );
+    } finally {
+      await runtime.closeDatabase();
+    }
+  `;
+  try {
+    const result = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", script], {
+      cwd: process.cwd(),
+      env: { ...process.env, DATABASE_TYPE: "sqlite", FORWARDX_TEST_DB: databasePath },
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

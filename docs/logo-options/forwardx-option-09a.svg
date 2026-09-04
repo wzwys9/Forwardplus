@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">ForwardX Logo Option 09A</title>
+  <desc id="desc">Greater-than less-than mark with vertical offset and clear center gap.</desc>
+  <defs>
+    <linearGradient id="bg" x1="34" y1="28" x2="224" y2="228" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1557d8"/>
+      <stop offset=".52" stop-color="#0277b8"/>
+      <stop offset="1" stop-color="#078066"/>
+    </linearGradient>
+    <linearGradient id="rightMark" x1="116" y1="96" x2="196" y2="184" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#d9fff3"/>
+      <stop offset="1" stop-color="#8cf0d3"/>
+    </linearGradient>
+  </defs>
+  <rect x="28" y="28" width="200" height="200" rx="46" fill="url(#bg)"/>
+  <path d="M70 70h26v116H70V70Zm21 0h60v23H91V70Zm0 49h40v22H91v-22Z" fill="#ffffff" opacity=".1"/>
+  <path d="M61 75h39l50 42-50 42H61l50-42-50-42Z" fill="#ffffff"/>
+  <path d="M195 97h-39l-50 42 50 42h39l-50-42 50-42Z" fill="url(#rightMark)"/>
+</svg>
