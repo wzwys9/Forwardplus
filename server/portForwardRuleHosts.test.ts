@@ -103,17 +103,14 @@ test("pending rule cleanup never remains an active host delete blocker", () => {
 
     const moduleUrl = (file) => pathToFileURL(path.join(process.cwd(), file)).href;
     const runtime = await import(moduleUrl("server/dbRuntime.ts"));
+    const schema = await import(moduleUrl("server/dbSchema.ts"));
     const hostRepository = await import(moduleUrl("server/repositories/hostRepository.ts"));
     const ruleRepository = await import(moduleUrl("server/repositories/forwardRuleRepository.ts"));
 
     await runtime.connectDatabase({ type: "sqlite", sqlite: { path: process.env.FORWARDX_TEST_DB } });
-    await runtime.executeRaw('CREATE TABLE "users" ("id" INTEGER PRIMARY KEY, "username" TEXT NOT NULL, "name" TEXT)');
-    await runtime.executeRaw('CREATE TABLE "forward_groups" ("id" INTEGER PRIMARY KEY, "groupMode" TEXT NOT NULL)');
-    await runtime.executeRaw('CREATE TABLE "forward_group_members" ("id" INTEGER PRIMARY KEY, "groupId" INTEGER NOT NULL, "memberType" TEXT NOT NULL, "hostId" INTEGER, "priority" INTEGER NOT NULL, "ruleId" INTEGER, "updatedAt" INTEGER)');
-    await runtime.executeRaw('CREATE TABLE "forward_rules" ("id" INTEGER PRIMARY KEY, "hostId" INTEGER NOT NULL, "userId" INTEGER NOT NULL, "forwardGroupId" INTEGER, "forwardGroupRuleId" INTEGER, "forwardGroupMemberId" INTEGER, "isForwardGroupTemplate" INTEGER NOT NULL, "isEnabled" INTEGER NOT NULL, "pendingDelete" INTEGER NOT NULL, "isRunning" INTEGER NOT NULL, "updatedAt" INTEGER NOT NULL)');
-    await runtime.executeRaw('CREATE TABLE "forward_rule_tunnel_exits" ("id" INTEGER PRIMARY KEY, "ruleId" INTEGER NOT NULL)');
-    await runtime.executeRaw('INSERT INTO "users" ("id", "username", "name") VALUES (99, \'customer-a\', \'Customer A\')');
-    await runtime.executeRaw('INSERT INTO "forward_rules" ("id", "hostId", "userId", "forwardGroupId", "forwardGroupRuleId", "forwardGroupMemberId", "isForwardGroupTemplate", "isEnabled", "pendingDelete", "isRunning", "updatedAt") VALUES (10, 2, 99, NULL, NULL, NULL, 0, 1, 0, 1, 1)');
+    await schema.ensureDatabaseSchema();
+    await runtime.executeRaw('INSERT INTO "users" ("id", "username", "name", "password") VALUES (99, \'customer-a\', \'Customer A\', \'test\')');
+    await runtime.executeRaw('INSERT INTO "forward_rules" ("id", "hostId", "name", "sourcePort", "targetIp", "targetPort", "userId", "forwardGroupId", "forwardGroupRuleId", "forwardGroupMemberId", "isForwardGroupTemplate", "isEnabled", "pendingDelete", "isRunning", "updatedAt") VALUES (10, 2, \'cleanup-rule\', 21000, \'127.0.0.1\', 80, 99, NULL, NULL, NULL, 0, 1, 0, 1, 1)');
 
     assert.deepEqual(await hostRepository.getHostRuleDeleteBlockers(2), {
       ruleCount: 1,
