@@ -88,6 +88,10 @@ test("DNS provider repository stores an account-bound global account and exposes
       const stableZoneId = catalog[0].zoneId;
       const stableDefaultLineId = catalog[0].lines.find((line) => line.providerLineId === "line-default").lineId;
       assert.equal(catalog[0].catalogUsable, true);
+      assert.equal(catalog[0].inUse, false);
+      assert.equal(catalog[0].quickConfigReferenceCount, 0);
+      assert.equal(catalog[0].managedRecordCount, 0);
+      assert.equal(catalog[0].activeOperationCount, 0);
       assert.deepEqual(catalog[0].carrierLines.map((line) => [line.category, line.status]), [
         ["DEFAULT", "AVAILABLE"], ["TELECOM", "AVAILABLE"], ["UNICOM", "AVAILABLE"],
         ["MOBILE", "AVAILABLE"], ["EDUCATION", "AVAILABLE"],
@@ -147,6 +151,18 @@ test("DNS provider repository stores an account-bound global account and exposes
       assert.equal(unavailableCatalog[0].catalogUsable, false);
       assert.equal(unavailableCatalog[0].carrierLines.find((line) => line.category === "TELECOM").status, "AMBIGUOUS");
       assert.equal(unavailableCatalog[0].carrierLines.find((line) => line.category === "EDUCATION").status, "MISSING");
+
+      await runtime.executeRaw(
+        "INSERT INTO xray_quick_configs "
+          + "(configTag, targetType, targetVersion, dnsAccountId, zoneId, relativeName, fqdn, state, revision, createdByUserId, createdAt, updatedAt) "
+          + "VALUES (?, 'EXTERNAL_PROXY_NODE', ?, ?, ?, 'edge', 'edge.example.com', 'ACTIVE', 1, 1, ?, ?)",
+        ["quick-config-zone-lock", "a".repeat(64), created.accountId, stableZoneId, new Date(), new Date()],
+      );
+      const lockedCatalog = await repository.listGlobalDnsProviderZones();
+      assert.equal(lockedCatalog[0].inUse, true);
+      assert.equal(lockedCatalog[0].quickConfigReferenceCount, 1);
+      await runtime.executeRaw("UPDATE xray_quick_configs SET state = 'REMOVED' WHERE configTag = ?", ["quick-config-zone-lock"]);
+      assert.equal((await repository.listGlobalDnsProviderZones())[0].inUse, false);
 
       await runtime.executeRaw(
         "UPDATE dns_provider_record_lines SET name = '电信' WHERE zoneId = ? AND providerLineId = 'line-default'",

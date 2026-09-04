@@ -1,6 +1,6 @@
 # Xray 面板 API 契约
 
-状态：第一版契约已实施；多协议 additive 契约已批准并按任务增量落地；DNSPod + Realm 快速配置契约已批准。与 `SPEC.md` 0.21 配套。ForwardX 使用 tRPC，本文件描述 procedure、输入输出和错误语义；实现以共享 Zod schema 和类型测试固化。
+状态：第一版契约已实施；多协议 additive 契约已批准并按任务增量落地；DNSPod 快速配置与通用记录管理契约已批准。与 `SPEC.md` 0.25 配套。ForwardX 使用 tRPC，本文件描述 procedure、输入输出和错误语义；实现以共享 Zod schema 和类型测试固化。
 
 主机列表、状态摘要和 Agent 升级接口将真实 `agentVersion` 与可空 `agentDistribution`、`agentBuildId` 分开返回。升级候选定义为“来源不是 `forwardplus` 或版本低于面板目标”；单台/批量升级请求写入 `targetDistribution=forwardplus`，只有后续报告同时满足来源和版本才返回完成。来源未知的旧 Agent 不能因为版本较高而绕过 Forwardplus 专有功能门控。
 
@@ -580,13 +580,24 @@ profileId 固定为 `VLESS_RAW_TLS`、`VLESS_RAW_TLS_VISION`、`TROJAN_RAW_TLS`�
 
 ### `xray.dnsProviderAccounts.zones`
 
-输入 `{ refresh?: boolean }`。只有账号验证未过期时可用；catalog 最多缓存 6 小时。`refresh=true` 强制有界实时同步；`refresh=false` 遇到过期缓存也自动尝试一次同步，失败时返回 stale 安全投影而不是旧 catalog 可写能力。zone 返回 `{ zoneId, providerZoneId, name, status, catalogRevision, expiresAt, catalogUsable, catalogReasonCode, lines[], carrierLines[] }`，line 只含 `{ lineId, providerLineId, name, category, status }`；`carrierLines` 恰好投影 `DEFAULT + TELECOM + UNICOM + MOBILE + EDUCATION` 五类，每类为 `{ category, status:"AVAILABLE", lineId, providerLineId, name } | { category, status:"MISSING"|"AMBIGUOUS"|"STALE", reasonCode }`，`OTHER` 只保留在原始安全 `lines` 数组。服务端仅对本次 DNSPod catalog 返回的完整规范名称按版本化精确表 `默认/电信/联通/移动/教育网` 分类，lineId 必须取动态响应，禁止硬编码、子串或顺序推断。只有 `AVAILABLE` 可提交；客户端提交 provider line id，后端在每次 DNS write 前再次实时核对。
+输入 `{ refresh?: boolean }`。只有账号验证未过期时可用；catalog 最多缓存 6 小时。`refresh=true` 强制有界实时同步；`refresh=false` 遇到过期缓存也自动尝试一次同步，失败时返回 stale 安全投影而不是旧 catalog 可写能力。zone 返回 `{ zoneId, providerZoneId, name, status, catalogRevision, expiresAt, catalogUsable, catalogReasonCode, inUse, quickConfigReferenceCount, managedRecordCount, activeOperationCount, lines[], carrierLines[] }`，line 只含 `{ lineId, providerLineId, name, category, status }`；`carrierLines` 恰好投影 `DEFAULT + TELECOM + UNICOM + MOBILE + EDUCATION` 五类，每类为 `{ category, status:"AVAILABLE", lineId, providerLineId, name } | { category, status:"MISSING"|"AMBIGUOUS"|"STALE", reasonCode }`，`OTHER` 只保留在原始安全 `lines` 数组。`inUse` 在未删除快速配置、未清理托管记录或活动 operation 任一计数非零时为 true。服务端仅对本次 DNSPod catalog 返回的完整规范名称按版本化精确表 `默认/电信/联通/移动/教育网` 分类，lineId 必须取动态响应，禁止硬编码、子串或顺序推断。只有 `AVAILABLE` 可提交；客户端提交面板 line id，后端在每次 DNS write 前再次实时核对。
 
-## 18. 快速配置 API（TASK057）
+## 18. DNS 记录管理 API（MAINT-019）
+
+全部 procedure 位于 `xray.dnsRecords.*`、只允许管理员，并设置 `private, no-store`。账号必须验证有效，zone 必须是当前 global binding 目录中的 `AVAILABLE` 项；所有 provider 响应都继续通过严格解析器，不暴露 RequestId 或原始错误。
+
+- `list({ zoneId, search?, recordType?, page=1, pageSize=20 })` 实时读取 DNSPod 记录，服务端稳定排序、筛选并分页，返回 `{ items, total, page, pageSize, zone:{ zoneId,name,inUse,...counts } }`。每条记录只返回 providerRecordId、subdomain、recordType、lineId/lineName、value、ttl、status 和基于规范 tuple 的 `recordRevision`。
+- `create({ zoneId, subdomain, recordType, lineId, value, ttl })` 只允许 A/AAAA/CNAME。`lineId` 是面板目录 id，服务端解析并复核 providerLineId/name；成功后只返回 `{ providerRecordId }`，界面再实时重读列表。
+- `update({ zoneId, providerRecordId, expectedRecordRevision, subdomain, recordType, lineId, value, ttl })` 在写入前用 `DescribeRecord` 回读并比对 revision，远端已变更时返回 `DNS_RECORD_CHANGED`，不覆盖。
+- `remove({ zoneId, providerRecordId, expectedRecordRevision })` 同样先回读并比对 revision，仅删除该精确 recordId。
+
+三个 mutation 均必须在 provider 写入前从数据库重新计算 zone 占用；占用时返回 `DNS_ZONE_IN_USE` 冲突。账号/catalog revision 变化、记录被第三方改写、recordId 不属于选定 zone 都必须 fail closed。写请求出现结果不明时返回 `DNS_WRITE_UNCERTAIN`，界面要求刷新而不自动重试。
+
+## 19. 快速配置 API（TASK057）
 
 全部 procedure 位于 `xray.quickConfigs.*`，只允许管理员。输入均为 strict Zod object，拒绝浏览器提交任意 Agent task、候选数组、DNS record、Realm 命令、规则 payload、ownerGroupTag 或分享材料。所有包含 domain/probe/recommendation/preview/remove token 或派生分享材料的响应统一设置 `Cache-Control: private, no-store, max-age=0` 与 `Pragma: no-cache`；token 不进入普通 list/detail/operation DTO。
 
-### 18.1 目标目录与列表
+### 19.1 目标目录与列表
 
 `xray.quickConfigs.targetsList({ search?, targetType?, page?, pageSize? })` 的 `items` 使用以下判别联合：
 
@@ -692,7 +703,7 @@ type QuickConfigDetail = QuickConfigSummary & {
 
 `xray.quickConfigs.list({ search?, state?, targetType?, accountId?, page=1, pageSize=20 })` 返回 `{ items:QuickConfigSummary[], total:number, page:number, pageSize:number }`，其中 `pageSize` 为 1–100。`xray.quickConfigs.detail({ id })` 返回 `QuickConfigDetail`。不得返回 DNSPod secret、出口凭据、完整 URI、token、原始 provider 响应或 operation JSON。
 
-### 18.2 域名检查与确认
+### 19.2 域名检查与确认
 
 `xray.quickConfigs.domainChecksCreate` 输入：
 
@@ -736,7 +747,7 @@ type DomainCheckDto = {
 
 `domainChecksConfirm` 必须再次实时读取同名记录后才签发 confirmed token，而不是只验浏览器回传的 hash；面板同名非 `REMOVED` 快速配置也在 create 与 confirm 两处重查。两类 token 使用紧凑的版本化 payload、随机 nonce 和 purpose-separated HMAC-SHA256；签名密钥从面板持久 cookie secret 以固定 quick-config context 派生，因此服务重启后仍可验证，而 cookie secret 轮换会安全地使全部短期 token 失效。签名比较使用 constant-time，解析前限制整体长度，未知字段、版本、用途、管理员、revision 或过期时间一律拒绝。
 
-### 18.3 线路与端口检查
+### 19.3 线路与端口检查
 
 四运营商输入固定为：
 
@@ -779,7 +790,7 @@ type PortCheckResult =
 
 Realm 继续监听既有 `[::]:port` 且 `ipv6_only=false`，同 host 的 IPv4/IPv6 route 共用一条规则。现有 `PORT_PROBE` 不接受任意 IPv6 bind 地址；最终 apply 必须等 Realm 的实际双栈 listener readiness 后才能写 DNS，双栈 bind 失败返回 `RULE_APPLY_FAILED` 并补偿。
 
-### 18.4 Preview 与 apply
+### 19.4 Preview 与 apply
 
 默认线路输入固定为：
 
@@ -855,7 +866,7 @@ type QuickConfigOperationDto = {
 
 DTO 不返回 request/result JSON、provider/Agent 原文、execution owner/lease/fence 或 token，页面可据此刷新恢复。
 
-### 18.5 分享与普通规则联动
+### 19.5 分享与普通规则联动
 
 `xray.quickConfigs.share({ id, accessRef? })` 只对 `shareCapability != NONE` 可用。`accessRef` 严格判别为 `{ type:"LEGACY_CLIENT", legacyClientId:number } | { type:"ACCESS_ENTRY", accessEntryId:number }`；外部节点禁止携带，受管 Xray 多账户必须携带并在服务端复核归属。返回判别联合 `{ format:"VLESS_URI"|"SHADOWSOCKS_URI", uri:string }` 或 `{ format:"SOCKS5_ENDPOINT", endpoint:{ host:string, port:number, username?:string, password?:string } }`，只替换 authority，响应 `private, no-store`；关闭、失败或复制后前端清理内存。
 
@@ -865,9 +876,10 @@ DTO 不返回 request/result JSON、provider/Agent 原文、execution owner/leas
 
 快速配置创建/编辑/重试在数据库事务内由服务端解析 `portResourceGroupId`，浏览器不得提交该字段。匹配范围固定为同 owner、同 host member、`groupMode=port`、同 engine 的已启用资源；存在稳定 `systemManagedKey` 的资源优先保持，恰有一个候选时复用，否则幂等创建 `systemManagedKind=XRAY_QUICK_CONFIG_PORT` 的资源。`forwardGroups.toggle(false)`、`delete` 和会改变 host/engine/mode 的 `update` 在 `quickConfigRuleCount > 0` 时返回 `QUICK_CONFIG_PORT_RESOURCE_IN_USE`；列表中的禁用只是体验层，服务端检查不可省略。已废弃的 `rules.portLinksPage` 与 `rules.portLinkHostsPage` 不再用于链路管理并从公开 router 删除。
 
-### 18.6 稳定错误码
+### 19.6 稳定错误码
 
 - 账号：`DNS_PROVIDER_NOT_CONFIGURED`、`DNS_PROVIDER_INVALID`、`DNS_PROVIDER_VALIDATION_STALE`、`DNS_PROVIDER_CATALOG_STALE`、`DNS_PROVIDER_LINE_MISSING`、`DNS_PROVIDER_LINE_AMBIGUOUS`、`DNS_PROVIDER_NO_ZONES`、`DNS_PROVIDER_IN_USE`、`DNS_PROVIDER_CONFLICT`。
+- 通用 DNS 管理：`DNS_ZONE_NOT_FOUND`、`DNS_ZONE_IN_USE`、`DNS_RECORD_NOT_FOUND`、`DNS_RECORD_CHANGED`、`DNS_WRITE_UNCERTAIN`、`DNS_PROVIDER_UNAVAILABLE`、`DNS_PROVIDER_REQUEST_REJECTED`、`DNS_PROVIDER_INVALID_RESPONSE`。
 - 域名：`DOMAIN_INVALID`、`DOMAIN_CHECK_INVALID`、`DOMAIN_CHECK_EXPIRED`、`DOMAIN_CONFIRMATION_INVALID`、`DOMAIN_CONFIRMATION_EXPIRED`、`DOMAIN_CONFIRMATION_REQUIRED`、`DOMAIN_CONFLICT_CHANGED`、`DOMAIN_ALREADY_MANAGED`、`DNS_RECORD_DRIFT`。
 - 目标/主机：`QUICK_CONFIG_NOT_FOUND`、`QUICK_CONFIG_TARGET_UNSUPPORTED`、`QUICK_CONFIG_TARGET_CHANGED`、`QUICK_CONFIG_HOST_UNAVAILABLE`、`QUICK_CONFIG_MANAGED_RULE`、`QUICK_CONFIG_PORT_RESOURCE_IN_USE`；主机离线继续统一使用通用 `HOST_OFFLINE`，UDP 能力不足统一使用 `UDP_CAPABILITY_REQUIRED`，`QUICK_CONFIG_HOST_UNAVAILABLE` 只表示在线主机缺有效公开地址或 Realm runtime 前置条件。
 - 端口：`GLOBAL_PORT_CONFLICT`、`GLOBAL_PORT_LEGACY_CONFLICT`、`GLOBAL_PORT_RESERVATION_EXPIRED`、`GLOBAL_PORT_SCAN_PENDING`、`GLOBAL_PORT_EXTERNAL_OCCUPIED`、`GLOBAL_PORT_PROBE_INVALID`、`GLOBAL_PORT_PROBE_EXPIRED`、`GLOBAL_PORT_PROBE_FAILED`、`GLOBAL_PORT_RECOMMENDATION_INVALID`、`GLOBAL_PORT_RECOMMENDATION_EXPIRED`。
@@ -875,7 +887,7 @@ DTO 不返回 request/result JSON、provider/Agent 原文、execution owner/leas
 
 所有错误只携带稳定 code、通用 message 和完成下一步所需的安全 id/revision；不返回 provider 原始错误、Agent 原文、DNSPod RequestId、secret、record ownership hash、reservation token 摘要或完整拓扑 JSON。
 
-## 19. 快速配置六引擎扩展（TASK058）
+## 20. 快速配置六引擎扩展（TASK058）
 
 TASK058 对第 18 节做向后兼容扩展：`QuickConfigSummary.engine`、`QuickConfigPreviewDto.rules[].engine` 和 topology 对应规则引擎从固定 `"realm"` 扩展为 `"iptables" | "nftables" | "realm" | "socat" | "gost" | "nginx"`。同一 topology 只能保存一种 engine；不同 host 不得混用。既有 TASK057 数据仍按 `realm` 读取。
 

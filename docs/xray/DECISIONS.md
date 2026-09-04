@@ -122,6 +122,7 @@
 | `XRAY-ADR-115` | 已确认 | 普通转发规则新建表单先以全局账本预检，再由服务端对完整入口 host/network 集合复用既有单端口 `PORT_PROBE`；浏览器只持用途隔离签名 check id，全部成功后释放短期预留，最终 create 再取得正式 allocation。编辑自身 listener 不做 bind 探测 | 仅查所选主机数据库会把其他主机已用端口标绿，也无法发现数据库外进程；而直接探测编辑中的自身 listener 必然误报。服务端派生 fan-out 与短期签名聚合兼顾真实占用、跨主机唯一、不可删减结果和旧 Agent 合同兼容，最终 allocation 继续关闭探测后竞态。 |
 | `XRAY-ADR-116` | 已确认 | Xray 节点创建向导把端口从基础配置中独立出来，顺序固定为“基础配置 → 协议 → 传输 → 端口 → 安全 → 账户 → 确认”；端口探测只在确定 profile 后按其 listener network 执行，切换网络只使旧结果失效而不自动跳页 | 旧流程在选协议前默认做 TCP 探测，选择 Hysteria 2/mKCP/WireGuard 后又将用户跳回端口做 UDP 探测。先确定影响 listener 的 profile 再检测，可避免无效探测、意外回跳和错误网络预留。 |
 | `XRAY-ADR-117` | 已确认 | 创建 Xray 节点的协议选择暂时只展示 VLESS、Trojan、Shadowsocks、HTTP 和 Mixed；VMess、Hysteria 2、WireGuard、Tunnel 只隐藏前端创建入口，后端能力和已有节点管理保持不变 | 用户希望先收窄面板中的产品选择，但明确要求保留后端代码。前端 allowlist 能在不迁移数据、不改变 `AVAILABLE` 状态和不破坏既有节点的情况下实现可逆隐藏。 |
+| `XRAY-ADR-118` | 已确认 | DNS 服务商页增加实时 DNSPod 记录管理，首版只开放 A/AAAA/CNAME；任一快速配置、未清理托管记录或活动 operation 引用的整个 zone 仅允许读取，所有写在服务端再次拦截 | 通用管理不应绕过快速配置的 recordId 所有权和 saga 补偿语义。实时读取避免第二份 DNS 真相；revision 比对和不重试非幂等写防止覆盖第三方变更或重复写入。 |
 
 ## 更新规则
 

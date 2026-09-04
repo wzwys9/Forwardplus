@@ -120,6 +120,10 @@ export type DnsProviderZoneSafeDto = Readonly<{
   expiresAt: string;
   catalogUsable: boolean;
   catalogReasonCode: null | "DNS_PROVIDER_CATALOG_STALE" | "DNS_PROVIDER_LINE_MISSING" | "DNS_PROVIDER_LINE_AMBIGUOUS";
+  inUse: boolean;
+  quickConfigReferenceCount: number;
+  managedRecordCount: number;
+  activeOperationCount: number;
   lines: readonly Readonly<{
     lineId: number;
     providerLineId: string;
@@ -852,7 +856,19 @@ export async function listGlobalDnsProviderZones(now = new Date()): Promise<DnsP
     const accountId = positiveSafeInteger(account.id);
     const q = quoteIdentifier;
     const zones = await queryRaw<Row>(
-      `SELECT * FROM ${q("dns_provider_zones")} WHERE ${q("accountId")} = ? ORDER BY ${q("name")} ASC, ${q("id")} ASC`,
+      `SELECT z.*,
+        (SELECT COUNT(*) FROM ${q("xray_quick_configs")} qc
+          WHERE qc.${q("dnsAccountId")} = z.${q("accountId")} AND qc.${q("zoneId")} = z.${q("id")}
+            AND qc.${q("state")} <> 'REMOVED') AS ${q("quickConfigReferenceCount")},
+        (SELECT COUNT(*) FROM ${q("xray_quick_config_dns_records")} r
+          WHERE r.${q("dnsAccountId")} = z.${q("accountId")} AND r.${q("zoneId")} = z.${q("id")}
+            AND r.${q("status")} <> 'REMOVED') AS ${q("managedRecordCount")},
+        (SELECT COUNT(*) FROM ${q("xray_quick_config_operations")} o
+          JOIN ${q("xray_quick_configs")} qc ON qc.${q("id")} = o.${q("quickConfigId")}
+          WHERE qc.${q("dnsAccountId")} = z.${q("accountId")} AND qc.${q("zoneId")} = z.${q("id")}
+            AND o.${q("status")} IN ('QUEUED', 'RUNNING', 'COMPENSATING')) AS ${q("activeOperationCount")}
+        FROM ${q("dns_provider_zones")} z WHERE z.${q("accountId")} = ?
+        ORDER BY z.${q("name")} ASC, z.${q("id")} ASC`,
       [accountId],
     );
     const allLines = await queryRaw<Row>(
@@ -920,6 +936,9 @@ export async function listGlobalDnsProviderZones(now = new Date()): Promise<DnsP
         return { category, status: "AVAILABLE", lineId: line.lineId, providerLineId: line.providerLineId, name: line.name } as const;
       });
       const firstUnavailable = carrierLines.find((line) => line.status !== "AVAILABLE");
+      const quickConfigReferenceCount = nonnegativeSafeInteger(zone.quickConfigReferenceCount ?? 0);
+      const managedRecordCount = nonnegativeSafeInteger(zone.managedRecordCount ?? 0);
+      const activeOperationCount = nonnegativeSafeInteger(zone.activeOperationCount ?? 0);
       output.push({
         zoneId,
         providerZoneId: boundedString(zone.providerZoneId, 128),
@@ -933,6 +952,10 @@ export async function listGlobalDnsProviderZones(now = new Date()): Promise<DnsP
         expiresAt: expiresAt.toISOString(),
         catalogUsable: !firstUnavailable,
         catalogReasonCode: firstUnavailable?.reasonCode ?? null,
+        inUse: quickConfigReferenceCount > 0 || managedRecordCount > 0 || activeOperationCount > 0,
+        quickConfigReferenceCount,
+        managedRecordCount,
+        activeOperationCount,
         lines,
         carrierLines,
       });

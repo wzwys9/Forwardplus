@@ -102,6 +102,13 @@ import {
   upsertGlobalDnsProviderAccount,
 } from "../dnsProviderAccountService";
 import {
+  createDnsProviderRecord,
+  DnsProviderRecordServiceError,
+  listDnsProviderRecords,
+  removeDnsProviderRecord,
+  updateDnsProviderRecord,
+} from "../dnsProviderRecordService";
+import {
   confirmQuickConfigDomainCheck,
   createQuickConfigDomainCheck,
   listQuickConfigTargets,
@@ -178,6 +185,18 @@ const dnsProviderRevisionInput = z.object({
 const dnsProviderRemoveInput = dnsProviderRevisionInput.extend({
   confirmName: z.string().min(1).max(128),
 }).strict();
+
+const dnsRecordType = z.enum(["A", "AAAA", "CNAME"]);
+const dnsRecordWriteInput = z.object({
+  zoneId: positiveId,
+  subdomain: z.string().trim().min(1).max(253),
+  recordType: dnsRecordType,
+  lineId: positiveId,
+  value: z.string().trim().min(1).max(2_048),
+  ttl: z.number().int().min(1).max(604_800),
+}).strict();
+const dnsProviderRecordId = z.string().min(1).max(128).regex(/^\d+$/);
+const dnsRecordRevision = z.string().length(64).regex(/^[a-f0-9]{64}$/);
 
 const quickConfigTargetType = z.enum(["XRAY_INBOUND", "EXTERNAL_PROXY_NODE"]);
 const quickConfigTargetRef = z.object({
@@ -691,6 +710,22 @@ function dnsProviderAccountTrpcError(error: unknown): never {
   throw new TRPCError({ code, message: error.code, cause: error });
 }
 
+function dnsProviderRecordTrpcError(error: unknown): never {
+  if (!(error instanceof DnsProviderRecordServiceError)) return internalXrayTrpcError();
+  const code = error.code === "DNS_ZONE_NOT_FOUND" || error.code === "DNS_RECORD_NOT_FOUND"
+    ? "NOT_FOUND"
+    : error.code === "DNS_ZONE_IN_USE" || error.code === "DNS_RECORD_CHANGED"
+      ? "CONFLICT"
+      : error.code === "DNS_PROVIDER_NOT_CONFIGURED" || error.code === "DNS_PROVIDER_VALIDATION_STALE"
+        || error.code === "DNS_PROVIDER_CATALOG_STALE"
+        ? "PRECONDITION_FAILED"
+        : error.code === "DNS_PROVIDER_UNAVAILABLE" || error.code === "DNS_PROVIDER_INVALID_RESPONSE"
+          || error.code === "DNS_WRITE_UNCERTAIN"
+          ? "BAD_GATEWAY"
+          : error.code === "SENSITIVE_DATA_UNAVAILABLE" ? "INTERNAL_SERVER_ERROR" : "BAD_REQUEST";
+  throw new TRPCError({ code, message: error.code, cause: error });
+}
+
 function quickConfigTrpcError(error: unknown): never {
   if (error instanceof XrayQuickConfigEditError) {
     const code = error.code === "QUICK_CONFIG_NOT_FOUND" ? "NOT_FOUND"
@@ -841,6 +876,61 @@ export const xrayRouter = router({
           return await listGlobalDnsProviderZonesService(input ?? {});
         } catch (error) {
           dnsProviderAccountTrpcError(error);
+        }
+      }),
+  }),
+  dnsRecords: router({
+    list: adminProcedure
+      .input(z.object({
+        zoneId: positiveId,
+        search: z.string().trim().max(128).optional(),
+        recordType: z.string().trim().min(1).max(16).regex(/^[A-Za-z][A-Za-z0-9]{0,15}$/).optional(),
+        page,
+        pageSize: pageSize.default(20),
+      }).strict())
+      .query(async ({ input, ctx }) => {
+        setSensitiveResponseHeaders(ctx.res);
+        try {
+          return await listDnsProviderRecords(input);
+        } catch (error) {
+          dnsProviderRecordTrpcError(error);
+        }
+      }),
+    create: adminProcedure
+      .input(dnsRecordWriteInput)
+      .mutation(async ({ input, ctx }) => {
+        setSensitiveResponseHeaders(ctx.res);
+        try {
+          return await createDnsProviderRecord(input);
+        } catch (error) {
+          dnsProviderRecordTrpcError(error);
+        }
+      }),
+    update: adminProcedure
+      .input(dnsRecordWriteInput.extend({
+        providerRecordId: dnsProviderRecordId,
+        expectedRecordRevision: dnsRecordRevision,
+      }).strict())
+      .mutation(async ({ input, ctx }) => {
+        setSensitiveResponseHeaders(ctx.res);
+        try {
+          return await updateDnsProviderRecord(input);
+        } catch (error) {
+          dnsProviderRecordTrpcError(error);
+        }
+      }),
+    remove: adminProcedure
+      .input(z.object({
+        zoneId: positiveId,
+        providerRecordId: dnsProviderRecordId,
+        expectedRecordRevision: dnsRecordRevision,
+      }).strict())
+      .mutation(async ({ input, ctx }) => {
+        setSensitiveResponseHeaders(ctx.res);
+        try {
+          return await removeDnsProviderRecord(input);
+        } catch (error) {
+          dnsProviderRecordTrpcError(error);
         }
       }),
   }),

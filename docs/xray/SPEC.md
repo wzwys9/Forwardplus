@@ -1,7 +1,7 @@
 # 规格：ForwardX 受管 Xray
 
 状态：已批准  
-版本：0.24
+版本：0.25
 日期：2026-09-04
 
 实现状态：第一版 `XRAY-TASK-001..037`、多协议基础 `XRAY-TASK-038..042`、Xray-native profile `XRAY-TASK-043..052`、MTProto 独立服务首片 `XRAY-TASK-053`、AmneziaWG userspace 独立服务 `XRAY-TASK-054`、出口节点/中转联动 `XRAY-TASK-055` 与六种本地转发方式出口引用 `XRAY-TASK-056` 已完成；DNSPod 快速配置 `XRAY-TASK-057` 与六引擎创建/切换 `XRAY-TASK-058` 的可体验主流程已实现，集中运行验证待补；TUN 保持 `NOT_IMPLEMENTED`。Reality 默认候选为 `v2`，固定 Xray 默认版本仍为 `v26.3.27`。
@@ -284,11 +284,13 @@
 - `XRAY-QC-024` `port` 资源的引用数必须等于未待删除的用户模板规则数加快速配置规则数。快速配置引用大于零时，服务端必须拒绝停用、删除或改变资源 identity/runtime 字段，界面至少禁用关闭开关并说明原因；名称等纯展示字段是否可改由接口显式限制。面板启动时必须幂等收敛历史未归属或 engine 已变化的快速配置规则，不能重建数据面或重复下发 Agent。
 - `XRAY-QC-025` 受管 Xray 使用目标原端口时，其他入口主机的实际探测只能通过服务端内部派生的精确 `inboundId + port` target-alias 授权忽略该 inbound 自身的全局占用；授权在探测创建、Agent 任务派发和结果接受时都必须用单次一致性查询重新验证 ACTIVE allocation、稳定 runtimeTag、同主机公开 owning reference，不能由浏览器或 Agent 构造。快速配置重新检测或切换引擎时，可以提交上一轮服务端签名的 probe result token；服务端必须拒绝非规范编码，并先完整验证管理员、域名、目标和其中全部 host/network reservation，再一次性释放，任何错配不得部分释放。
 - `XRAY-QC-026` 普通转发规则的新建表单在把源端口标记为“可用”前，必须同时通过套餐/主机范围、本机数据库监听、不区分 TCP/UDP 的全局端口账本，以及服务端派生的全部实际入口主机 Agent bind 探测。`both` 必须分别取得 TCP、UDP 结果；任一入口占用、离线、能力不足、失败、超时或过期都不得提交。编辑已有规则允许全局账本识别同一稳定 `FORWARD_RULE` owner，但不得对自身正在运行的 listener 做空闲 bind 探测。最终创建仍须事务化取得全局 allocation 并处理探测后的竞态。
+- `XRAY-QC-027` 系统设置的 DNS 服务商页在账号卡片下增加管理员专用的“DNS 管理”。域名下拉来自当前已验证 DNSPod 账号的 zone 目录，记录列表实时从 DNSPod 读取，不在面板建立第二份通用 DNS 记录副本。第一版只允许创建、修改和删除 `A | AAAA | CNAME`，线路必须从当前 zone 的动态目录选择。选中 zone 被任一未删除快速配置、未清理托管 DNS 记录或活动编排引用时，仍可读取和刷新，但整个 zone 必须只读；服务端在每次写入前重新检查并返回稳定冲突错误，不得只依赖前端禁用。
 
 - `XRAY-AC-015` 一个加密保存并验证通过的 DNSPod 账户可列出多个可用 zone 和动态线路；无账号、错误凭据和失效验证会禁用创建且不泄露 SecretId/SecretKey。
 - `XRAY-AC-016` `dfd` 与 `hk.dfd` 能在所选 zone 下完成检查/确认；`@`、通配符和非法输入被拒绝。同名 A/AAAA/CNAME 必须显式确认替换，TXT/MX/CAA 保留，检查后竞态会在提交前被发现。
 - `XRAY-AC-017` 四类运营商可各选多个 IPv4/IPv6入口；原端口可用时默认直达落地，端口改写时必须选择受管默认入口，所有 DNS A/AAAA/lineId 与规则引用可从详情追踪。
 - `XRAY-AC-018` 全局端口账本在并发、删除、重试、历史冲突和面板重启后保持唯一；新 Xray 端口跨 host、跨 TCP/UDP 均不能重复，孤立端口只有 12 小时校准确认全部 host 空闲后才回收。
+- `XRAY-AC-019` 多 zone 账号可在 DNS 管理中通过下拉切换，每个 zone 能列出 DNSPod 实时记录并对未占用 zone 完成 A/AAAA/CNAME 增改删；已占用 zone 仍可查看，但前端写按钮禁用且任意直接 API 写请求均被服务端拒绝。
 - `XRAY-AC-019` TASK057 的 Realm 规则全部出现在普通转发规则列表且多线路不重复监听；创建/修改/删除的 Agent、DNS 与端口部分失败可解释、可补偿、可重试。
 - `XRAY-AC-020` TASK058 的六种引擎都复用同一快速配置、端口和 DNS 合同；只显示全部所选 host 共同支持的引擎，切换失败恢复旧引擎且不提前修改 DNS。
 - `XRAY-AC-021` 同一 preview 同时包含默认及运营商记录时，create/edit/retry 的 provider 写入均先完成默认线路，运营商记录随后执行；preview 内容、用户步骤和最终拓扑保持不变。

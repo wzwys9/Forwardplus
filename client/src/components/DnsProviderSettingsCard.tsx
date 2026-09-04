@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { trpc } from "@/lib/trpc";
+import DnsRecordManagementCard from "@/components/DnsRecordManagementCard";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -57,6 +58,16 @@ type DnsZone = {
   expiresAt: string;
   catalogUsable: boolean;
   catalogReasonCode: string | null;
+  inUse: boolean;
+  quickConfigReferenceCount: number;
+  managedRecordCount: number;
+  activeOperationCount: number;
+  lines: ReadonlyArray<{
+    lineId: number;
+    providerLineId: string;
+    name: string;
+    status: "AVAILABLE" | "STALE" | "REMOVED" | "ERROR";
+  }>;
   carrierLines: ReadonlyArray<{
     category: "DEFAULT" | "TELECOM" | "UNICOM" | "MOBILE" | "EDUCATION";
     status: "AVAILABLE" | "MISSING" | "AMBIGUOUS" | "STALE";
@@ -511,6 +522,8 @@ export default function DnsProviderSettingsCard() {
           )}
         </CardContent>
       </Card>
+
+      <DnsRecordManagementCard zones={visibleZones} accountValid={account.validationStatus === "VALID"} />
 
       <Dialog open={rotationOpen} onOpenChange={changeRotationOpen}>
         <DialogContent className="flex max-h-[92svh] max-w-xl flex-col gap-0 p-0">
