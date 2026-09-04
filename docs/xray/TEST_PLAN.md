@@ -700,3 +700,9 @@ MAINT-006 已以提交 `d2af667`、`281e0e8`、`e61ef7a`（交接提交 `bca83c9
 - 快速配置重检覆盖：上一轮规范编码的签名 probe token 的多 host TCP/UDP reservation 先全量校验再一起释放；同管理员同域名同目标可在 engine/线路/端口变化后继续，跨管理员、篡改、非规范等价编码、跨目标、重复或缺失 reservation 零释放。
 - UI reducer 覆盖成功 token 在返回修改 engine/入口/端口后仅保留于内存，新检测受理后清除，过期 token 不再提交；普通创建向导 `replaceReservationIds`、外部目标、改写端口与 AUTO 探测保持原行为。
 - 只运行上述服务端/前端聚焦目标、`corepack pnpm exec tsc --noEmit`、版本一致性、一次生产构建、文档构建和差异检查；不运行无关 DNSPod 写入、六引擎真实运行、Agent Go 全量或浏览器矩阵。
+
+## 75. MAINT-021 DNSPod 已删除托管记录补建回归（2026-09-05）
+
+- provider client 回归用有效数字 recordId 调用 `DescribeRecord`，模拟 DNSPod 返回 `InvalidParameter.RecordIdInvalid`，断言稳定错误为 `DNS_PROVIDER_RECORD_NOT_FOUND`，且错误对象、JSON 和 stack 不暴露 provider code、message、RequestId 或凭据。
+- 保留现有同步决策回归：单记录不存在且完整列表没有精确匹配时进入 CREATE；存在未归属同值、重复或跨配置记录时仍 fail closed。
+- 只运行 DNSPod client 和快速配置同步决策聚焦测试、TypeScript、VitePress 文档构建与差异检查；不执行真实 DNS 写入、浏览器、Go、六引擎或服务端全量。

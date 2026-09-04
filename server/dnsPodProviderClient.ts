@@ -192,7 +192,8 @@ function mapProviderError(code: string, httpStatus: number): DnsPodProviderError
   if (/^(?:InternalError|ServiceUnavailable|FailedOperation\.UnknowError)/.test(code) || httpStatus >= 500) {
     return new DnsPodProviderError("DNS_PROVIDER_UNAVAILABLE", true);
   }
-  if (/^(?:ResourceNotFound\.|FailedOperation\.NoDataOfRecord)/.test(code)) {
+  if (/^(?:ResourceNotFound\.|FailedOperation\.NoDataOfRecord)/.test(code)
+    || code === "InvalidParameter.RecordIdInvalid") {
     return new DnsPodProviderError("DNS_PROVIDER_RECORD_NOT_FOUND");
   }
   return new DnsPodProviderError("DNS_PROVIDER_REQUEST_REJECTED");

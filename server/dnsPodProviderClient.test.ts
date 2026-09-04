@@ -206,6 +206,41 @@ test("catalog, record listing, and CRUD preserve the dynamic DNSPod line id", as
   assert.equal(byAction.get("DeleteRecord")?.RecordId, 771);
 });
 
+test("a DNSPod-invalid deleted record id is normalized as a missing record without leaking provider details", async () => {
+  const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
+    assert.equal(requestAction(init), "DescribeRecord");
+    assert.deepEqual(requestPayload(init), {
+      Domain: "example.com",
+      DomainId: 42,
+      RecordId: 770,
+    });
+    return dnsPodResponse({
+      Error: {
+        Code: "InvalidParameter.RecordIdInvalid",
+        Message: "deleted record leaked SECRETKEYEXAMPLE and AKIDEXAMPLE",
+      },
+      RequestId: "deleted-record-request-id",
+    }, 400);
+  }) as typeof fetch;
+
+  await assert.rejects(
+    clientWith(fetchImpl).getRecord({
+      zone: { providerZoneId: "42", name: "example.com", grade: "DP_FREE" },
+      providerRecordId: "770",
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof DnsPodProviderError);
+      assert.equal(error.code, "DNS_PROVIDER_RECORD_NOT_FOUND");
+      const exposed = `${String(error)} ${JSON.stringify(error)} ${error.stack ?? ""}`;
+      assert.doesNotMatch(
+        exposed,
+        /SECRETKEYEXAMPLE|AKIDEXAMPLE|deleted-record-request-id|deleted record leaked|RecordIdInvalid/,
+      );
+      return true;
+    },
+  );
+});
+
 test("transient failures retry at most twice and permanent failures do not retry", async () => {
   const sleeps: number[] = [];
   let calls = 0;
