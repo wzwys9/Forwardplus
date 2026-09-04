@@ -458,6 +458,42 @@ async function getPortOperation(operationId: string): Promise<PortOperationRow |
   return rows[0] ?? null;
 }
 
+export async function cancelXrayPortProbeOperation(operationIdValue: unknown, userIdValue: unknown): Promise<boolean> {
+  const operationId = String(operationIdValue ?? "");
+  const userId = positiveId(userIdValue, "PORT_RESERVATION_MISMATCH");
+  return withKeyedTaskLock(`xray-port-operation:${operationId}`, async () => {
+    const operation = await getPortOperation(operationId);
+    if (!operation || operation.type !== "PORT_PROBE") throw new XrayPortOperationError("OPERATION_CONFLICT");
+    if (Number(operation.createdByUserId) !== userId) throw new XrayPortOperationError("PORT_RESERVATION_MISMATCH");
+    if (operation.status === "SUCCESS") {
+      const meta = parseRequestMeta(operation.requestMetaJson);
+      try {
+        const parsed = JSON.parse(String(operation.resultJson ?? ""));
+        const reservationId = String(parsed.reservationId ?? "");
+        const entry = xrayReservations.get(reservationId);
+        if (entry && meta && entry.hostId === Number(operation.hostId) && entry.userId === userId
+          && entry.network === meta.network && entry.port === normalizedPort(parsed.selectedPort)) {
+          removeXrayReservation(entry);
+        }
+      } catch {
+        // A malformed terminal result has no trustworthy reservation to release.
+      }
+      return false;
+    }
+    if (TERMINAL_OPERATION_STATUSES.has(operation.status)) return false;
+    const now = nowDate();
+    const q = quoteIdentifier;
+    await executeRaw(
+      `UPDATE ${q("xray_operations")}
+          SET ${q("status")} = ?, ${q("errorCode")} = ?, ${q("errorMessage")} = ?,
+              ${q("finishedAt")} = ?, ${q("updatedAt")} = ?
+        WHERE ${q("operationId")} = ? AND ${q("status")} IN (?, ?)`,
+      ["CANCELLED", "TASK_CANCELLED", "Xray port probe was replaced", now, now, operationId, "QUEUED", "RUNNING"],
+    );
+    return true;
+  });
+}
+
 function removeXrayReservation(entry: XrayReservationEntry) {
   if (xrayReservations.get(entry.reservationId) !== entry) return;
   xrayReservations.delete(entry.reservationId);

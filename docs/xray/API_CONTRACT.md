@@ -527,6 +527,10 @@ profileId 固定为 `VLESS_RAW_TLS`、`VLESS_RAW_TLS_VISION`、`TROJAN_RAW_TLS`�
 
 规则 create/update 增加可选 `targetExternalProxyNodeId`。存在时只允许管理员、`protocol=tcp` 与 iptables、nftables、Realm、socat、GOST、Nginx 六种本地转发执行路径，服务端忽略客户端提交的目标地址并物化资源 endpoint，且拒绝任何向上游发送 PROXY Protocol 的选项；经过既有隧道/转发组时仍按其最终出口执行路径处理。为空时保持既有手动目标合同。稳定错误码增加 `EXTERNAL_PROXY_NOT_FOUND`、`EXTERNAL_PROXY_IN_USE`、`EXTERNAL_PROXY_INVALID_LINK`、`EXTERNAL_PROXY_UNSUPPORTED`、`EXTERNAL_PROXY_REFERENCE_INVALID`。
 
+`rules.checkPort` 与 `rules.randomPort` 必须把所有非 `FREE` 全局端口 allocation 合并到既有主机/隧道/转发组、套餐和数据库监听判断；`excludeRuleId` 只允许同一稳定 `FORWARD_RULE` owner 在编辑时保留自身端口。新建表单随后调用 `rules.portProbeStart({ hostId|forwardGroupId, tunnelId?, sourcePort, protocol, replacePortCheckId? })`。服务端重新鉴权并派生完整入口 host 集合，按明确的 TCP/UDP 网络创建既有单端口 `PORT_PROBE`，返回 `{ status:"RUNNING", portCheckId }` 或稳定的 `USED/FAILED` 结果；浏览器不得提交 host、候选、operation 或 reservation 数组。
+
+`rules.portProbeResult({ portCheckId })` 返回 `{status:"RUNNING", completed, total}`、`{status:"AVAILABLE", checkedAt}`、`{status:"USED", reasonCode, reason}`、`{status:"FAILED", reasonCode, reason}` 或 `{status:"EXPIRED", reasonCode, reason}`。`portCheckId` 是从持久 cookie secret 派生的用途隔离 HMAC token，严格绑定管理员、端口、协议、完整 `host + network + operationId` 集合和期限；未知字段、非规范编码、跨管理员、删减、篡改或过期 fail closed。全部成功后释放短期 host reservation，最终 `rules.create` 的进程内预留和事务化全局 allocation 继续作为竞态防线。输入变化或 Dialog 关闭可调用 `rules.portProbeDiscard({ portCheckId })`，它只取消该签名集合中属于当前管理员的未完成 operation，并释放匹配的短期预留。
+
 ## 17. DNS provider account API（TASK057）
 
 全部 procedure 位于 `xray.dnsProviderAccounts.*`，只允许管理员。首版 UI 只管理固定 `XRAY_QUICK_CONFIG` global binding；底层 DTO 保留稳定 account id/tag 以便未来增加 scope。任何携带 secret 或短期授权 token 的请求/响应都必须设置 `Cache-Control: private, no-store, max-age=0` 和 `Pragma: no-cache`。

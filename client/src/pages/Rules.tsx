@@ -2364,6 +2364,16 @@ function RulesContent() {
   const [portStatus, setPortStatus] = useState<"idle" | "checking" | "available" | "used">("idle");
   const [portRangeError, setPortRangeError] = useState<string | null>(null);
   const latestPortCheckRef = useRef(0);
+  const lastPortCheckIdRef = useRef<string | null>(null);
+  const [portCheckId, setPortCheckId] = useState<string | null>(null);
+  const { mutateAsync: startPortProbe } = trpc.rules.portProbeStart.useMutation();
+  const { mutate: discardPortProbe } = trpc.rules.portProbeDiscard.useMutation();
+  const portProbeResultQuery = trpc.rules.portProbeResult.useQuery({ portCheckId: portCheckId || "" }, {
+    enabled: !!portCheckId,
+    retry: false,
+    refetchInterval: (query) => query.state.data?.status === "RUNNING" ? 750 : false,
+    refetchOnWindowFocus: false,
+  });
   const [copyRuleIds, setCopyRuleIds] = useState<number[]>([]);
   const [copyRuleSearch, setCopyRuleSearch] = useState("");
   const [copyRuleCategory, setCopyRuleCategory] = useState<RuleCategory>("all");
@@ -2712,11 +2722,18 @@ function RulesContent() {
   };
 
   const resetForm = () => {
+    if (lastPortCheckIdRef.current) {
+      discardPortProbe({ portCheckId: lastPortCheckIdRef.current });
+    }
     setForm({ ...defaultForm, failoverTargetsText: "" });
     setExternalProxySearch("");
     setEditingId(null);
     setEditingOriginalProtocol(null);
     setLegacyLocalRuleEditId(null);
+    latestPortCheckRef.current += 1;
+    lastPortCheckIdRef.current = null;
+    setPortCheckId(null);
+    setPortRangeError(null);
     setPortStatus("idle");
   };
 
@@ -2951,9 +2968,10 @@ function RulesContent() {
   const sourcePortRangeText = useMemo(() => describePortPolicy(selectedEntryPortPolicy), [selectedEntryPortPolicy]);
   const portStatusHint = useMemo(() => {
     if (portStatus === "used") {
+      const isRangeError = !!portRangeError && /范围|区间|1-65535|1000-65535/.test(portRangeError);
       return {
         type: "used" as const,
-        text: portRangeError ? "超范围" : "不可用",
+        text: isRangeError ? "超范围" : "不可用",
         title: portRangeError || "端口已被占用",
       };
     }
@@ -2961,11 +2979,13 @@ function RulesContent() {
       return {
         type: "available" as const,
         text: "可用",
-        title: `允许端口范围: ${sourcePortRangeText}`,
+        title: editingId
+          ? `允许端口范围: ${sourcePortRangeText}`
+          : `已通过全局端口库和入口服务器实际检测；允许范围: ${sourcePortRangeText}`,
       };
     }
     return null;
-  }, [portRangeError, portStatus, sourcePortRangeText]);
+  }, [editingId, portRangeError, portStatus, sourcePortRangeText]);
   const tunnelById = useMemo(() => {
     const map = new Map<number, any>();
     (tunnels || []).forEach((tunnel: any) => map.set(Number(tunnel.id), tunnel));
@@ -3302,28 +3322,78 @@ function RulesContent() {
     setPortRangeError(null);
     setPortStatus("checking");
     try {
-      const result = await utils.rules.checkPort.fetch({
-        ...(isForwardGroupRouteMode
-          ? { forwardGroupId: Number(forwardGroupId) }
-          : { hostId: Number(hostId), tunnelId: routeMode === "tunnel" ? tunnelId : null }),
+      const target = isForwardGroupRouteMode
+        ? { forwardGroupId: Number(forwardGroupId) }
+        : { hostId: Number(hostId), tunnelId: routeMode === "tunnel" ? tunnelId : null };
+      if (editingId) {
+        const result = await utils.rules.checkPort.fetch({
+          ...target,
+          sourcePort,
+          excludeRuleId: editingId,
+          protocol: form.protocol,
+        });
+        if (latestPortCheckRef.current !== checkId) return;
+        setPortRangeError(result.used ? result.reason ?? null : null);
+        setPortStatus(result.used ? "used" : "available");
+        return;
+      }
+      const result = await startPortProbe({
+        ...target,
         sourcePort,
-        excludeRuleId: editingId || undefined,
         protocol: form.protocol,
+        ...(lastPortCheckIdRef.current ? { replacePortCheckId: lastPortCheckIdRef.current } : {}),
       });
+      if (latestPortCheckRef.current !== checkId) {
+        if (result.status === "RUNNING") discardPortProbe({ portCheckId: result.portCheckId });
+        return;
+      }
+      if (result.status === "RUNNING") lastPortCheckIdRef.current = result.portCheckId;
+      else lastPortCheckIdRef.current = null;
+      if (result.status === "RUNNING") {
+        setPortCheckId(result.portCheckId);
+        return;
+      }
+      setPortCheckId(null);
+      setPortRangeError(result.reason);
+      setPortStatus("used");
+    } catch (error) {
       if (latestPortCheckRef.current !== checkId) return;
-      setPortRangeError(result.used ? result.reason ?? null : null);
-      setPortStatus(result.used ? "used" : "available");
-    } catch {
-      if (latestPortCheckRef.current !== checkId) return;
-      setPortStatus("idle");
+      lastPortCheckIdRef.current = null;
+      setPortCheckId(null);
+      setPortRangeError(error instanceof Error ? error.message : "端口检测失败，请重试");
+      setPortStatus("used");
     }
-  }, [form.forwardGroupId, form.hostId, form.protocol, form.routeMode, form.sourcePort, form.tunnelId, editingId, utils, selectedEntryPortPolicy, isForwardGroupRouteMode]);
+  }, [form.forwardGroupId, form.hostId, form.protocol, form.routeMode, form.sourcePort, form.tunnelId, editingId, utils, selectedEntryPortPolicy, isForwardGroupRouteMode, startPortProbe, discardPortProbe]);
 
   // A response started for the previous route must not mark the new route occupied.
   useEffect(() => {
     latestPortCheckRef.current += 1;
+    const previousPortCheckId = lastPortCheckIdRef.current;
+    lastPortCheckIdRef.current = null;
+    if (previousPortCheckId) discardPortProbe({ portCheckId: previousPortCheckId });
+    setPortCheckId(null);
     setPortStatus("idle");
   }, [editingId, form.forwardGroupId, form.hostId, form.protocol, form.routeMode, form.sourcePort, form.tunnelId, isForwardGroupRouteMode]);
+
+  useEffect(() => {
+    const result = portProbeResultQuery.data;
+    if (!result || result.status === "RUNNING" || !portCheckId) return;
+    setPortCheckId(null);
+    if (result.status === "AVAILABLE") {
+      setPortRangeError(null);
+      setPortStatus("available");
+      return;
+    }
+    setPortRangeError(result.reason);
+    setPortStatus("used");
+  }, [portCheckId, portProbeResultQuery.data]);
+
+  useEffect(() => {
+    if (!portProbeResultQuery.error || !portCheckId) return;
+    setPortCheckId(null);
+    setPortRangeError(portProbeResultQuery.error.message || "端口检测失败，请重试");
+    setPortStatus("used");
+  }, [portCheckId, portProbeResultQuery.error]);
 
   // 源端口变化时自动检测
   useEffect(() => {
@@ -3418,8 +3488,8 @@ function RulesContent() {
         : { hostId: Number(form.hostId), tunnelId: form.routeMode === "tunnel" ? form.tunnelId : null, excludeRuleId: editingId || undefined, protocol: form.protocol };
       const result = await utils.rules.randomPort.fetch(randomPortInput);
       setForm({ ...form, sourcePort: result.port });
-      setPortStatus("available");
-      toast.success(`已分配随机端口: ${result.port}`);
+      setPortStatus("idle");
+      toast.success(`已选择随机端口 ${result.port}，正在检测入口服务器`);
     } catch (err: any) {
       toast.error(err.message || "无法获取随机端口");
     }
@@ -3867,11 +3937,15 @@ function RulesContent() {
       recoverSeconds: form.recoverSeconds || 120,
       autoFailback: form.autoFailback,
     };
-    if (!isForwardGroupRouteMode && portStatus === "used") {
+    if (portStatus === "used") {
       toast.error("源端口已被占用，请更换端口或使用随机分配");
       return;
     }
-    if (!editingId && !isForwardGroupRouteMode && form.sourcePort > 0 && portStatus !== "available") {
+    if (!editingId && form.sourcePort <= 0) {
+      toast.error("请填写源端口，或点击随机分配后等待检测");
+      return;
+    }
+    if (!editingId && portStatus !== "available") {
       toast.error("请等待端口可用后再保存");
       return;
     }
@@ -7630,6 +7704,12 @@ function RulesContent() {
                         <span className="truncate">{portStatusHint?.text || "可用"}</span>
                       </div>
                     )}
+                    {portStatus === "checking" && (
+                      <div className="absolute right-2.5 top-1/2 inline-flex max-w-[5.5rem] -translate-y-1/2 items-center gap-1 text-[11px] font-medium text-muted-foreground" title="正在检查全局端口库和全部入口服务器">
+                        <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                        <span className="truncate">检测中</span>
+                      </div>
+                    )}
                   </div>
                   <Button
                     type="button"
@@ -7780,7 +7860,7 @@ function RulesContent() {
             </Button>
             <Button
               onClick={handleSubmit}
-              disabled={isPending || !form.name || (!isForwardGroupRouteMode && !form.hostId) || !form.targetIp || !form.targetPort || (form.targetMode === "external" && !form.targetExternalProxyNodeId) || portStatus === "used" || (form.routeMode === "local" && !canUseLocalForward) || (form.routeMode === "tunnel" && !form.tunnelId) || (isForwardGroupRouteMode && !form.forwardGroupId) || (form.failoverEnabled && form.protocol !== "tcp")}
+              disabled={isPending || !form.name || (!isForwardGroupRouteMode && !form.hostId) || !form.targetIp || !form.targetPort || (form.targetMode === "external" && !form.targetExternalProxyNodeId) || (!editingId && (form.sourcePort <= 0 || portStatus !== "available")) || (editingId && portStatus === "used") || (form.routeMode === "local" && !canUseLocalForward) || (form.routeMode === "tunnel" && !form.tunnelId) || (isForwardGroupRouteMode && !form.forwardGroupId) || (form.failoverEnabled && form.protocol !== "tcp")}
             >
               {isPending ? "处理中..." : editingId ? "保存" : "创建"}
             </Button>

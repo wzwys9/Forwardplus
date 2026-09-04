@@ -16,6 +16,7 @@ test("forward-group port checks cover every entry and exclude the edited templat
     const moduleUrl = (file) => pathToFileURL(path.join(process.cwd(), file)).href;
     const runtime = await import(moduleUrl("server/dbRuntime.ts"));
     const schema = await import(moduleUrl("server/dbSchema.ts"));
+    const operations = await import(moduleUrl("server/xrayPortOperations.ts"));
     const { rulesRouter } = await import(moduleUrl("server/routers/rules.ts"));
     const q = (name) => '"' + name + '"';
     const insert = async (table, columns, values) => {
@@ -69,6 +70,12 @@ test("forward-group port checks cover every entry and exclude the edited templat
         "id", "hostId", "name", "forwardType", "protocol", "tunnelId", "tunnelExitPort", "forwardGroupId", "forwardGroupRuleId",
         "forwardGroupMemberId", "isForwardGroupTemplate", "sourcePort", "targetIp", "targetPort", "userId", "isEnabled", "isRunning",
       ], [131, 1, "tunnel-child", "gost", "tcp", 201, 17700, 10, 130, 101, 0, 17400, "203.0.113.20", 443, 1, 1, 0]);
+      await insert("global_port_allocations", [
+        "allocationTag", "port", "status", "primaryOwnerType", "primaryOwnerTag", "version",
+      ], ["test-global-port:17502", 17502, "ACTIVE", "XRAY_INBOUND", "xray-test-owner", 1]);
+      await insert("xray_runtime_reports", [
+        "hostId", "capabilitySchemaVersion", "supportsPortProbe", "supportsUdpPortProbe", "supportsUdpListenerReadiness",
+      ], [1, 1, 1, 1, 1]);
 
       const caller = rulesRouter.createCaller({
         req: { headers: {} },
@@ -89,6 +96,114 @@ test("forward-group port checks cover every entry and exclude the edited templat
         await caller.checkPort({ forwardGroupId: 10, sourcePort: 17501, protocol: "tcp" }),
         { used: false },
       );
+      assert.deepEqual(
+        await caller.checkPort({ forwardGroupId: 10, sourcePort: 17502, protocol: "tcp" }),
+        { used: true, reason: "端口已被全局占用" },
+      );
+      assert.deepEqual(
+        await caller.checkPort({ hostId: 1, sourcePort: 17502, protocol: "tcp" }),
+        { used: true, reason: "端口已被全局占用" },
+      );
+      assert.deepEqual(
+        await caller.portProbeStart({ hostId: 1, sourcePort: 17502, protocol: "tcp" }),
+        { status: "USED", reasonCode: "GLOBAL_PORT_CONFLICT", reason: "端口已被全局占用" },
+      );
+      await runtime.executeRaw('UPDATE "hosts" SET "portRangeStart" = ?, "portRangeEnd" = ? WHERE "id" = ?', [17502, 17502, 1]);
+      await assert.rejects(
+        () => caller.randomPort({ forwardGroupId: 10, protocol: "tcp" }),
+        /入口端口区间内已无可用端口/,
+      );
+      await runtime.executeRaw('UPDATE "hosts" SET "portRangeStart" = ?, "portRangeEnd" = ? WHERE "id" = ?', [17000, 18000, 1]);
+
+      const occupiedProbe = await caller.portProbeStart({
+        hostId: 1,
+        sourcePort: 17503,
+        protocol: "tcp",
+      });
+      assert.equal(occupiedProbe.status, "RUNNING");
+      const [occupiedTask] = await operations.takeXrayPortProbeTasks(1, 1);
+      assert.deepEqual(occupiedTask.payload, { network: "tcp", listenAddress: "0.0.0.0", ports: [17503] });
+      await operations.completeXrayPortProbeTask(1, {
+        schemaVersion: 1,
+        taskId: occupiedTask.taskId,
+        type: "PORT_PROBE",
+        status: "SUCCESS",
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        result: {
+          ports: [{ port: 17503, available: false, errorCode: "PORT_IN_USE" }],
+          observedAt: new Date().toISOString(),
+        },
+        error: null,
+      });
+      assert.deepEqual(
+        await caller.portProbeResult({ portCheckId: occupiedProbe.portCheckId }),
+        { status: "USED", reasonCode: "PORT_IN_USE", reason: "端口已被入口服务器占用" },
+      );
+
+      const availableProbe = await caller.portProbeStart({
+        forwardGroupId: 10,
+        sourcePort: 17504,
+        protocol: "both",
+      });
+      assert.equal(availableProbe.status, "RUNNING", JSON.stringify(availableProbe));
+      const availableTasks = await operations.takeXrayPortProbeTasks(1, 2);
+      assert.deepEqual(availableTasks.map((task) => task.payload.network).sort(), ["tcp", "udp"]);
+      for (const task of availableTasks) await operations.completeXrayPortProbeTask(1, {
+          schemaVersion: 1,
+          taskId: task.taskId,
+          type: "PORT_PROBE",
+          status: "SUCCESS",
+          startedAt: new Date().toISOString(),
+          finishedAt: new Date().toISOString(),
+          result: {
+            ports: [{ port: 17504, available: true, errorCode: null }],
+            observedAt: new Date().toISOString(),
+          },
+          error: null,
+        });
+      const availableResult = await caller.portProbeResult({ portCheckId: availableProbe.portCheckId });
+      assert.equal(availableResult.status, "AVAILABLE");
+      const foreignCaller = rulesRouter.createCaller({
+        req: { headers: {} },
+        res: { clearCookie() {} },
+        user: { id: 2, username: "other-admin", role: "admin", accountEnabled: true },
+        authSession: null,
+        authFailureReason: null,
+      });
+      await assert.rejects(
+        () => foreignCaller.portProbeResult({ portCheckId: availableProbe.portCheckId }),
+        /端口检查凭证无效/,
+      );
+      const tamperedSuffix = availableProbe.portCheckId.endsWith("A") ? "B" : "A";
+      await assert.rejects(
+        () => caller.portProbeResult({ portCheckId: availableProbe.portCheckId.slice(0, -1) + tamperedSuffix }),
+        /端口检查凭证无效/,
+      );
+
+      const replacedProbe = await caller.portProbeStart({ forwardGroupId: 10, sourcePort: 17505, protocol: "tcp" });
+      assert.equal(replacedProbe.status, "RUNNING");
+      const replacementProbe = await caller.portProbeStart({
+        forwardGroupId: 10,
+        sourcePort: 17506,
+        protocol: "tcp",
+        replacePortCheckId: replacedProbe.portCheckId,
+      });
+      assert.equal(replacementProbe.status, "RUNNING");
+      const replacementTasks = await operations.takeXrayPortProbeTasks(1, 2);
+      assert.equal(replacementTasks.length, 1);
+      assert.deepEqual(replacementTasks[0].payload.ports, [17506]);
+      await operations.completeXrayPortProbeTask(1, {
+        schemaVersion: 1,
+        taskId: replacementTasks[0].taskId,
+        type: "PORT_PROBE",
+        status: "SUCCESS",
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        result: { ports: [{ port: 17506, available: true, errorCode: null }], observedAt: new Date().toISOString() },
+        error: null,
+      });
+      assert.equal((await caller.portProbeResult({ portCheckId: replacementProbe.portCheckId })).status, "AVAILABLE");
       assert.deepEqual(
         await caller.checkPort({ forwardGroupId: 10, sourcePort: 17500, excludeRuleId: 100, protocol: "tcp" }),
         { used: false },
@@ -155,7 +270,7 @@ test("forward-group port checks cover every entry and exclude the edited templat
   `;
   const result = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
     cwd: process.cwd(),
-    env: { ...process.env, DATABASE_TYPE: "sqlite", FORWARDX_TEST_DB: databasePath },
+    env: { ...process.env, DATABASE_TYPE: "sqlite", FORWARDX_TEST_DB: databasePath, JWT_SECRET: "rule-port-check-test-secret-1234567890" },
     encoding: "utf8",
     timeout: 60_000,
   });

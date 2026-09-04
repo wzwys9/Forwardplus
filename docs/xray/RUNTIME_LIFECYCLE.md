@@ -228,6 +228,8 @@ iptables、nftables、Realm、socat、GOST、Nginx 六种本地转发引用只�
 - port check 可以持久创建既有 Agent probe operation 和短期 host reservation，但不创建 global allocation、quick config、普通规则或 DNS。对最终需新建 listener 的 `FORWARD` host 集合并行检查 TCP/UDP，全部结果齐全才成功；受管 Xray 原端口在落地主机上的 `LANDING/DIRECT` route 不探测自身已占用 listener，改为核对合法账本 alias 与 Xray runtime READY。其他入口主机仍执行真实 bind 探测，但面板只可用内部 `inboundId + port` target-alias 授权从全局不可用集合排除目标自身 allocation，并在 operation 创建、Agent 任务派发和结果接受时分别以单条关联查询重验 ACTIVE owner、同主机公开 owning reference 与 inbound；本机数据库监听和短期 reservation 始终不能被该授权绕过。
 
 快速配置成功探测留下的 TCP/UDP reservation 最长 60 秒。用户返回更换 engine 或立即重检时，新请求可交回上一轮签名 probe result token；服务端验证完整 token 和其中全部 reservation 后一次性释放再创建新 probe。创建新 probe 已受理后旧 token 不可继续复用；关闭向导或 token 已过期时继续依赖现有 TTL 自动释放。
+
+普通转发规则的新建表单复用同一 `PORT_PROBE` operation，但由规则路由从直连主机或转发组实时派生完整入口集合；`both` 拆成同端口 TCP、UDP 两个 task。只有全部结果仍在有效期且与签名 check id 精确一致才短暂显示可用；聚合结果读取后释放 probe reservation，最终规则创建再取得正式全局 allocation。编辑已有规则只做策略、数据库和允许自身 owner 的全局账本检查，避免把正在运行的自身 listener 当成外部占用。
 - preview 只消费 confirmed domain/probe token 并纯计算 immutable topology、去重规则、A/AAAA 和 default route；不创建 Agent task 或任何业务记录。preview token 最长 5 分钟。
 
 ### 16.2 Apply saga
