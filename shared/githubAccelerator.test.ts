@@ -48,9 +48,9 @@ test("panel updates require both the main accelerator and panel switch", () => {
   });
 });
 
-test("builds an authenticated private-repository installer command with a persistent accelerator argument", () => {
+test("builds an anonymous public-repository installer command with pipefail and a persistent accelerator argument", () => {
   assert.equal(
     buildPanelInstallerCommand({ deployment: "docker", action: "upgrade", accelerator }),
-    "bash -o pipefail -c 'GH_TOKEN=\"${FORWARDPLUS_GITHUB_TOKEN:-${GH_TOKEN:-}}\" gh api -H \"Accept: application/vnd.github.raw+json\" \"repos/wzwys9/Forwardplus/contents/scripts/install-panel-docker.sh?ref=main\" | sudo --preserve-env=FORWARDPLUS_GITHUB_TOKEN,FORWARDX_TARGET_VERSION bash -s -- upgrade --github-accelerator '\\''https://mirror.example.com'\\'''",
+    "bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 '\\''https://mirror.example.com/https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh'\\'' | sudo --preserve-env=FORWARDPLUS_GITHUB_TOKEN,FORWARDX_TARGET_VERSION bash -s -- upgrade --github-accelerator '\\''https://mirror.example.com'\\'''",
   );
 });

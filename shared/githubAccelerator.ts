@@ -86,13 +86,14 @@ export function buildPanelInstallerCommand(options: {
 }) {
   const accelerator = effectiveGithubAccelerator(options.accelerator);
   const repositoryPath = PANEL_INSTALLER_REPOSITORY_PATHS[options.deployment];
-  const apiPath = `repos/wzwys9/Forwardplus/contents/${repositoryPath}?ref=main`;
+  const rawUrl = `https://raw.githubusercontent.com/wzwys9/Forwardplus/main/${repositoryPath}`;
+  const scriptUrl = applyGithubAccelerator(rawUrl, accelerator);
   const runner = options.sudo === false
     ? "bash"
     : "sudo --preserve-env=FORWARDPLUS_GITHUB_TOKEN,FORWARDX_TARGET_VERSION bash";
   const acceleratorArg = accelerator.enabled
     ? ` --github-accelerator ${shellSingleQuote(accelerator.url)}`
     : "";
-  const pipeline = `GH_TOKEN="\${FORWARDPLUS_GITHUB_TOKEN:-\${GH_TOKEN:-}}" gh api -H "Accept: application/vnd.github.raw+json" "${apiPath}" | ${runner} -s -- ${options.action}${acceleratorArg}`;
+  const pipeline = `curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 ${shellSingleQuote(scriptUrl)} | ${runner} -s -- ${options.action}${acceleratorArg}`;
   return `bash -o pipefail -c ${shellSingleQuote(pipeline)}`;
 }
