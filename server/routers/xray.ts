@@ -148,6 +148,10 @@ import {
   XrayQuickConfigRetryError,
 } from "../xrayQuickConfigRetryService";
 import {
+  createXrayQuickConfigSync,
+  XrayQuickConfigSyncError,
+} from "../xrayQuickConfigSyncService";
+import {
   getXrayQuickConfigDetail,
   getXrayQuickConfigOperation,
   listXrayQuickConfigs,
@@ -727,6 +731,16 @@ function dnsProviderRecordTrpcError(error: unknown): never {
 }
 
 function quickConfigTrpcError(error: unknown): never {
+  if (error instanceof XrayQuickConfigSyncError) {
+    const code = error.code === "QUICK_CONFIG_NOT_FOUND" ? "NOT_FOUND"
+      : error.code === "QUICK_CONFIG_REVISION_CONFLICT" || error.code === "QUICK_CONFIG_OPERATION_CONFLICT"
+        || error.code === "QUICK_CONFIG_SYNC_CONFLICT" || error.code === "GLOBAL_PORT_CONFLICT"
+        || error.code === "DNS_RECORD_DRIFT"
+        ? "CONFLICT"
+        : error.code === "SENSITIVE_DATA_UNAVAILABLE" ? "INTERNAL_SERVER_ERROR"
+          : "PRECONDITION_FAILED";
+    throw new TRPCError({ code, message: error.code, cause: error });
+  }
   if (error instanceof XrayQuickConfigEditError) {
     const code = error.code === "QUICK_CONFIG_NOT_FOUND" ? "NOT_FOUND"
       : error.code === "QUICK_CONFIG_REVISION_CONFLICT" || error.code === "QUICK_CONFIG_OPERATION_CONFLICT"
@@ -1095,6 +1109,16 @@ export const xrayRouter = router({
         setSensitiveResponseHeaders(ctx.res);
         try {
           return await retryQuickConfigOperation({ ...input, userId: ctx.user.id });
+        } catch (error) {
+          quickConfigTrpcError(error);
+        }
+      }),
+    sync: adminProcedure
+      .input(z.object({ id: positiveId, expectedRevision: positiveId }).strict())
+      .mutation(async ({ input, ctx }) => {
+        setSensitiveResponseHeaders(ctx.res);
+        try {
+          return await createXrayQuickConfigSync({ ...input, userId: ctx.user.id });
         } catch (error) {
           quickConfigTrpcError(error);
         }

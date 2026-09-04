@@ -123,6 +123,7 @@
 | `XRAY-ADR-116` | 已确认 | Xray 节点创建向导把端口从基础配置中独立出来，顺序固定为“基础配置 → 协议 → 传输 → 端口 → 安全 → 账户 → 确认”；端口探测只在确定 profile 后按其 listener network 执行，切换网络只使旧结果失效而不自动跳页 | 旧流程在选协议前默认做 TCP 探测，选择 Hysteria 2/mKCP/WireGuard 后又将用户跳回端口做 UDP 探测。先确定影响 listener 的 profile 再检测，可避免无效探测、意外回跳和错误网络预留。 |
 | `XRAY-ADR-117` | 已确认 | 创建 Xray 节点的协议选择暂时只展示 VLESS、Trojan、Shadowsocks、HTTP 和 Mixed；VMess、Hysteria 2、WireGuard、Tunnel 只隐藏前端创建入口，后端能力和已有节点管理保持不变 | 用户希望先收窄面板中的产品选择，但明确要求保留后端代码。前端 allowlist 能在不迁移数据、不改变 `AVAILABLE` 状态和不破坏既有节点的情况下实现可逆隐藏。 |
 | `XRAY-ADR-118` | 已确认 | DNS 服务商页增加实时 DNSPod 记录管理，首版只开放 A/AAAA/CNAME；任一快速配置、未清理托管记录或活动 operation 引用的整个 zone 仅允许读取，所有写在服务端再次拦截 | 通用管理不应绕过快速配置的 recordId 所有权和 saga 补偿语义。实时读取避免第二份 DNS 真相；revision 比对和不重试非幂等写防止覆盖第三方变更或重复写入。 |
+| `XRAY-ADR-119` | 已确认 | 快速配置详情增加显式持久同步 operation：active topology 是期望真相，先收敛正式规则再核对 DNS；只恢复同名 locally-owned recordId 或补建确实缺失的托管记录，不删除额外记录，部分失败不破坏性补偿现有数据面 | 管理员需要修复 Agent/DNS 漂移，但普通 refresh 只有读取语义。显式同步提供可审计修复，同时以 recordId、相对域名、tuple 和 revision/fence 限制写集合，避免把“恢复配置”扩大为覆盖第三方 DNS。 |
 
 ## 更新规则
 

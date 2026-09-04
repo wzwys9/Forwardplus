@@ -257,6 +257,7 @@ Tunnel 目标是管理员授予受管 Xray 的持久出站连接能力。输入�
 - **并发与租约：** 端口唯一性由数据库唯一键、乐观 version 和持久引用共同保证，不依赖单进程 Map。reservation token 只存不可逆摘要并有短 TTL；过期、进程崩溃或补偿中断后进入 `PENDING_SCAN`。`FREE` 到 `RESERVED`、引用增删和状态转换都必须在同一数据库事务内重验，禁止 ABA 重用。12 小时扫描用数据库 CAS 租约防重叠，并在释放事务中重验全部引用、allocation version、受管 host cohort 和每台 host 的双网络结果；扫描期间新增 host 或引用会使本轮结论失效。
 - **编排补偿：** apply 必须先确认所有 Realm 规则，再发布 DNS；remove 必须先撤销/恢复 DNS，再停止规则。每个外部动作使用稳定幂等键和持久步骤，数据库事务不得宣称包含 Agent 或 DNSPod。补偿只撤销本 operation 明确拥有且未漂移的对象；无法证明安全时保留规则和端口引用、返回稳定 `PARTIAL_FAILURE` 与具体脱敏错误码，不能为了“清理干净”覆盖第三方 DNS 或提前复用端口。
 - **普通规则联动：** 快速配置生成的 Realm listener 是正式 `forward_rules`，继续受现有管理员鉴权、Agent allowlist、命令生成和审计约束。直接规则 mutation 必须拒绝会造成 DNS 漂移的编辑、停用或删除；不得通过去掉 UI 按钮、伪造普通规则或隐藏第二套配置绕过编排。
+- **显式同步：** 只有管理员主动提交且 quick-config revision/current-operation CAS 通过时，维护 operation 才可重新断言 active topology。规则只修改 `xrayQuickConfigId` 明确归属本配置的行；DNS 只创建缺失托管记录，或把仍位于同一相对名称的本地 provider recordId 恢复为已持久化 tuple。创建前必须持久化已存在的同值 recordId 集合；重启接管只能认领集合外的唯一结果。移动到其他名称、未归属的同值记录、额外第三方记录和跨配置 recordId 一律不接管、不覆盖、不删除。同步失败不得以补偿名义删除原有可用数据面。
 - **派生连接材料：** 受管 Xray 分享、外部 VLESS/SS 链接和 SOCKS endpoint 只在管理员按需响应中重建，整体设置 `private, no-store`；只替换 authority，保留原 SNI/public key/flow/method/凭据。快速配置表、DNS 记录、operation、规则备注和浏览器持久存储不得保存完整材料。
 - **备份与轮换：** 三类 provider/quick-config/port 表全部进入结构化备份；provider secret envelope 进入加密备份预检和主密钥轮换。原始数据库备份仍需独立主密钥，结构化普通导出不含 secret。恢复后在任何 DNS 写入前重验 envelope、账号绑定、operation phase、记录所有权和端口引用；无法解密时返回 `SENSITIVE_DATA_UNAVAILABLE`，不得生成新凭据或继续补偿。
 

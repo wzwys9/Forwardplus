@@ -387,6 +387,7 @@ function QuickConfigDetailDialog(props: { id: number; onClose: () => void; onEdi
   const removePreviewMutation = trpc.xray.quickConfigs.removePreview.useMutation({ gcTime: 0 });
   const removeApplyMutation = trpc.xray.quickConfigs.removeApply.useMutation({ gcTime: 0 });
   const retryMutation = trpc.xray.quickConfigs.retry.useMutation({ gcTime: 0 });
+  const syncMutation = trpc.xray.quickConfigs.sync.useMutation({ gcTime: 0 });
   const detailQuery = trpc.xray.quickConfigs.detail.useQuery({ id: props.id }, {
     retry: false,
     refetchInterval: (query) => activeQuickConfigStates.has(String(query.state.data?.state)) ? 1_500 : false,
@@ -505,6 +506,7 @@ function QuickConfigDetailDialog(props: { id: number; onClose: () => void; onEdi
   const maySwitchEngine = !!detail && !!currentEngine && detail.state === "ACTIVE" && !detail.currentOperationId;
   const mayEdit = !!detail && !!currentEngine && !!detail.activeTopology && detail.state === "ACTIVE"
     && !detail.currentOperationId && !!props.onEdit;
+  const maySync = !!detail && !!detail.activeTopology && detail.state === "ACTIVE" && !detail.currentOperationId;
   const mayRetryOperation = !!detail && !!operation && !detail.currentOperationId
     && (detail.state === "FAILED" && operation.status === "FAILED"
       && (operation.type === "APPLY" || operation.type === "REMOVE" || operation.type === "RETRY")
@@ -633,6 +635,23 @@ function QuickConfigDetailDialog(props: { id: number; onClose: () => void; onEdi
       retryMutation.reset();
     }
   };
+  const syncConfiguration = async () => {
+    if (!detail || !maySync) return;
+    setLifecycleError(null);
+    try {
+      const result = await syncMutation.mutateAsync({ id: detail.id, expectedRevision: detail.revision });
+      setSubmittedOperationId(result.operationId);
+      toast.success("同步已提交，正在核对转发规则和 DNS");
+      await Promise.all([
+        utils.xray.quickConfigs.detail.invalidate({ id: props.id }),
+        utils.xray.quickConfigs.list.invalidate(),
+      ]);
+    } catch (error) {
+      setLifecycleError(safeCode(error));
+    } finally {
+      syncMutation.reset();
+    }
+  };
 
   return (
     <Dialog open onOpenChange={(open) => { if (!open) close(); }}>
@@ -648,7 +667,7 @@ function QuickConfigDetailDialog(props: { id: number; onClose: () => void; onEdi
                 <section className="rounded-lg border p-4">
                   <div className="flex flex-wrap items-center gap-2"><h2 className="break-all font-semibold">{detail.fqdn}:{detail.publicPort}</h2><Badge variant={stateBadgeVariant(detail.state)}>{quickConfigStateLabels[detail.state] ?? detail.state}</Badge><Badge variant="outline">{engineLabel(detail.engine)}</Badge></div>
                   <p className="mt-2 text-sm text-muted-foreground">{detail.targetName} · {detail.target.protocol} · 原始落地 {formatXrayEndpoint(detail.target.endpoint.address, detail.target.endpoint.port)}</p>
-                  <div className="mt-4 flex flex-wrap gap-2"><Button type="button" variant="outline" size="sm" disabled={detailQuery.isFetching || operationQuery.isFetching} onClick={() => { void detailQuery.refetch(); if (operationId > 0) void operationQuery.refetch(); }}><RefreshCw className={`mr-2 h-4 w-4 ${detailQuery.isFetching || operationQuery.isFetching ? "animate-spin" : ""}`} />刷新状态</Button>{detail.state === "ACTIVE" && detail.target.shareCapability !== "NONE" && <Button type="button" size="sm" disabled={shareRequested} onClick={() => { if (detail.targetType === "XRAY_INBOUND") { clearShare(); setShareError(null); setShareAccountPickerOpen(true); } else { requestExternalShare(); } }}><Copy className="mr-2 h-4 w-4" />获取连接信息</Button>}{mayEdit && !engineSwitchOpen && <Button type="button" size="sm" variant="outline" onClick={() => props.onEdit?.(detail)}><Pencil className="mr-2 h-4 w-4" />编辑配置</Button>}{maySwitchEngine && !engineSwitchOpen && <Button type="button" size="sm" variant="outline" onClick={beginEngineSwitch}><ArrowRightLeft className="mr-2 h-4 w-4" />切换引擎</Button>}{mayRetryOperation && <Button type="button" size="sm" variant="outline" disabled={retryMutation.isPending} onClick={() => { void retryOperation(); }}>{retryMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RotateCcw className="mr-2 h-4 w-4" />}重试操作</Button>}{mayRecoverDnsCompensation && <Button type="button" size="sm" variant="outline" disabled={retryMutation.isPending} onClick={() => { void retryOperation("DNS_COMPENSATION"); }}>{retryMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RotateCcw className="mr-2 h-4 w-4" />}恢复 DNS 补偿</Button>}{mayRecoverOldEngine && <Button type="button" size="sm" variant="outline" disabled={retryMutation.isPending} onClick={() => { void retryOperation("ENGINE_ROLLBACK"); }}>{retryMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RotateCcw className="mr-2 h-4 w-4" />}恢复旧引擎</Button>}{mayRemove && !engineSwitchOpen && <Button type="button" size="sm" variant="destructive" disabled={removePreviewMutation.isPending || removeApplyMutation.isPending} onClick={() => { void previewRemoval(); }}>{removePreviewMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Trash2 className="mr-2 h-4 w-4" />}删除快速配置</Button>}</div>
+                  <div className="mt-4 flex flex-wrap gap-2"><Button type="button" variant="outline" size="sm" disabled={detailQuery.isFetching || operationQuery.isFetching} onClick={() => { void detailQuery.refetch(); if (operationId > 0) void operationQuery.refetch(); }}><RefreshCw className={`mr-2 h-4 w-4 ${detailQuery.isFetching || operationQuery.isFetching ? "animate-spin" : ""}`} />刷新状态</Button>{detail.state === "ACTIVE" && detail.target.shareCapability !== "NONE" && <Button type="button" size="sm" disabled={shareRequested} onClick={() => { if (detail.targetType === "XRAY_INBOUND") { clearShare(); setShareError(null); setShareAccountPickerOpen(true); } else { requestExternalShare(); } }}><Copy className="mr-2 h-4 w-4" />获取连接信息</Button>}{mayEdit && !engineSwitchOpen && <Button type="button" size="sm" variant="outline" onClick={() => props.onEdit?.(detail)}><Pencil className="mr-2 h-4 w-4" />编辑配置</Button>}{maySwitchEngine && !engineSwitchOpen && <Button type="button" size="sm" variant="outline" onClick={beginEngineSwitch}><ArrowRightLeft className="mr-2 h-4 w-4" />切换引擎</Button>}{mayRetryOperation && <Button type="button" size="sm" variant="outline" disabled={retryMutation.isPending} onClick={() => { void retryOperation(); }}>{retryMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RotateCcw className="mr-2 h-4 w-4" />}重试操作</Button>}{mayRecoverDnsCompensation && <Button type="button" size="sm" variant="outline" disabled={retryMutation.isPending} onClick={() => { void retryOperation("DNS_COMPENSATION"); }}>{retryMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RotateCcw className="mr-2 h-4 w-4" />}恢复 DNS 补偿</Button>}{mayRecoverOldEngine && <Button type="button" size="sm" variant="outline" disabled={retryMutation.isPending} onClick={() => { void retryOperation("ENGINE_ROLLBACK"); }}>{retryMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RotateCcw className="mr-2 h-4 w-4" />}恢复旧引擎</Button>}{maySync && !engineSwitchOpen && <Button type="button" size="sm" variant="outline" disabled={syncMutation.isPending} onClick={() => { void syncConfiguration(); }}>{syncMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}同步配置</Button>}{mayRemove && !engineSwitchOpen && <Button type="button" size="sm" variant="destructive" disabled={removePreviewMutation.isPending || removeApplyMutation.isPending || syncMutation.isPending} onClick={() => { void previewRemoval(); }}>{removePreviewMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Trash2 className="mr-2 h-4 w-4" />}删除快速配置</Button>}</div>
                   {detail.state === "ACTIVE" && detail.targetType === "XRAY_INBOUND" && detail.target.shareCapability !== "NONE" && <p className="mt-3 text-xs text-muted-foreground">受管节点必须明确选择一个已启用账户后才会请求分享材料；页面不会自动选择或预加载敏感连接信息。</p>}
                 </section>
                 {dnsCompensationBlocked && <Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>DNS 补偿尚未完成</AlertTitle><AlertDescription>{topologyEditRecoveryPending ? "编辑前的配置仍保持服务。请先点击“重试操作”继续恢复 DNS 和清理未生效规则。" : "创建前的 DNS 记录仍有未恢复项。为避免遗失原记录，快速配置删除已锁定；请先点击“恢复 DNS 补偿”。"}</AlertDescription></Alert>}

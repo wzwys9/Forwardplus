@@ -880,6 +880,11 @@ async function finishApplyRuleCompensation(
 }
 
 async function processOperation(operation: Row) {
+  const configSync = await import("./xrayQuickConfigSyncService");
+  if (configSync.isXrayQuickConfigSyncOperation(operation)) {
+    await configSync.processXrayQuickConfigSyncOperation(operation);
+    return;
+  }
   const engineSwitch = await import("./xrayQuickConfigEngineSwitchService");
   if (await engineSwitch.isXrayQuickConfigEngineSwitchOperation(operation)) {
     await engineSwitch.processXrayQuickConfigEngineSwitchOperation(operation);

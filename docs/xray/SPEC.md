@@ -1,7 +1,7 @@
 # 规格：ForwardX 受管 Xray
 
 状态：已批准  
-版本：0.25
+版本：0.26
 日期：2026-09-04
 
 实现状态：第一版 `XRAY-TASK-001..037`、多协议基础 `XRAY-TASK-038..042`、Xray-native profile `XRAY-TASK-043..052`、MTProto 独立服务首片 `XRAY-TASK-053`、AmneziaWG userspace 独立服务 `XRAY-TASK-054`、出口节点/中转联动 `XRAY-TASK-055` 与六种本地转发方式出口引用 `XRAY-TASK-056` 已完成；DNSPod 快速配置 `XRAY-TASK-057` 与六引擎创建/切换 `XRAY-TASK-058` 的可体验主流程已实现，集中运行验证待补；TUN 保持 `NOT_IMPLEMENTED`。Reality 默认候选为 `v2`，固定 Xray 默认版本仍为 `v26.3.27`。
@@ -285,6 +285,7 @@
 - `XRAY-QC-025` 受管 Xray 使用目标原端口时，其他入口主机的实际探测只能通过服务端内部派生的精确 `inboundId + port` target-alias 授权忽略该 inbound 自身的全局占用；授权在探测创建、Agent 任务派发和结果接受时都必须用单次一致性查询重新验证 ACTIVE allocation、稳定 runtimeTag、同主机公开 owning reference，不能由浏览器或 Agent 构造。快速配置重新检测或切换引擎时，可以提交上一轮服务端签名的 probe result token；服务端必须拒绝非规范编码，并先完整验证管理员、域名、目标和其中全部 host/network reservation，再一次性释放，任何错配不得部分释放。
 - `XRAY-QC-026` 普通转发规则的新建表单在把源端口标记为“可用”前，必须同时通过套餐/主机范围、本机数据库监听、不区分 TCP/UDP 的全局端口账本，以及服务端派生的全部实际入口主机 Agent bind 探测。`both` 必须分别取得 TCP、UDP 结果；任一入口占用、离线、能力不足、失败、超时或过期都不得提交。编辑已有规则允许全局账本识别同一稳定 `FORWARD_RULE` owner，但不得对自身正在运行的 listener 做空闲 bind 探测。最终创建仍须事务化取得全局 allocation 并处理探测后的竞态。
 - `XRAY-QC-027` 系统设置的 DNS 服务商页在账号卡片下增加管理员专用的“DNS 管理”。域名下拉来自当前已验证 DNSPod 账号的 zone 目录，记录列表实时从 DNSPod 读取，不在面板建立第二份通用 DNS 记录副本。第一版只允许创建、修改和删除 `A | AAAA | CNAME`，线路必须从当前 zone 的动态目录选择。选中 zone 被任一未删除快速配置、未清理托管 DNS 记录或活动编排引用时，仍可读取和刷新，但整个 zone 必须只读；服务端在每次写入前重新检查并返回稳定冲突错误，不得只依赖前端禁用。
+- `XRAY-QC-028` ACTIVE 快速配置详情提供显式“同步配置”。同步以当前 active topology、对应 rule binding 和托管 DNS 行为唯一期望状态，通过持久 operation 先收敛正式 `forward_rules` 并确认 Agent 运行，再实时读取 DNSPod：缺失的托管 A/AAAA 记录补建，同一 locally-owned provider recordId 在同一相对域名下发生 type/line/value/TTL 漂移时恢复为期望 tuple，完全一致时只验证不写。额外的非托管记录不得删除；provider recordId 已移动到其他相对域名、同值记录无法证明属于本 operation，或出现重复/跨配置归属时必须 fail closed。同步部分失败保留已完成修复和当前 active topology，不回滚、删除既有可用规则或 DNS，并允许管理员再次同步。
 
 - `XRAY-AC-015` 一个加密保存并验证通过的 DNSPod 账户可列出多个可用 zone 和动态线路；无账号、错误凭据和失效验证会禁用创建且不泄露 SecretId/SecretKey。
 - `XRAY-AC-016` `dfd` 与 `hk.dfd` 能在所选 zone 下完成检查/确认；`@`、通配符和非法输入被拒绝。同名 A/AAAA/CNAME 必须显式确认替换，TXT/MX/CAA 保留，检查后竞态会在提交前被发现。
@@ -299,6 +300,7 @@
 - `XRAY-AC-024` 历史规则收敛、创建、编辑新增 host、失败重试和 engine 切换后，每条活动快速配置规则都归属正确端口资源；重复启动/重试不重复创建系统资源，待删除规则不再计数，任何锁定绕过都由服务端拒绝。
 - `XRAY-AC-025` 已运行的受管 Xray 原端口可在其他入口主机完成 TCP/UDP 快速配置探测并生成 `TARGET_ALIAS`；切换引擎或立即重检不会撞到同一向导上一轮预留，而其他 Xray、规则、隧道、受管服务、跨管理员 token 和探测期间 owner 变化仍被拒绝。
 - `XRAY-AC-026` 普通端口转发的新建表单对直连主机和转发组的完整入口集合执行真实单端口探测；跨主机全局占用、任一实际 bind 占用和删减/篡改检查身份都不会显示绿色，随机候选也不能绕过同一门禁。
+- `XRAY-AC-027` ACTIVE 快速配置点击“同步配置”后，正确规则和 DNS 不产生 provider 写；缺失规则会作为正式规则恢复并等待 Agent running，缺失托管记录会补建，同一已归属 recordId 的同名 tuple 漂移会恢复。同步不接管或删除第三方同名记录，失败后 active topology 与已运行数据面仍保留，operation 展示具体失败步骤并可再次同步。
 
 | kind | runtime/version | listener | 分享 | 开放门槛 |
 |---|---|---|---|---|

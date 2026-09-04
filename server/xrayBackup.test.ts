@@ -396,6 +396,20 @@ test("DNS provider backup preflight rejects incomplete secrets and dangling cata
     assert.equal(backup.migrationSnapshotHasXraySecrets(snapshot), true);
     backup.assertMigrationSnapshotXraySecretsAvailable(snapshot, { keyring });
 
+    const activeConfigSync = structuredClone(snapshot);
+    activeConfigSync.tables.xray_quick_config_operations[0].type = "EDIT";
+    activeConfigSync.tables.xray_quick_config_operations[0].requestSummaryJson = JSON.stringify({
+      kind: "CONFIG_SYNC", schemaVersion: 1,
+    });
+    activeConfigSync.tables.xray_quick_config_operation_steps[0].kind = "DNS_CREATE";
+    activeConfigSync.tables.xray_quick_config_operation_steps[0].subjectType = "DNS_RECORD";
+    activeConfigSync.tables.xray_quick_config_operation_steps[0].subjectId = "44";
+    activeConfigSync.tables.xray_quick_config_operation_steps[0].status = "RUNNING";
+    activeConfigSync.tables.xray_quick_config_operation_steps[0].requestSummaryJson = JSON.stringify({
+      kind: "DNS_SYNC_INTENT", schemaVersion: 1, preexistingExactProviderRecordIds: ["101", "202"],
+    });
+    backup.assertMigrationSnapshotXraySecretsAvailable(activeConfigSync, { keyring });
+
     const tunnelHopOwner = structuredClone(snapshot);
     tunnelHopOwner.tables.tunnels = [{
       id: 70, exitHostId: 2, mode: "forwardx", forwardxVersion: "v1",
@@ -574,6 +588,12 @@ test("DNS provider backup preflight rejects incomplete secrets and dangling cata
     const leakedPrivateKey = structuredClone(snapshot);
     leakedPrivateKey.tables.xray_quick_config_operation_steps[0].requestSummaryJson = JSON.stringify({ privateKey: "opaque" });
     rejects(leakedPrivateKey);
+
+    const invalidSyncEvidence = structuredClone(activeConfigSync);
+    invalidSyncEvidence.tables.xray_quick_config_operation_steps[0].requestSummaryJson = JSON.stringify({
+      kind: "DNS_SYNC_INTENT", schemaVersion: 1, preexistingExactProviderRecordIds: ["202", "101"],
+    });
+    rejects(invalidSyncEvidence);
 
     const danglingManagedRule = structuredClone(snapshot);
     danglingManagedRule.tables.forward_rules[0].xrayQuickConfigId = 999;

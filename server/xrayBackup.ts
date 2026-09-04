@@ -177,15 +177,28 @@ function snapshotBoundedString(value: unknown, maximum: number, pattern?: RegExp
   return text;
 }
 
-function assertSafeSummaryJson(value: unknown) {
+function assertSafeSummaryJson(value: unknown, context: "OPERATION" | "STEP") {
   const raw = String(value ?? "");
   if (!raw || Buffer.byteLength(raw, "utf8") > 16_384) throw unavailable();
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { throw unavailable(); }
-  // TASK057D has no summary-producing worker yet. Until the saga contract adds a
-  // per-kind versioned allowlist, the only portable and secret-free summary is {}.
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
-    || Object.keys(parsed as Record<string, unknown>).length !== 0) throw unavailable();
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw unavailable();
+  const summary = parsed as Record<string, unknown>;
+  if (Object.keys(summary).length === 0) return;
+  if (context === "OPERATION" && summary.kind === "CONFIG_SYNC" && summary.schemaVersion === 1
+    && Object.keys(summary).every((key) => ["kind", "schemaVersion"].includes(key))) return;
+  if (context === "STEP" && summary.kind === "DNS_SYNC_INTENT" && summary.schemaVersion === 1
+    && Object.keys(summary).every((key) => ["kind", "schemaVersion", "preexistingExactProviderRecordIds"].includes(key))
+    && Array.isArray(summary.preexistingExactProviderRecordIds)
+    && summary.preexistingExactProviderRecordIds.length <= 64
+    && new Set(summary.preexistingExactProviderRecordIds).size === summary.preexistingExactProviderRecordIds.length
+    && summary.preexistingExactProviderRecordIds.every((id) => (
+      typeof id === "string" && /^[1-9]\d*$/.test(id) && Number.isSafeInteger(Number(id))
+    ))
+    && summary.preexistingExactProviderRecordIds.every((id, index, ids) => (
+      index === 0 || Number(ids[index - 1]) < Number(id)
+    ))) return;
+  throw unavailable();
 }
 
 function assertSafeDiagnosticText(value: unknown, maximum: number) {
@@ -793,7 +806,7 @@ export function assertMigrationSnapshotXraySecretsAvailable(
       snapshotPositiveSafeInteger(row.revision);
       snapshotPositiveSafeInteger(row.expectedRevision);
       snapshotPositiveSafeInteger(row.executionFence);
-      assertSafeSummaryJson(row.requestSummaryJson);
+      assertSafeSummaryJson(row.requestSummaryJson, "OPERATION");
       assertSafeDiagnosticText(row.errorCode, 64);
       assertSafeDiagnosticText(row.errorMessage, 512);
       operationIds.set(id, row); operationTags.add(operationTag);
@@ -1003,8 +1016,8 @@ export function assertMigrationSnapshotXraySecretsAvailable(
           ))) throw unavailable();
         }
       }
-      assertSafeSummaryJson(row.requestSummaryJson);
-      if (row.resultSummaryJson !== null && row.resultSummaryJson !== undefined) assertSafeSummaryJson(row.resultSummaryJson);
+      assertSafeSummaryJson(row.requestSummaryJson, "STEP");
+      if (row.resultSummaryJson !== null && row.resultSummaryJson !== undefined) assertSafeSummaryJson(row.resultSummaryJson, "STEP");
       assertSafeDiagnosticText(row.errorCode, 64);
       operationStepIds.add(id); operationStepKeys.add(operationStepKey); idempotencyKeys.add(idempotencyKey);
     }

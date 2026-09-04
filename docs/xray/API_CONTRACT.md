@@ -1,6 +1,6 @@
 # Xray 面板 API 契约
 
-状态：第一版契约已实施；多协议 additive 契约已批准并按任务增量落地；DNSPod 快速配置与通用记录管理契约已批准。与 `SPEC.md` 0.25 配套。ForwardX 使用 tRPC，本文件描述 procedure、输入输出和错误语义；实现以共享 Zod schema 和类型测试固化。
+状态：第一版契约已实施；多协议 additive 契约已批准并按任务增量落地；DNSPod 快速配置、同步与通用记录管理契约已批准。与 `SPEC.md` 0.26 配套。ForwardX 使用 tRPC，本文件描述 procedure、输入输出和错误语义；实现以共享 Zod schema 和类型测试固化。
 
 主机列表、状态摘要和 Agent 升级接口将真实 `agentVersion` 与可空 `agentDistribution`、`agentBuildId` 分开返回。升级候选定义为“来源不是 `forwardplus` 或版本低于面板目标”；单台/批量升级请求写入 `targetDistribution=forwardplus`，只有后续报告同时满足来源和版本才返回完成。来源未知的旧 Agent 不能因为版本较高而绕过 Forwardplus 专有功能门控。
 
@@ -847,6 +847,8 @@ CreateRecord 成功或网络结果不明确后的验证允许最多 30 秒 provi
 `xray.quickConfigs.removePreview({ id, expectedRevision })` 返回 `{ quickConfigId, revision, fqdn, dnsRecords:[{ recordRef, recordType, providerLineId, value, action:"DELETE" }], rules:[{ ruleId, hostId, name, action:"REMOVE"|"KEEP_SHARED" }], allocation:{ port, nextState:"RELEASING"|"ACTIVE" }, warnings:[{ code, message }], removeToken, expiresAt }`；只列将 CAS 删除的当前 managed A/AAAA，不承诺恢复创建前或历史 edit 的第三方记录。`xray.quickConfigs.removeApply({ removeToken, confirmFqdn })` 创建持久 remove operation 并返回 `{ quickConfigId, operationId, state:"DELETING" }`。Agent 离线或能力不足时拒绝，不能只删数据库行。
 
 `xray.quickConfigs.retry({ operationId, expectedOperationRevision })` 只接受失败/部分失败的终态 operation；原行不可变，服务端以 quick-config revision 与 active-slot CAS 新建 `type=RETRY/retryOfOperationId=原 id` 的 operation，只复制仍需执行的安全 step identity，不重放已确认成功步骤，返回 `{ operationId:newId, operationRevision:1 }`。活动 operation 存在时返回冲突。`xray.quickConfigs.operation({ operationId })` 返回：
+
+`xray.quickConfigs.sync({ id, expectedRevision })` 只接受 `ACTIVE`、存在唯一 active topology 且没有 current operation 的快速配置，返回 `{ quickConfigId, operationId, state:"UPDATING" }`。它创建 `type=EDIT`、`requestSummaryJson={kind:"CONFIG_SYNC",schemaVersion:1}` 的持久 operation；浏览器不能提交规则、DNS tuple、host、recordId 或 provider payload。服务端从 active topology 重建期望规则，缺失时创建、字段漂移时恢复并等待 Agent running；随后实时读取 DNSPod，对 locally-owned 同名 recordId 做 keep/repair，对确实缺失的托管记录 create。每次 DNS 写前会持久化当时已存在的同值 recordId，进程接管只允许认领此集合之外的唯一记录。provider recordId 已移动到其他相对名称、未归属的同值记录、重复记录或跨配置占用均返回稳定漂移错误，不接管、不删除。终态无论成功或部分失败都恢复 quick config 的 `ACTIVE` 状态并清除 current operation；已完成的增量修复不做破坏性补偿，管理员可用新 revision 再次同步。
 
 ```ts
 type QuickConfigOperationDto = {
