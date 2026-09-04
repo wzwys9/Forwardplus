@@ -200,7 +200,7 @@ resolve_xray_feature_flag() {
     normalize_xray_feature_flag "$existing"
     return
   fi
-  if [ "$ACTION" = "migrate-forwardx" ]; then
+  if [ "$ACTION" = "migrate-forwardx" ] || [ "$MIGRATE_FORWARDX_AGENTS" = "true" ]; then
     printf "1\n"
   else
     printf "0\n"
@@ -773,7 +773,6 @@ write_env() {
   existing_xray_master_key_path="$(get_env_value XRAY_MASTER_KEY_PATH || true)"
   xray_master_key_path="${XRAY_MASTER_KEY_PATH:-$existing_xray_master_key_path}"
   xray_master_key_path="${xray_master_key_path:-/data/xray-master.key}"
-  xray_enabled="$(resolve_xray_feature_flag)"
   existing_github_token="$(get_env_value FORWARDPLUS_GITHUB_TOKEN || true)"
   if [ -z "$GITHUB_TOKEN" ] && [ -n "$existing_github_token" ]; then
     GITHUB_TOKEN="$existing_github_token"
@@ -782,6 +781,7 @@ write_env() {
   if [ "$MIGRATE_FORWARDX_AGENTS" != "true" ] && [[ "$existing_migrate_agents" =~ ^(1|true|yes|on)$ ]]; then
     MIGRATE_FORWARDX_AGENTS="true"
   fi
+  xray_enabled="$(resolve_xray_feature_flag)"
   umask 077
   cat > "$APP_DIR/.env" <<EOF
 PORT=$PORT

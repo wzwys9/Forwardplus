@@ -116,6 +116,7 @@
 | `XRAY-ADR-109` | 已确认 | Forwardplus Agent 使用独立 `agentDistribution=forwardplus` 与 `agentBuildId` 标识发行身份，`agentVersion` 永远保留真实版本；来源不匹配或版本落后任一成立即迁移，升级完成要求两者同时满足 | 原版 ForwardX 版本号可能高于 Forwardplus，但不包含本项目的 Xray/快速配置合同。动态抬高版本只能短暂绕过比较且会污染展示、能力门控和后续升级，因此必须把发行身份从语义版本中拆开。 |
 | `XRAY-ADR-110` | 已确认 | 新安装和普通升级继续默认关闭 Xray UI；显式 `migrate-forwardx` 在旧环境缺少 `FORWARDX_XRAY_ENABLED` 时自动启用，已有设置与进程环境覆盖优先且按公开开关语义规范为 `0/1` | 用户已明确选择从原版切换到 Forwardplus，迁移成功后仍隐藏核心新增入口会形成不可发现的半迁移状态；同时保留显式关闭和 fail-closed 默认，避免普通升级越过管理员选择。 |
 | `XRAY-ADR-111` | 已确认 | `xray.portProbes.create` 以可选 `replaceReservationIds` 受控替换同一创建向导的最多一项 TCP 与一项 UDP 短期预留；先完整校验 owner/host/共同端口/网络唯一性，再一起释放并重新探测 | 界面明确允许“重新探测”，但旧实现先丢弃浏览器 reservation ID，导致新请求把自己的短期 host reservation 错报为 `PORT_IN_USE`。显式交回 ID 能支持单/双网络刷新，同时不放宽其他用户、数据库监听或全局账本门禁。 |
+| `XRAY-ADR-112` | 已确认 | 旧版脚本首跳升级的兼容恢复只在 `FORWARDX_XRAY_ENABLED` 完全缺失且持久 `FORWARDPLUS_MIGRATE_AGENTS=true` 时启用 Xray UI；新版 systemd/Docker 安装器在普通升级中把该恢复值持久化为 `1`。任何显式 Xray 值都优先，其中空值、非法值和关闭值继续 fail closed | Shell 进程在下载新版脚本后不会重新加载函数；因此旧 `write_env()` 可在启动新程序前删除后来新增的 Xray 开关。迁移标记是管理员显式执行来源迁移留下的持久证据，可跨越这一首跳缺口；仅对“字段缺失”回退可避免覆盖管理员主动关闭。 |
 
 ## 更新规则
 

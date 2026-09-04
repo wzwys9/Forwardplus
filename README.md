@@ -176,7 +176,7 @@ Forwardplus 支持 SQLite、MySQL 和 PostgreSQL：
 | `FORWARDX_IMAGE` | `ghcr.io/wzwys9/forwardplus:latest` | Docker 镜像 |
 | `FORWARDPLUS_GITHUB_TOKEN` | 空 | 可选，只读 GitHub Token |
 | `FORWARDPLUS_MIGRATE_AGENTS` | `false` | 仅由 `migrate-forwardx` 写入；让来源不匹配的 Agent 重连后自动迁移 |
-| `FORWARDX_XRAY_ENABLED` | 关闭 | Xray 管理入口开关；`migrate-forwardx` 在原部署没有显式设置时自动写入 `1` |
+| `FORWARDX_XRAY_ENABLED` | 关闭 | Xray 管理入口开关；`migrate-forwardx` 在原部署没有显式设置时自动写入 `1`。首跳旧脚本若删除该字段，会由持久迁移标记恢复并在后续升级写回；显式关闭始终优先 |
 
 更多变量见[环境变量文档](https://wzwys9.github.io/Forwardplus/guide/env-vars.html)。
 

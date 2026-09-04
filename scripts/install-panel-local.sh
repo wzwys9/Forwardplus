@@ -146,7 +146,7 @@ resolve_xray_feature_flag() {
     normalize_xray_feature_flag "$existing"
     return
   fi
-  if [ "$ACTION" = "migrate-forwardx" ]; then
+  if [ "$ACTION" = "migrate-forwardx" ] || [ "$MIGRATE_FORWARDX_AGENTS" = "true" ]; then
     printf "1\n"
   else
     printf "0\n"
@@ -885,11 +885,11 @@ write_env() {
   fi
   mkdir -p "$APP_DIR/data"
   ensure_xray_master_key
-  xray_enabled="$(resolve_xray_feature_flag)"
   existing_migrate_agents="$(get_env_value FORWARDPLUS_MIGRATE_AGENTS || true)"
   if [ "$MIGRATE_FORWARDX_AGENTS" != "true" ] && [[ "$existing_migrate_agents" =~ ^(1|true|yes|on)$ ]]; then
     MIGRATE_FORWARDX_AGENTS="true"
   fi
+  xray_enabled="$(resolve_xray_feature_flag)"
   umask 077
   cat > "$APP_DIR/.env" <<EOF
 NODE_ENV=production

@@ -18,7 +18,7 @@ Docker 部署时，环境变量通常写在部署目录的 `.env` 文件中。�
 | `FORWARDX_JWT_SECRET_PATH` | 空 | 未配置 `JWT_SECRET` 时，面板保存自动生成登录密钥的路径。 |
 | `DATABASE_CONFIG_PATH` / `DB_CONFIG_PATH` | `/data/database.json` | 面板保存数据库连接配置的位置。 |
 | `SQLITE_PATH` | `/data/forwardx.db` | SQLite 数据文件路径。 |
-| `FORWARDX_XRAY_ENABLED` | 关闭 | 管理员 Xray UI 功能开关；仅 `1`、`true`、`on`（忽略大小写和空白）开启，其他值失败关闭。新安装和普通升级默认关闭；`migrate-forwardx` 在原部署没有显式设置时自动开启并由后续升级保留。详见[受管 Xray 节点](./xray.md)。 |
+| `FORWARDX_XRAY_ENABLED` | 关闭 | 管理员 Xray UI 功能开关；仅 `1`、`true`、`on`（忽略大小写和空白）显式开启，其他已配置值失败关闭。新安装和未迁移普通升级默认关闭；`migrate-forwardx` 在原部署没有显式设置时自动开启。若首跳旧升级脚本删除该字段，持久迁移标记会临时恢复界面并由新版安装器写回；显式关闭始终优先。详见[受管 Xray 节点](./xray.md)。 |
 | `XRAY_MASTER_KEY_PATH` | 随部署方式确定 | 可选，覆盖持久 Xray 面板主密钥文件路径；文件必须由面板服务用户所有、权限 `0600` 且不能是符号链接。 |
 | `FORWARDX_PANEL_TIME_SYNC` | `true` | 启动并定期校准旧版 Agent/FXP 加密协议使用的面板时钟；不会修改宿主机或 Docker 的系统时间。 |
 | `FORWARDX_PANEL_TIME_SOURCES` | 内置多个 HTTPS 来源 | 可选，使用逗号分隔的可信 HTTPS 地址覆盖默认校时来源。 |

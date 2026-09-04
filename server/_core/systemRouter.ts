@@ -1629,7 +1629,10 @@ function publicSystemSettings(all: Record<string, string | null>, activeProtocol
     lookingGlassUserEnabled: all.lookingGlassUserEnabled !== "false",
     allowMultiDeviceLogin: all.allowMultiDeviceLogin === "true",
     pluginsEnabled: all.pluginsEnabled === "true",
-    xrayEnabled: isXrayUiFeatureEnabled(process.env.FORWARDX_XRAY_ENABLED),
+    xrayEnabled: isXrayUiFeatureEnabled(
+      process.env.FORWARDX_XRAY_ENABLED,
+      ENV.migrateForwardxAgents,
+    ),
     publicHostMonitor: {
       enabled: all.publicHostMonitorEnabled === "true",
       path: normalizePublicHostMonitorPath(all.publicHostMonitorPath),
@@ -1762,7 +1765,10 @@ export const systemRouter = router({
       lookingGlassUserEnabled: all.lookingGlassUserEnabled !== "false",
       allowMultiDeviceLogin: all.allowMultiDeviceLogin === "true",
       pluginsEnabled: all.pluginsEnabled === "true",
-      xrayEnabled: isXrayUiFeatureEnabled(process.env.FORWARDX_XRAY_ENABLED),
+      xrayEnabled: isXrayUiFeatureEnabled(
+        process.env.FORWARDX_XRAY_ENABLED,
+        ENV.migrateForwardxAgents,
+      ),
       updateAutoCheckEnabled: isUpdateAutoCheckEnabled(all),
       publicHostMonitor: {
         enabled: all.publicHostMonitorEnabled === "true",

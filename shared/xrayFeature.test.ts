@@ -11,3 +11,16 @@ test("the Xray UI feature flag is fail-closed and accepts only explicit true val
     assert.equal(isXrayUiFeatureEnabled(value), true, String(value));
   }
 });
+
+test("a durable ForwardX migration marker recovers only a missing Xray UI flag", () => {
+  assert.equal(isXrayUiFeatureEnabled(undefined, true), true);
+  assert.equal(isXrayUiFeatureEnabled(undefined, false), false);
+
+  for (const explicitValue of [null, "", "0", "false", "off", "yes", true, 1]) {
+    assert.equal(
+      isXrayUiFeatureEnabled(explicitValue, true),
+      false,
+      `explicit ${String(explicitValue)} must override the migration fallback`,
+    );
+  }
+});

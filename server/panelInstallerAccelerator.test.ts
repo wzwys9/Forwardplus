@@ -420,6 +420,49 @@ sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
   }
 });
 
+test("ordinary upgrades recover a missing Xray flag from the durable migration marker", { skip: !bash }, () => {
+  for (const installer of installers) {
+    const endMarker = installer.name === "local" ? "install_panel() {" : "ensure_xray_master_key() {";
+    const writeCall = installer.name === "local" ? "write_env" : 'write_env "ghcr.io/wzwys9/forwardplus:v2.3.280"';
+    const recovered = runHarness({
+      installer,
+      endMarker,
+      args: ["upgrade"],
+      prepare: (directory) => {
+        fs.writeFileSync(path.join(directory, ".env"), "FORWARDPLUS_MIGRATE_AGENTS=true\n");
+      },
+      body: `
+JWT_SECRET=test-secret
+XRAY_MASTER_KEY_PATH="$APP_DIR/data/xray-master.key"
+${writeCall}
+sed -n -e 's/^FORWARDX_XRAY_ENABLED=/XRAY=/p' -e 's/^FORWARDPLUS_MIGRATE_AGENTS=/MIGRATE=/p' "$APP_DIR/.env"
+`,
+    });
+    assert.equal(recovered.status, 0, recovered.stderr);
+    assert.equal(recovered.stdout, "XRAY=1\nMIGRATE=true\n");
+
+    const explicitOff = runHarness({
+      installer,
+      endMarker,
+      args: ["upgrade"],
+      prepare: (directory) => {
+        fs.writeFileSync(
+          path.join(directory, ".env"),
+          "FORWARDX_XRAY_ENABLED=off\nFORWARDPLUS_MIGRATE_AGENTS=true\n",
+        );
+      },
+      body: `
+JWT_SECRET=test-secret
+XRAY_MASTER_KEY_PATH="$APP_DIR/data/xray-master.key"
+${writeCall}
+sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
+`,
+    });
+    assert.equal(explicitOff.status, 0, explicitOff.stderr);
+    assert.equal(explicitOff.stdout.trim(), "0");
+  }
+});
+
 test("Docker Compose passes the persisted Xray feature flag into the panel", () => {
   assert.match(dockerSource, /FORWARDX_XRAY_ENABLED: \$\{FORWARDX_XRAY_ENABLED:-0\}/);
 });
