@@ -234,7 +234,7 @@ const quickConfigEndpoint = z.object({
 const quickConfigCarrierRoutes = z.array(z.object({
   carrier: z.enum(["TELECOM", "UNICOM", "MOBILE", "EDUCATION"]),
   providerLineId: z.string().min(1).max(128).regex(/^[^\u0000-\u001f\u007f]+$/),
-  endpoints: z.array(quickConfigEndpoint).min(1).max(32).superRefine((items, ctx) => {
+  endpoints: z.array(quickConfigEndpoint.extend({ relays: z.array(quickConfigEndpoint).max(8).optional() }).strict()).min(1).max(32).superRefine((items, ctx) => {
     const keys = items.map((item) => `${item.hostId}:${item.addressFamily}`);
     if (new Set(keys).size !== keys.length) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Endpoints must be unique within a carrier" });
@@ -796,6 +796,7 @@ function quickConfigTrpcError(error: unknown): never {
     const code = error.code === "QUICK_CONFIG_TARGET_CHANGED" ? "CONFLICT"
       : error.code === "QUICK_CONFIG_TARGET_UNSUPPORTED" || error.code === "QUICK_CONFIG_HOST_UNAVAILABLE"
         || error.code === "QUICK_CONFIG_ADDRESS_UNAVAILABLE" || error.code === "FORWARD_PROTOCOL_DISABLED"
+        || error.code === "QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED"
         || error.code === "AGENT_CAPABILITY_MISSING" || error.code === "HOST_OFFLINE"
         || error.code === "UDP_CAPABILITY_REQUIRED"
         || error.code === "GLOBAL_PORT_PROBE_FAILED" || error.code === "GLOBAL_PORT_PROBE_EXPIRED"

@@ -1,9 +1,12 @@
 import crypto from "node:crypto";
 import dns from "node:dns/promises";
 import net from "node:net";
+import { loadQuickConfigSegments } from "./xrayQuickConfigTopologyStore";
+import { compileQuickConfigTopology, normalizeQuickConfigPath, serializeQuickConfigRelays, QuickConfigPathError, type QuickConfigPathEndpoint, type QuickConfigRelay } from "./xrayQuickConfigTopology";
 
 import {
   XRAY_QUICK_CONFIG_FORWARD_ENGINES,
+  quickConfigPathEngineCompatible,
   type XrayQuickConfigForwardEngine,
 } from "../shared/xrayQuickConfigForwardEngines";
 
@@ -55,6 +58,7 @@ export const QUICK_CONFIG_PLANNING_ERROR_CODES = [
   "QUICK_CONFIG_TARGET_UNSUPPORTED",
   "QUICK_CONFIG_HOST_UNAVAILABLE",
   "QUICK_CONFIG_ADDRESS_UNAVAILABLE",
+  "QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED",
   "FORWARD_PROTOCOL_DISABLED",
   "AGENT_CAPABILITY_MISSING",
   "HOST_OFFLINE",
@@ -76,10 +80,11 @@ export class XrayQuickConfigPlanningError extends Error {
 export const QUICK_CONFIG_CARRIERS = ["TELECOM", "UNICOM", "MOBILE", "EDUCATION"] as const;
 export type QuickConfigCarrier = typeof QUICK_CONFIG_CARRIERS[number];
 export type QuickConfigAddressFamily = "IPV4" | "IPV6";
+
 export type QuickConfigCarrierRoutesInput = ReadonlyArray<Readonly<{
   carrier: QuickConfigCarrier;
   providerLineId: string;
-  endpoints: ReadonlyArray<Readonly<{ hostId: number; addressFamily: QuickConfigAddressFamily }>>;
+  endpoints: ReadonlyArray<QuickConfigPathEndpoint>;
 }>>;
 
 export type QuickConfigPortChoice =
@@ -133,6 +138,7 @@ type ResolvedEndpoint = Readonly<{
   hostName: string;
   addressFamily: QuickConfigAddressFamily;
   address: string;
+  relays?: ReadonlyArray<QuickConfigRelay & { hostName: string }>;
 }>;
 
 type ResolvedCarrierRoute = Readonly<{
@@ -428,13 +434,12 @@ function normalizeCarrierInput(input: QuickConfigCarrierRoutesInput): QuickConfi
     }
     const seen = new Set<string>();
     const endpoints = route.endpoints.map((endpoint: QuickConfigCarrierRoutesInput[number]["endpoints"][number]) => {
-      const hostId = positiveInteger(endpoint?.hostId);
-      const addressFamily = endpoint?.addressFamily;
-      if (addressFamily !== "IPV4" && addressFamily !== "IPV6") fail("QUICK_CONFIG_PREVIEW_INVALID");
+      const normalized = normalizeQuickConfigPath(endpoint);
+      const { hostId, addressFamily } = normalized;
       const key = `${hostId}:${addressFamily}`;
       if (seen.has(key)) fail("QUICK_CONFIG_PREVIEW_INVALID");
       seen.add(key);
-      return { hostId, addressFamily };
+      return normalized;
     }).sort((left: { hostId: number; addressFamily: QuickConfigAddressFamily }, right: { hostId: number; addressFamily: QuickConfigAddressFamily }) => (
       left.hostId - right.hostId || left.addressFamily.localeCompare(right.addressFamily)
     ));
@@ -461,7 +466,7 @@ async function resolveCarrierRoutes(
     if (!line || line.status !== "AVAILABLE" || line.providerLineId !== route.providerLineId) {
       fail("QUICK_CONFIG_PREVIEW_INVALID");
     }
-    const endpoints = route.endpoints.map((endpoint) => {
+    const resolveHop = (endpoint: QuickConfigPathEndpoint) => {
       const host = hostById.get(endpoint.hostId);
       if (!host) fail("QUICK_CONFIG_HOST_UNAVAILABLE");
       if (!host.eligible) {
@@ -472,6 +477,12 @@ async function resolveCarrierRoutes(
       const selected = host.endpoints.find((candidate) => candidate.addressFamily === endpoint.addressFamily);
       if (!selected) fail("QUICK_CONFIG_HOST_UNAVAILABLE");
       return { hostId: host.hostId, hostName: host.name, addressFamily: selected.addressFamily, address: selected.address };
+    };
+    const endpoints = route.endpoints.map((endpoint) => {
+      const hops = [endpoint, ...(endpoint.relays ?? [])];
+      const landingHostId = domain.target.targetType === "XRAY_INBOUND" ? domain.target.host.id : null;
+      if (hops.length > 1 && hops.some(hop => hop.hostId === landingHostId)) fail("QUICK_CONFIG_PREVIEW_INVALID");
+      return { ...resolveHop(endpoint), ...(endpoint.relays?.length ? { relays: endpoint.relays.map(resolveHop) } : {}) };
     });
     return { carrier: route.carrier, providerLineId: route.providerLineId, endpoints };
   });
@@ -481,13 +492,16 @@ async function resolveCarrierRoutes(
 async function assertForwardEngineAvailable(
   engineValue: unknown,
   routes: QuickConfigCarrierRoutesInput,
+  target: QuickConfigTarget,
+  rewritten: boolean,
 ): Promise<XrayQuickConfigForwardEngine> {
   const engine = forwardEngine(engineValue);
+  const directLandingHostId = !rewritten && target.targetType === "XRAY_INBOUND" ? target.host.id : undefined;
+  if (!quickConfigPathEngineCompatible(engine, routes.flatMap(route => route.endpoints.map(endpoint => [endpoint, ...(endpoint.relays ?? [])])), target.endpoint.address, directLandingHostId)) fail("QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED");
+  const entries = [...new Map(routes.flatMap(route => route.endpoints.flatMap(endpoint => [endpoint, ...(endpoint.relays ?? [])]))
+    .map(endpoint => [`${endpoint.hostId}:${endpoint.addressFamily}`, { hostId: endpoint.hostId, addressFamily: endpoint.addressFamily }])).values()];
   const catalog = await listXrayQuickConfigForwardEngines({
-    entries: routes.flatMap((route) => route.endpoints.map((endpoint) => ({
-      hostId: endpoint.hostId,
-      addressFamily: endpoint.addressFamily,
-    }))),
+    entries,
   });
   const item = catalog.items.find((candidate) => candidate.engine === engine);
   if (!item?.eligible) {
@@ -506,14 +520,21 @@ function forwardHostsFor(
   target: QuickConfigTarget,
   rewritten: boolean,
   routes: readonly ResolvedCarrierRoute[],
-): Array<{ hostId: number; hostName: string }> {
+  publicPort: number,
+) {
   const landingHostId = target.targetType === "XRAY_INBOUND" ? target.host.id : null;
-  const byHost = new Map<number, string>();
-  for (const endpoint of routes.flatMap((route) => route.endpoints)) {
-    if (!rewritten && landingHostId === endpoint.hostId) continue;
-    byHost.set(endpoint.hostId, endpoint.hostName);
-  }
-  return [...byHost].map(([hostId, hostName]) => ({ hostId, hostName })).sort((a, b) => a.hostId - b.hostId);
+  const endpoints = routes.flatMap(route => route.endpoints);
+  const names = new Map(endpoints.flatMap(endpoint => [endpoint, ...(endpoint.relays ?? [])]).map(hop => [hop.hostId, hop.hostName]));
+  return compileQuickConfigTopology(endpoints.map(endpoint => ({
+    hostId: endpoint.hostId,
+    routeMode: !rewritten && landingHostId === endpoint.hostId ? "DIRECT" : "FORWARD",
+    relayHopsJson: serializeQuickConfigRelays(endpoint.relays ?? []),
+  })), { publicPort, targetAddress: target.endpoint.address, targetPort: target.endpoint.port })
+    .map(segment => ({ ...segment, hostName: names.get(segment.hostId)! }));
+}
+
+function carrierSnapshotHash(carriers: { normalized: QuickConfigCarrierRoutesInput; resolved: ResolvedCarrierRoute[] }): string {
+  return sha256(stableJson({ input: carriers.normalized, resolved: carriers.resolved }));
 }
 
 function conflictReason(error: unknown): GlobalConflictReason | null {
@@ -583,6 +604,12 @@ async function editPlanningSnapshot(domain: ResolvedQuickConfigDomain): Promise<
         AND fr.${q("isEnabled")} = ? AND fr.${q("pendingDelete")} = ?`,
     [domain.editIdentity.quickConfigId, positiveInteger(row.activeTopologyRevisionId), domain.editIdentity.quickConfigId, true, false],
   );
+  const expected = await loadQuickConfigSegments(domain.editIdentity.quickConfigId, positiveInteger(row.activeTopologyRevisionId), {
+    publicPort: portNumber(row.publicPort), targetAddress: String(row.targetAddress), targetPort: portNumber(row.targetPort),
+  });
+  if (rules.length !== expected.length || expected.some(segment => !rules.some(rule =>
+    Number(rule.hostId) === segment.hostId && rule.targetIp === segment.targetAddress && Number(rule.targetPort) === segment.targetPort
+    && Number(rule.sourcePort) === Number(row.publicPort) && rule.forwardType === engine))) fail("QUICK_CONFIG_PREVIEW_INVALID");
   return {
     quickConfigId: domain.editIdentity.quickConfigId,
     expectedRevision: domain.editIdentity.expectedRevision,
@@ -642,13 +669,19 @@ function editProbeHosts(
   routes: readonly ResolvedCarrierRoute[],
   snapshot: EditPlanningSnapshot | null,
 ) {
-  return forwardHostsFor(domain.target, rewritten, routes).filter((host) => !matchingEditRule(snapshot, {
+  return forwardHostsFor(domain.target, rewritten, routes, selectedPort).filter((host) => !matchingEditRule(snapshot, {
     hostId: host.hostId,
     engine,
     listenPort: selectedPort,
-    targetAddress: domain.target.endpoint.address,
-    targetPort: domain.target.endpoint.port,
-  }));
+    targetAddress: host.targetAddress,
+    targetPort: host.targetPort,
+  })).map(({ hostId, hostName }) => ({ hostId, hostName }));
+}
+
+function editedListenerConflict(domain: ResolvedQuickConfigDomain, routes: readonly ResolvedCarrierRoute[], selectedPort: number, snapshot: EditPlanningSnapshot | null): boolean {
+  if (!snapshot || snapshot.publicPort !== selectedPort) return false;
+  return forwardHostsFor(domain.target, selectedPort !== domain.target.endpoint.port, routes, selectedPort).some(segment =>
+    snapshot.rules.some(old => old.hostId === segment.hostId && (old.targetAddress !== segment.targetAddress || old.targetPort !== segment.targetPort)));
 }
 
 async function portAllowedForHosts(port: number, hosts: readonly { hostId: number }[]): Promise<boolean> {
@@ -854,11 +887,11 @@ export async function createQuickConfigPortCheck(input: {
     const key = tokenKey(options.tokenSecret);
     const domain = await resolveConfirmedQuickConfigDomain({ confirmedDomainToken: input.confirmedDomainToken, userId });
     const carriers = await resolveCarrierRoutes(domain, input.carrierRoutes);
-    const engine = await assertForwardEngineAvailable(input.engine, carriers.normalized);
+    const engine = forwardEngine(input.engine);
     const editSnapshot = await editPlanningSnapshot(domain);
     if (editSnapshot && editSnapshot.engine !== engine) fail("QUICK_CONFIG_PREVIEW_INVALID");
     const confirmedDomainTokenHash = sha256(input.confirmedDomainToken);
-    const carrierRoutesHash = sha256(stableJson(carriers.normalized));
+    const carrierRoutesHash = carrierSnapshotHash(carriers);
     const originalForwardHosts = editProbeHosts(domain, engine, domain.target.endpoint.port, false, carriers.resolved, editSnapshot);
     const originalHostSetHash = hostSetHash(originalForwardHosts.map((host) => host.hostId));
 
@@ -881,6 +914,7 @@ export async function createQuickConfigPortCheck(input: {
       });
     }
     const rewritten = selectedPort !== domain.target.endpoint.port;
+    await assertForwardEngineAvailable(engine, carriers.normalized, domain.target, rewritten);
     const forwardHosts = editProbeHosts(domain, engine, selectedPort, rewritten, carriers.resolved, editSnapshot);
     const cohortHash = hostSetHash(forwardHosts.map((host) => host.hostId));
     if (input.choice.mode === "RECOMMENDED") {
@@ -896,7 +930,8 @@ export async function createQuickConfigPortCheck(input: {
         target: domain.target,
       }, options);
     }
-    const ledgerConflict = await editAwareLedgerConflict(domain, selectedPort, rewritten, editSnapshot);
+    const ledgerConflict = editedListenerConflict(domain, carriers.resolved, selectedPort, editSnapshot)
+      ? "GLOBAL_PORT_CONFLICT" : await editAwareLedgerConflict(domain, selectedPort, rewritten, editSnapshot);
     if (ledgerConflict) {
       return recommendationResponse({
         target: domain.target,
@@ -1224,13 +1259,13 @@ export async function getQuickConfigPortCheckResult(input: {
         userId: payload.userId,
       });
       const carriers = await resolveCarrierRoutes(domain, payload.carrierRoutes);
-      await assertForwardEngineAvailable(payload.engine, carriers.normalized);
+      await assertForwardEngineAvailable(payload.engine, carriers.normalized, domain.target, payload.rewritten);
       const editSnapshot = await editPlanningSnapshot(domain);
       if (editSnapshot && editSnapshot.engine !== payload.engine) fail("QUICK_CONFIG_PREVIEW_INVALID");
       const currentForwardHosts = editProbeHosts(domain, payload.engine, payload.selectedPort, payload.rewritten, carriers.resolved, editSnapshot);
       if (domain.target.targetType !== payload.targetType || domain.target.targetId !== payload.targetId
         || !hashEqual(domain.target.targetVersion, payload.targetVersion)
-        || !hashEqual(sha256(stableJson(carriers.normalized)), payload.carrierRoutesHash)
+        || !hashEqual(carrierSnapshotHash(carriers), payload.carrierRoutesHash)
         || !hashEqual(hostSetHash(currentForwardHosts.map((host) => host.hostId)), payload.hostSetHash)
         || stableJson(currentForwardHosts) !== stableJson(payload.forwardHosts)
         || ((payload.selectedPort !== domain.target.endpoint.port) !== payload.rewritten)) {
@@ -1371,7 +1406,7 @@ async function validateProbePayload(input: {
   options: PlanningOptions;
 }): Promise<ProbeResultTokenPayload> {
   const payload = parseSignedToken(input.probeResultToken, "PROBE_RESULT", input.options) as ProbeResultTokenPayload;
-  const carrierHash = sha256(stableJson(input.carriers.normalized));
+  const carrierHash = carrierSnapshotHash(input.carriers);
   const editSnapshot = await editPlanningSnapshot(input.domain);
   if (editSnapshot && editSnapshot.engine !== input.engine) fail("QUICK_CONFIG_PREVIEW_INVALID");
   const forwardHosts = editProbeHosts(input.domain, input.engine, payload.selectedPort, payload.rewritten, input.carriers.resolved, editSnapshot);
@@ -1417,24 +1452,24 @@ async function previewWithoutToken(input: {
   engine: XrayQuickConfigForwardEngine;
 }): Promise<Omit<QuickConfigPreviewDto, "previewToken" | "expiresAt">> {
   const target = input.domain.target;
-  const forwardHosts = forwardHostsFor(target, input.probe.rewritten, input.carriers);
+  const forwardHosts = forwardHostsFor(target, input.probe.rewritten, input.carriers, input.probe.selectedPort);
   const editSnapshot = await editPlanningSnapshot(input.domain);
   const rules = forwardHosts.map((host) => ({
     ruleKey: sha256(stableJson({ schema: "quick-config-rule:v1", hostId: host.hostId, engine: input.engine,
-      listenPort: input.probe.selectedPort, targetAddress: target.endpoint.address, targetPort: target.endpoint.port })),
+      listenPort: input.probe.selectedPort, targetAddress: host.targetAddress, targetPort: host.targetPort })),
     action: matchingEditRule(editSnapshot, {
       hostId: host.hostId,
       engine: input.engine,
       listenPort: input.probe.selectedPort,
-      targetAddress: target.endpoint.address,
-      targetPort: target.endpoint.port,
+      targetAddress: host.targetAddress,
+      targetPort: host.targetPort,
     }) ? "REUSE" as const : "CREATE" as const,
     hostId: host.hostId,
     hostName: host.hostName,
     engine: input.engine,
     listenPort: input.probe.selectedPort,
-    targetAddress: target.endpoint.address,
-    targetPort: target.endpoint.port,
+    targetAddress: host.targetAddress,
+    targetPort: host.targetPort,
   }));
   const carrierRecords = input.carriers.flatMap((route) => route.endpoints.map((endpoint) => {
     const recordType = endpoint.addressFamily === "IPV4" ? "A" as const : "AAAA" as const;
@@ -1507,7 +1542,7 @@ async function buildImmutablePlan(input: {
   const userId = positiveInteger(input.userId);
   const domain = await resolveConfirmedQuickConfigDomain({ confirmedDomainToken: input.confirmedDomainToken, userId });
   const carriers = await resolveCarrierRoutes(domain, input.carrierRoutes);
-  const engine = await assertForwardEngineAvailable(input.engine, carriers.normalized);
+  const engine = forwardEngine(input.engine);
   const probe = await validateProbePayload({
     probeResultToken: input.probeResultToken,
     confirmedDomainToken: input.confirmedDomainToken,
@@ -1517,6 +1552,7 @@ async function buildImmutablePlan(input: {
     userId,
     options,
   });
+  await assertForwardEngineAvailable(engine, carriers.normalized, domain.target, probe.rewritten);
   const expectedCandidates = await defaultCandidates({
     target: domain.target,
     rewritten: probe.rewritten,
@@ -1529,6 +1565,7 @@ async function buildImmutablePlan(input: {
   if (stableJson(expectedCandidates) !== stableJson(probe.candidates)) fail("QUICK_CONFIG_PREVIEW_INVALID");
   const defaults = selectedCandidates(probe, input.defaultRoutes);
   const editSnapshot = await editPlanningSnapshot(domain);
+  if (editedListenerConflict(domain, carriers.resolved, probe.selectedPort, editSnapshot)) fail("QUICK_CONFIG_PREVIEW_INVALID");
   const ledgerConflict = await editAwareLedgerConflict(domain, probe.selectedPort, probe.rewritten, editSnapshot);
   if (ledgerConflict) fail("QUICK_CONFIG_PREVIEW_INVALID");
   const preview = await previewWithoutToken({ domain, carriers: carriers.resolved, selectedDefaults: defaults, probe, engine });
@@ -1696,6 +1733,7 @@ export async function validateQuickConfigEditPreviewToken(input: {
 }
 
 function planningError(error: unknown): never {
+  if (error instanceof QuickConfigPathError) fail("QUICK_CONFIG_PREVIEW_INVALID");
   if (error instanceof XrayQuickConfigPlanningError) throw error;
   if (error instanceof XrayQuickConfigServiceError) throw error;
   if (error instanceof GlobalPortAllocationError) {

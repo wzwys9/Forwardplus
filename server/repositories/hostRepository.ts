@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, inArray, isNotNull, or, sql, type SQLWrapper } from "drizzle-orm";
+import { quickConfigReferencesHost } from "../xrayQuickConfigTopologyStore";
 import {
   agentTokens,
   forwardGroupMembers,
@@ -685,6 +686,7 @@ export async function deleteHost(id: number) {
   await withDatabaseTransaction(async () => {
     const db = await getDb();
     if (!db) throw new Error("Database not available");
+    if (await quickConfigReferencesHost(id)) throw new Error("该主机仍被快速配置路径引用，请先编辑或删除快速配置");
     await deletePanelOwnedXrayHostState(id);
     await db.delete(forwardRules).where(eq(forwardRules.hostId, id));
     await db.delete(forwardRuleTunnelExits).where(eq(forwardRuleTunnelExits.exitHostId, id));
@@ -712,6 +714,7 @@ export async function deleteHost(id: number) {
 async function hostHasLiveReferences(hostId: number) {
   const db = await getDb();
   if (!db) return true;
+  if (await quickConfigReferencesHost(hostId)) return true;
   const [ruleBlockers, forwardGroupRows, tunnelRows, tunnelHopRows, tunnelExitRows, planRows, tokenRows, managedServiceRows] = await Promise.all([
     getHostRuleDeleteBlockers(hostId),
     db.select({ count: sqlCountAll() }).from(forwardGroupMembers).where(and(
