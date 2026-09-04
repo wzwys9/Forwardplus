@@ -1105,6 +1105,10 @@ async function executeApply(
   });
   const usedBackupIds = new Set<number>();
   const protectedProviderIds = new Set<string>();
+  // Do not let an earlier replacement consume a later exact record. This is
+  // derived from the live snapshot, never from the browser's preview action.
+  const exactProviderIds = new Set(context.genericEdit ? remote.filter(candidate => managed.some(record =>
+    tupleMatches(candidate, record.tuple, context.relativeName))).map(candidate => candidate.providerRecordId) : []);
 
   try {
     for (const record of orderedManaged) {
@@ -1144,9 +1148,13 @@ async function executeApply(
           } else if (writeStep.status === "SUCCESS") {
             fail("DNS_RECORD_DRIFT", context.quickConfigId);
           } else if (writeStep.kind === "DNS_REPLACE") {
+            const candidates = availableBackups.filter(candidate => !usedBackupIds.has(candidate.id)
+              && (!context.genericEdit || (!exactProviderIds.has(candidate.providerRecordId)
+                && candidate.tuple.recordType === record.tuple.recordType)));
             const backup = (id ? backupById.get(id) : undefined)
-              ?? availableBackups.find((candidate) => !usedBackupIds.has(candidate.id));
-            if (!backup) fail("DNS_RECORD_DRIFT", context.quickConfigId);
+              ?? (context.genericEdit ? candidates.find(candidate => candidate.tuple.providerLineId === record.tuple.providerLineId) : undefined)
+              ?? candidates[0];
+            if (!backup || exactProviderIds.has(backup.providerRecordId)) fail("DNS_RECORD_DRIFT", context.quickConfigId);
             const source = await remoteRecord(client, context.zone, backup.providerRecordId);
             if (!source || !tupleMatches(source, backup.tuple, context.relativeName)) fail("DNS_RECORD_DRIFT", context.quickConfigId);
             await updateAndVerify(client, context, backup.providerRecordId, record.line, record.tuple);

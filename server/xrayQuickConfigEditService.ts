@@ -26,6 +26,7 @@ import { finalizeForwardRuleDelete, markForwardRulePendingDelete, createForwardR
 import { loadGlobalDnsProviderCredentials } from "./repositories/dnsProviderRepository";
 import { assignQuickConfigRulePortResource, ensureQuickConfigPortResource } from "./quickConfigPortResourceService";
 import { computeXrayQuickConfigDnsTupleHash } from "./xrayQuickConfigDnsTuple";
+import { matchQuickConfigDnsRecords } from "./xrayQuickConfigDnsDiff";
 import {
   validateQuickConfigEditPreviewToken,
   type QuickConfigImmutablePlan,
@@ -570,17 +571,11 @@ export async function applyQuickConfigEditPreview(input: { previewToken: string;
       }
     }
     const desired: Array<{ id: number; replacement: MutableRecord | null }> = [];
-    const assigned = new Set<number>();
-    for (const [index, record] of plan.preview.dnsRecords.entries()) {
+    const { matches, removed } = matchQuickConfigDnsRecords(plan.preview.dnsRecords, replacement.mutable);
+    for (const [index, { record, previous: prior }] of matches.entries()) {
       const category = record.routeKind === "DEFAULT" ? "DEFAULT" : record.carrier;
       const routeId = routeIds.get(routeDnsKey(category, record.providerLineId, record.recordType, record.value));
       if (!routeId) fail("QUICK_CONFIG_OPERATION_CONFLICT");
-      let replacementIndex = replacement.mutable.findIndex((candidate, candidateIndex) => !assigned.has(candidateIndex)
-        && candidate.recordType !== "CNAME" && candidate.recordType === record.recordType && candidate.providerLineId === record.providerLineId);
-      if (replacementIndex < 0) replacementIndex = replacement.mutable.findIndex((candidate, candidateIndex) => !assigned.has(candidateIndex)
-        && candidate.recordType !== "CNAME" && candidate.recordType === record.recordType);
-      const prior = replacementIndex < 0 ? null : replacement.mutable[replacementIndex];
-      if (replacementIndex >= 0) assigned.add(replacementIndex);
       const id = await insertAndGetId("xray_quick_config_dns_records", {
         quickConfigId: snapshot.quickConfigId,
         routeId,
@@ -668,7 +663,7 @@ export async function applyQuickConfigEditPreview(input: { previewToken: string;
       await insertStep({ operationId, operationTag, key: `dns-verify-${record.id}`, kind: "DNS_VERIFY", subjectType: "DNS_RECORD", subjectId: String(record.id), now });
     }
     for (const [index] of replacement.mutable.entries()) {
-      if (!assigned.has(index)) await insertStep({ operationId, operationTag, key: `dns-delete-${index + 1}`, kind: "DNS_DELETE", subjectType: "DNS_RECORD", subjectId: null, now });
+      if (removed.includes(replacement.mutable[index])) await insertStep({ operationId, operationTag, key: `dns-delete-${index + 1}`, kind: "DNS_DELETE", subjectType: "DNS_RECORD", subjectId: null, now });
     }
     for (let index = 0; index < desired.length + replacement.mutable.length; index += 1) {
       await insertStep({ operationId, operationTag, key: `dns-restore-${index + 1}`, kind: "DNS_RESTORE", subjectType: "DNS_RECORD", subjectId: null, now });
