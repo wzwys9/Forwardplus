@@ -18,7 +18,7 @@ Xray 节点
 
 - 路由建议 `/xray`。
 - 使用 admin route，普通用户既不显示菜单也不能访问路由。
-- 第一版发布继续受 `FORWARDX_XRAY_ENABLED` 管理员功能开关保护，默认关闭，由管理员在完成面板/Agent 升级和备份确认后显式启用。
+- 第一版发布继续受 `FORWARDX_XRAY_ENABLED` 管理员功能开关保护。新安装和普通升级默认关闭；显式执行 `migrate-forwardx` 视为管理员已选择切换到 Forwardplus，旧环境没有该设置时迁移安装器自动启用。已有显式设置和本次进程环境覆盖优先，显式关闭不得被迁移或后续升级改写为开启。
 - `FORWARDX_XRAY_ENABLED` 仅在字符串值为 `1`、`true` 或 `on`（忽略大小写和首尾空白）时开启；未配置、无法识别或公共设置查询失败时均保持关闭。
 - `system.publicInfo.xrayEnabled` 只公开上述布尔结果，侧边栏和 `/xray` 路由共用该结果；开关不替代后端各 Xray procedure 的管理员鉴权。
 

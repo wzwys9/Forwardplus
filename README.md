@@ -80,7 +80,7 @@ bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-
 bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | sudo bash -s -- migrate-forwardx'
 ```
 
-迁移不伪造版本号：面板和主机页仍显示 Agent 的真实版本，并额外显示发行来源。来源不是 `Forwardplus` 的 Agent 即使版本更高也会被识别为待迁移；完成迁移后，面板、Agent 安装脚本、Release 和容器镜像均只使用 `wzwys9/Forwardplus` 更新源。迁移前仍建议备份数据库和 Xray 主密钥。
+迁移不伪造版本号：面板和主机页仍显示 Agent 的真实版本，并额外显示发行来源。来源不是 `Forwardplus` 的 Agent 即使版本更高也会被识别为待迁移；完成迁移后，面板、Agent 安装脚本、Release 和容器镜像均只使用 `wzwys9/Forwardplus` 更新源。原部署没有显式配置 Xray 功能开关时，迁移会自动启用 Xray 管理入口；已有开关设置会保留原有启停语义。迁移前仍建议备份数据库和 Xray 主密钥。
 
 ### 本地 systemd
 
@@ -176,6 +176,7 @@ Forwardplus 支持 SQLite、MySQL 和 PostgreSQL：
 | `FORWARDX_IMAGE` | `ghcr.io/wzwys9/forwardplus:latest` | Docker 镜像 |
 | `FORWARDPLUS_GITHUB_TOKEN` | 空 | 可选，只读 GitHub Token |
 | `FORWARDPLUS_MIGRATE_AGENTS` | `false` | 仅由 `migrate-forwardx` 写入；让来源不匹配的 Agent 重连后自动迁移 |
+| `FORWARDX_XRAY_ENABLED` | 关闭 | Xray 管理入口开关；`migrate-forwardx` 在原部署没有显式设置时自动写入 `1` |
 
 更多变量见[环境变量文档](https://wzwys9.github.io/Forwardplus/guide/env-vars.html)。
 

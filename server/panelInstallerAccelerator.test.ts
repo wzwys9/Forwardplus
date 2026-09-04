@@ -87,6 +87,7 @@ function runHarness(options: {
     OUTPUT_FILE: shellPath(outputFile),
   };
   delete childEnv.FORWARDX_GITHUB_ACCELERATOR_URL;
+  delete childEnv.FORWARDX_XRAY_ENABLED;
   Object.assign(childEnv, options.env || {});
   const result = spawnSync(bash, [harness, ...(options.args || [])], {
     encoding: "utf8",
@@ -323,6 +324,104 @@ test("both installers expose an explicit ForwardX migration action and persist a
     assert.match(installer.source, /Detected existing panel/);
   }
   assert.match(dockerSource, /FORWARDPLUS_MIGRATE_AGENTS: \$\{MIGRATE_FORWARDX_AGENTS\}/);
+});
+
+test("migrate-forwardx enables Xray only when no explicit setting exists", { skip: !bash }, () => {
+  for (const installer of installers) {
+    const endMarker = installer.name === "local" ? "install_panel() {" : "ensure_xray_master_key() {";
+    const writeCall = installer.name === "local" ? "write_env" : 'write_env "ghcr.io/wzwys9/forwardplus:v2.3.279"';
+    const migrated = runHarness({
+      installer,
+      endMarker,
+      args: ["migrate-forwardx"],
+      body: `
+JWT_SECRET=test-secret
+XRAY_MASTER_KEY_PATH="$APP_DIR/data/xray-master.key"
+${writeCall}
+sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
+`,
+    });
+    assert.equal(migrated.status, 0, migrated.stderr);
+    assert.equal(migrated.stdout.trim(), "1");
+
+    const preserved = runHarness({
+      installer,
+      endMarker,
+      args: ["migrate-forwardx"],
+      prepare: (directory) => {
+        fs.writeFileSync(path.join(directory, ".env"), "FORWARDX_XRAY_ENABLED=off\n");
+      },
+      body: `
+JWT_SECRET=test-secret
+XRAY_MASTER_KEY_PATH="$APP_DIR/data/xray-master.key"
+${writeCall}
+sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
+`,
+    });
+    assert.equal(preserved.status, 0, preserved.stderr);
+    assert.equal(preserved.stdout.trim(), "0");
+
+    const overridden = runHarness({
+      installer,
+      endMarker,
+      args: ["migrate-forwardx"],
+      env: { FORWARDX_XRAY_ENABLED: "false" },
+      prepare: (directory) => {
+        fs.writeFileSync(path.join(directory, ".env"), "FORWARDX_XRAY_ENABLED=on\n");
+      },
+      body: `
+JWT_SECRET=test-secret
+XRAY_MASTER_KEY_PATH="$APP_DIR/data/xray-master.key"
+${writeCall}
+sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
+`,
+    });
+    assert.equal(overridden.status, 0, overridden.stderr);
+    assert.equal(overridden.stdout.trim(), "0");
+  }
+});
+
+test("new installs and ordinary upgrades default Xray off while upgrades preserve an enabled setting", { skip: !bash }, () => {
+  for (const installer of installers) {
+    const endMarker = installer.name === "local" ? "install_panel() {" : "ensure_xray_master_key() {";
+    const writeCall = installer.name === "local" ? "write_env" : 'write_env "ghcr.io/wzwys9/forwardplus:v2.3.279"';
+    for (const action of ["install", "upgrade"]) {
+      const defaulted = runHarness({
+        installer,
+        endMarker,
+        args: [action],
+        body: `
+JWT_SECRET=test-secret
+XRAY_MASTER_KEY_PATH="$APP_DIR/data/xray-master.key"
+${writeCall}
+sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
+`,
+      });
+      assert.equal(defaulted.status, 0, defaulted.stderr);
+      assert.equal(defaulted.stdout.trim(), "0");
+    }
+
+    const preserved = runHarness({
+      installer,
+      endMarker,
+      args: ["upgrade"],
+      prepare: (directory) => {
+        fs.writeFileSync(path.join(directory, ".env"), "FORWARDX_XRAY_ENABLED=On\n");
+      },
+      body: `
+JWT_SECRET=test-secret
+XRAY_MASTER_KEY_PATH="$APP_DIR/data/xray-master.key"
+${writeCall}
+sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
+`,
+    });
+    assert.equal(preserved.status, 0, preserved.stderr);
+    assert.equal(preserved.stdout.trim(), "1");
+  }
+});
+
+test("Docker Compose passes the persisted Xray feature flag into the panel", () => {
+  assert.match(dockerSource, /FORWARDX_XRAY_ENABLED: \$\{FORWARDX_XRAY_ENABLED:-0\}/);
 });
 
 test("the local installer validates the complete archive before removing the current panel", () => {

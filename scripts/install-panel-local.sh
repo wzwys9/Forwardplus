@@ -126,6 +126,33 @@ get_env_value() {
   grep -E "^${key}=" "$file" | tail -1 | sed -E "s/^${key}=//; s/^\"//; s/\"$//"
 }
 
+normalize_xray_feature_flag() {
+  local value="${1:-}"
+  value="$(printf "%s" "$value" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  case "$value" in
+    1|true|on) printf "1\n" ;;
+    *) printf "0\n" ;;
+  esac
+}
+
+resolve_xray_feature_flag() {
+  local existing=""
+  if [ "${FORWARDX_XRAY_ENABLED+x}" = "x" ]; then
+    normalize_xray_feature_flag "$FORWARDX_XRAY_ENABLED"
+    return
+  fi
+  if [ -f "$APP_DIR/.env" ] && grep -q '^FORWARDX_XRAY_ENABLED=' "$APP_DIR/.env"; then
+    existing="$(get_env_value FORWARDX_XRAY_ENABLED || true)"
+    normalize_xray_feature_flag "$existing"
+    return
+  fi
+  if [ "$ACTION" = "migrate-forwardx" ]; then
+    printf "1\n"
+  else
+    printf "0\n"
+  fi
+}
+
 normalize_github_accelerator_url() {
   local value="${1:-}"
   local pattern='^https?://[^/?#[:space:]]+(/[^?#[:space:]]*)?$'
@@ -852,12 +879,13 @@ install_runtime_dependencies() {
 }
 
 write_env() {
-  local jwt_secret="${JWT_SECRET:-}" existing_migrate_agents
+  local jwt_secret="${JWT_SECRET:-}" existing_migrate_agents xray_enabled
   if [ -z "$jwt_secret" ]; then
     jwt_secret="$(openssl rand -hex 32 2>/dev/null || date +%s%N | sha256sum | awk '{print $1}')"
   fi
   mkdir -p "$APP_DIR/data"
   ensure_xray_master_key
+  xray_enabled="$(resolve_xray_feature_flag)"
   existing_migrate_agents="$(get_env_value FORWARDPLUS_MIGRATE_AGENTS || true)"
   if [ "$MIGRATE_FORWARDX_AGENTS" != "true" ] && [[ "$existing_migrate_agents" =~ ^(1|true|yes|on)$ ]]; then
     MIGRATE_FORWARDX_AGENTS="true"
@@ -871,6 +899,7 @@ SQLITE_PATH=$APP_DIR/data/forwardx.db
 MYSQL_CONFIG_PATH=$APP_DIR/data/mysql.json
 JWT_SECRET=$jwt_secret
 XRAY_MASTER_KEY_PATH=$XRAY_MASTER_KEY_PATH
+FORWARDX_XRAY_ENABLED=$xray_enabled
 FORWARDX_PORT_CONFIG_PATH=$APP_DIR/.env
 FORWARDX_PORT_MANAGEMENT=local
 FORWARDX_GITHUB_ACCELERATOR_URL="$GITHUB_ACCELERATOR_URL"

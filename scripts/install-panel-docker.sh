@@ -180,6 +180,33 @@ get_env_value() {
   grep -E "^${key}=" "$file" | tail -1 | sed -E "s/^${key}=//; s/^\"//; s/\"$//"
 }
 
+normalize_xray_feature_flag() {
+  local value="${1:-}"
+  value="$(printf "%s" "$value" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  case "$value" in
+    1|true|on) printf "1\n" ;;
+    *) printf "0\n" ;;
+  esac
+}
+
+resolve_xray_feature_flag() {
+  local existing=""
+  if [ "${FORWARDX_XRAY_ENABLED+x}" = "x" ]; then
+    normalize_xray_feature_flag "$FORWARDX_XRAY_ENABLED"
+    return
+  fi
+  if [ -f "$APP_DIR/.env" ] && grep -q '^FORWARDX_XRAY_ENABLED=' "$APP_DIR/.env"; then
+    existing="$(get_env_value FORWARDX_XRAY_ENABLED || true)"
+    normalize_xray_feature_flag "$existing"
+    return
+  fi
+  if [ "$ACTION" = "migrate-forwardx" ]; then
+    printf "1\n"
+  else
+    printf "0\n"
+  fi
+}
+
 normalize_github_accelerator_url() {
   local value="${1:-}"
   local pattern='^https?://[^/?#[:space:]]+(/[^?#[:space:]]*)?$'
@@ -713,6 +740,7 @@ services:
       POSTGRES_SSL: ${POSTGRES_SSL:-false}
       JWT_SECRET: ${JWT_SECRET:-change-me-to-a-random-string}
       XRAY_MASTER_KEY_PATH: ${XRAY_MASTER_KEY_PATH:-/data/xray-master.key}
+      FORWARDX_XRAY_ENABLED: ${FORWARDX_XRAY_ENABLED:-0}
       FORWARDPLUS_GITHUB_TOKEN: ${FORWARDPLUS_GITHUB_TOKEN:-}
       FORWARDPLUS_MIGRATE_AGENTS: ${MIGRATE_FORWARDX_AGENTS}
     volumes:
@@ -732,7 +760,7 @@ EOF
 
 write_env() {
   local image="$1"
-  local existing_jwt jwt_secret existing_xray_master_key_path xray_master_key_path existing_github_token existing_migrate_agents
+  local existing_jwt jwt_secret existing_xray_master_key_path xray_master_key_path existing_github_token existing_migrate_agents xray_enabled
   if ! valid_port "$PORT"; then
     PORT="9810"
   fi
@@ -745,6 +773,7 @@ write_env() {
   existing_xray_master_key_path="$(get_env_value XRAY_MASTER_KEY_PATH || true)"
   xray_master_key_path="${XRAY_MASTER_KEY_PATH:-$existing_xray_master_key_path}"
   xray_master_key_path="${xray_master_key_path:-/data/xray-master.key}"
+  xray_enabled="$(resolve_xray_feature_flag)"
   existing_github_token="$(get_env_value FORWARDPLUS_GITHUB_TOKEN || true)"
   if [ -z "$GITHUB_TOKEN" ] && [ -n "$existing_github_token" ]; then
     GITHUB_TOKEN="$existing_github_token"
@@ -759,6 +788,7 @@ PORT=$PORT
 FORWARDX_PUBLIC_PORT=$PORT
 JWT_SECRET=$jwt_secret
 XRAY_MASTER_KEY_PATH=$xray_master_key_path
+FORWARDX_XRAY_ENABLED=$xray_enabled
 COMPOSE_PROJECT_NAME=$PROJECT_NAME
 FORWARDX_CONTAINER_NAME=$CONTAINER_NAME
 FORWARDX_IMAGE=$image
