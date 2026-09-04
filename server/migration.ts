@@ -1,5 +1,6 @@
 import { Request, Response, Router } from "express";
 import nodeCrypto from "crypto";
+import { parseQuickConfigRelays, serializeQuickConfigRelays } from "./xrayQuickConfigTopology";
 import fs from "fs";
 import path from "path";
 import { Readable } from "stream";
@@ -1503,6 +1504,9 @@ async function prepareImportRow(table: string, source: Record<string, any>, maps
       row.quickConfigId = mapRequiredId(maps, "xray_quick_configs", source.quickConfigId);
       row.topologyRevisionId = mapRequiredId(maps, "xray_quick_config_topology_revisions", source.topologyRevisionId);
       row.hostId = mapOptionalId(maps, "hosts", source.hostId);
+      row.relayHopsJson = serializeQuickConfigRelays(parseQuickConfigRelays(source.relayHopsJson).map(hop => ({
+        ...hop, hostId: mapRequiredId(maps, "hosts", hop.hostId),
+      })));
       return { row, existingWhere: row.routeTag ? { routeTag: row.routeTag } : undefined };
 
     case "xray_quick_config_operations":

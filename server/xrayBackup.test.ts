@@ -549,6 +549,14 @@ test("DNS provider backup preflight rejects incomplete secrets and dangling cata
     mismatchedRouteLine.tables.xray_quick_config_routes[0].lineCategory = "TELECOM";
     rejects(mismatchedRouteLine);
 
+    const malformedRelayPath = structuredClone(snapshot);
+    malformedRelayPath.tables.xray_quick_config_routes[0].relayHopsJson = "{invalid-json}";
+    rejects(malformedRelayPath);
+
+    const missingRelayHost = structuredClone(snapshot);
+    missingRelayHost.tables.xray_quick_config_routes[0].relayHopsJson = JSON.stringify([{ hostId: 999999, addressFamily: "IPV4", address: "8.8.8.8" }]);
+    rejects(missingRelayHost);
+
     const crossZoneBackup = structuredClone(snapshot);
     const twoZoneRevision = catalog.computeDnsProviderCatalogRevision([{
       providerZoneId: "zone-14", name: "example.com",

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { isIP } from "node:net";
+import { compileQuickConfigTopology, parseQuickConfigRelays } from "./xrayQuickConfigTopology";
 
 import {
   accessSecretPolicyForCredentialType,
@@ -783,7 +784,25 @@ export function assertMigrationSnapshotXraySecretsAvailable(
         || (sourceType === "LANDING" && (routeMode !== "DIRECT" || address !== expectedLandingAddress))
         || isIP(address) !== (addressFamily === "IPV4" ? 4 : 6)) throw unavailable();
       snapshotBoundedString(row.providerLineId, 128);
+      let relays: ReturnType<typeof parseQuickConfigRelays>;
+      try { relays = parseQuickConfigRelays(row.relayHopsJson); } catch { throw unavailable(); }
+      for (const hop of relays) {
+        const relayHost = hostRows.get(hop.hostId);
+        const expected = hop.addressFamily === "IPV4"
+          ? relayHost?.ipv4 || (isIP(String(relayHost?.ip ?? "")) === 4 ? relayHost?.ip : "")
+          : relayHost?.ipv6 || (isIP(String(relayHost?.ip ?? "")) === 6 ? relayHost?.ip : "");
+        if (!relayHost || hop.address !== expected || routeMode !== "FORWARD" || hop.hostId === hostId) throw unavailable();
+      }
       routeIds.set(id, row); routeTags.add(routeTag); routeKeys.add(key);
+    }
+    const segmentsByTopology = new Map<number, ReturnType<typeof compileQuickConfigTopology>>();
+    for (const [topologyId, topology] of topologyIds) {
+      const routes = [...routeIds.values()].filter(route => Number(route.topologyRevisionId) === topologyId);
+      if (!routes.length) continue;
+      try { segmentsByTopology.set(topologyId, compileQuickConfigTopology(routes.map(route => ({
+        hostId: route.hostId, routeMode: route.routeMode, relayHopsJson: route.relayHopsJson,
+      })), { publicPort: Number(topology.publicPort), targetAddress: String(topology.targetAddress), targetPort: Number(topology.targetPort) })); }
+      catch { throw unavailable(); }
     }
 
     const operationIds = new Map<number, Record<string, any>>();
@@ -879,23 +898,23 @@ export function assertMigrationSnapshotXraySecretsAvailable(
     }
     if ((snapshot.tables?.forward_rules || []).some((row) => snapshotOptionalId(row.xrayQuickConfigId) !== null
       && !boundForwardRules.has(snapshotId(row.id)))) throw unavailable();
-    for (const route of routeIds.values()) {
-      if (route.routeMode !== "FORWARD") continue;
-      const topologyRevisionId = snapshotId(route.topologyRevisionId);
+    for (const [topologyRevisionId, segments] of segmentsByTopology) {
       const topology = topologyIds.get(topologyRevisionId);
-      const hasMatchingRule = (snapshot.tables?.xray_quick_config_rule_bindings || []).some((binding) => {
-        if (snapshotId(binding.topologyRevisionId) !== topologyRevisionId) return false;
-        const rule = (snapshot.tables?.forward_rules || [])
-          .find((candidate) => snapshotId(candidate.id) === snapshotId(binding.forwardRuleId));
-        return rule
-          && snapshotId(rule.hostId) === snapshotId(route.hostId)
-          && String(rule.forwardType).toLowerCase() === String(topology?.engine).toLowerCase()
-          && String(rule.protocol).toLowerCase() === "tcp"
-          && Number(rule.sourcePort) === Number(topology?.publicPort)
-          && String(rule.targetIp) === String(topology?.targetAddress)
-          && Number(rule.targetPort) === Number(topology?.targetPort);
-      });
-      if (!hasMatchingRule) throw unavailable();
+      for (const segment of segments) {
+        const hasMatchingRule = (snapshot.tables?.xray_quick_config_rule_bindings || []).some((binding) => {
+          if (snapshotId(binding.topologyRevisionId) !== topologyRevisionId) return false;
+          const rule = (snapshot.tables?.forward_rules || [])
+            .find((candidate) => snapshotId(candidate.id) === snapshotId(binding.forwardRuleId));
+          return rule
+            && snapshotId(rule.hostId) === segment.hostId
+            && String(rule.forwardType).toLowerCase() === String(topology?.engine).toLowerCase()
+            && String(rule.protocol).toLowerCase() === "tcp"
+            && Number(rule.sourcePort) === Number(topology?.publicPort)
+            && String(rule.targetIp) === segment.targetAddress
+            && Number(rule.targetPort) === segment.targetPort;
+        });
+        if (!hasMatchingRule) throw unavailable();
+      }
     }
 
     const dnsRecordIds = new Set<number>();
@@ -1291,6 +1310,7 @@ export function assertMigrationSnapshotXraySecretsAvailable(
         if (quickConfigId !== null) {
           const topologyId = bindingTopologyByForwardRule.get(resourceId);
           const topology = topologyId ? topologyIds.get(topologyId) : undefined;
+          const segment = topologyId ? segmentsByTopology.get(topologyId)?.find(candidate => candidate.hostId === hostId) : undefined;
           const protocol = String(rule?.protocol ?? "").trim().toLowerCase();
           const ruleNetwork = protocol === "tcp" ? "TCP" : protocol === "udp" ? "UDP" : protocol === "both" ? "BOTH" : null;
           if (!topology || snapshotId(topology.quickConfigId) !== quickConfigId
@@ -1299,8 +1319,8 @@ export function assertMigrationSnapshotXraySecretsAvailable(
             || snapshotId(rule?.hostId) !== hostId
             || rule?.forwardType !== topology.engine || ruleNetwork !== String(row.network)
             || String(row.role) !== "PUBLIC_LISTENER"
-            || Number(rule?.targetPort) !== Number(topology.targetPort)
-            || String(rule?.targetIp) !== String(topology.targetAddress)) throw unavailable();
+            || Number(rule?.targetPort) !== segment?.targetPort
+            || String(rule?.targetIp) !== segment?.targetAddress) throw unavailable();
         }
       }
       if (isOwning) {
