@@ -7,7 +7,7 @@ import {
 
 const stepLabels: Record<XrayQuickConfigStep, string> = {
   DOMAIN: "域名",
-  CARRIERS: "运营商入口",
+  CARRIERS: "运营商路径",
   ENGINE: "转发引擎",
   PORT: "端口检测",
   DEFAULT: "默认线路",

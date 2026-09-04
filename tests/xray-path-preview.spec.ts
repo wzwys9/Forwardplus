@@ -1,5 +1,28 @@
 import { expect, test } from "@playwright/test";
 
+test("正式手机路径步骤保留有序中转并拒绝下一跳冲突", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", error => errors.push(error.message));
+  await page.setViewportSize({ width: 320, height: 640 });
+  await page.goto("/tests/fixtures/xray-path-preview.html?sample=1&formal=1");
+  await page.getByRole("button", { name: "编辑运营商路径", exact: true }).click();
+  await page.getByRole("button", { name: "编辑电信路径 1" }).click();
+  await page.getByRole("button", { name: "中转 2 使用 IPv6" }).click();
+  await expect(page.getByRole("button", { name: "使用这些路径" })).toBeDisabled();
+  await page.getByRole("button", { name: "中转 2 使用 IPv4" }).click();
+  const accept = page.getByRole("button", { name: "使用这些路径" });
+  await expect(accept).toBeEnabled();
+  await expect(accept).toBeInViewport();
+  expect(await page.getByRole("dialog").first().evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  await page.screenshot({ path: "test-results/multihop-formal-mobile.png" });
+  await accept.click();
+  await page.getByRole("button", { name: "下一步：转发引擎" }).click();
+  await expect(page.getByRole("heading", { name: "已进入转发引擎" })).toBeVisible();
+  const paths = JSON.parse(await page.getByTestId("accepted-paths").innerText());
+  expect(paths.TELECOM[0].hops).toEqual(["1:IPV4", "2:IPV6", "3:IPV4"]);
+  expect(errors).toEqual([]);
+});
+
 for (const width of [320, 768, 1024, 1440]) {
   test(`路径设计在 ${width}px 可编辑且没有横向溢出`, async ({ page }) => {
     const errors: string[] = [];

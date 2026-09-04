@@ -1,9 +1,11 @@
-import { useState } from "react";
+import { useReducer, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../../client/src/index.css";
 import { XrayQuickConfigPathDesigner } from "../../client/src/components/xray/XrayQuickConfigPathDesigner";
 import type { XrayQuickConfigEntryHost, XrayQuickConfigTarget } from "../../client/src/components/xray/xrayQuickConfigFlow";
 import { emptyQuickConfigPaths } from "../../client/src/components/xray/xrayQuickConfigPaths";
+import { XrayQuickConfigCarrierPaths } from "../../client/src/components/xray/XrayQuickConfigCarrierPaths";
+import { initialXrayQuickConfigFlowState, reduceXrayQuickConfigFlow } from "../../client/src/components/xray/xrayQuickConfigFlow";
 
 const names = ["香港 B · 电信入口", "日本 C · 中转", "新加坡 D · 中转", "备用 E（离线）"];
 const hosts: XrayQuickConfigEntryHost[] = names.map((name, index) => ({
@@ -35,4 +37,13 @@ function Fixture() {
       onRetry={() => {}} onClose={() => setOpen(false)} initialPaths={initial} /> : <p>预览已关闭</p>}
   </main>;
 }
-createRoot(document.getElementById("root")!).render(<Fixture />);
+function FormalFixture() {
+  const [state, dispatch] = useReducer(reduceXrayQuickConfigFlow, reduceXrayQuickConfigFlow(initialXrayQuickConfigFlowState(), { type: "SET_CARRIER_PATHS", paths: initial }));
+  const [next, setNext] = useState(false);
+  return <main className="mx-auto max-w-4xl p-3"><p className="mb-3 text-sm">隔离正式路径步骤 · 不连接 API</p>
+    {next ? <><h1>已进入转发引擎</h1><pre className="break-all whitespace-pre-wrap" data-testid="accepted-paths">{JSON.stringify(state.carrierPaths)}</pre></>
+      : <XrayQuickConfigCarrierPaths state={state} target={target} hosts={hosts} loading={false} error={false} confirmedValid linesAvailable
+        onChange={paths => dispatch({ type: "SET_CARRIER_PATHS", paths })} onBack={() => {}} onNext={() => setNext(true)} onRetry={() => {}} />}
+  </main>;
+}
+createRoot(document.getElementById("root")!).render(new URLSearchParams(window.location.search).has("formal") ? <FormalFixture /> : <Fixture />);
