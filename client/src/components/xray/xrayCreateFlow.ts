@@ -58,7 +58,6 @@ export type XrayPortProbeState =
   | { phase: "FAILED"; errorCode: string };
 
 export type XrayCreateState = {
-  step: 1 | 2;
   hostId: number | null;
   name: string;
   publicAddress: string;
@@ -66,6 +65,7 @@ export type XrayCreateState = {
   manualPort: string;
   probe: XrayPortProbeState;
   secondaryProbe: XrayPortProbeState;
+  replaceReservationIds: string[];
 };
 
 export type XrayCreateAction =
@@ -74,7 +74,7 @@ export type XrayCreateAction =
   | { type: "SET_PUBLIC_ADDRESS"; value: string }
   | { type: "SET_PORT_MODE"; mode: "AUTO" | "MANUAL" }
   | { type: "SET_MANUAL_PORT"; value: string }
-  | { type: "GO_TO_PORT" } | { type: "GO_TO_HOST" } | { type: "RESET_PROBE" }
+  | { type: "RESET_PROBE" }
   | { type: "PROBE_QUEUED"; slot?: "PRIMARY" | "SECONDARY"; operationId: string }
   | { type: "PROBE_RUNNING"; slot?: "PRIMARY" | "SECONDARY"; operationId: string }
   | { type: "PROBE_RESERVED"; slot?: "PRIMARY" | "SECONDARY"; selectedPort: number; reservationId: string; expiresAt: string }
@@ -82,7 +82,6 @@ export type XrayCreateAction =
 
 export function initialXrayCreateState(): XrayCreateState {
   return {
-    step: 1,
     hostId: null,
     name: "",
     publicAddress: "",
@@ -90,17 +89,29 @@ export function initialXrayCreateState(): XrayCreateState {
     manualPort: "",
     probe: { phase: "IDLE" },
     secondaryProbe: { phase: "IDLE" },
+    replaceReservationIds: [],
   };
 }
 
-function resetProbes(state: XrayCreateState): XrayCreateState {
-  return { ...state, probe: { phase: "IDLE" }, secondaryProbe: { phase: "IDLE" } };
-}
-
-export function currentXrayPortReplacementIds(state: XrayCreateState): string[] {
+function reservedProbeIds(state: XrayCreateState): string[] {
   return [state.probe, state.secondaryProbe]
     .filter((probe): probe is Extract<XrayPortProbeState, { phase: "RESERVED" }> => probe.phase === "RESERVED")
     .map((probe) => probe.reservationId);
+}
+
+function resetProbes(state: XrayCreateState, preserveReservations = true): XrayCreateState {
+  return {
+    ...state,
+    probe: { phase: "IDLE" },
+    secondaryProbe: { phase: "IDLE" },
+    replaceReservationIds: preserveReservations
+      ? [...new Set([...state.replaceReservationIds, ...reservedProbeIds(state)])]
+      : [],
+  };
+}
+
+export function currentXrayPortReplacementIds(state: XrayCreateState): string[] {
+  return [...new Set([...state.replaceReservationIds, ...reservedProbeIds(state)])];
 }
 
 function replaceProbe(
@@ -112,15 +123,20 @@ function replaceProbe(
 }
 
 export function reduceXrayCreateState(state: XrayCreateState, action: XrayCreateAction): XrayCreateState {
-  if (action.type === "SELECT_HOST") return resetProbes({ ...state, hostId: action.host.id, publicAddress: action.host.publicIpv4 ?? state.publicAddress });
+  if (action.type === "SELECT_HOST") return resetProbes({
+    ...state,
+    hostId: action.host.id,
+    publicAddress: action.host.publicIpv4 ?? state.publicAddress,
+  }, false);
   if (action.type === "SET_NAME") return { ...state, name: action.value };
   if (action.type === "SET_PUBLIC_ADDRESS") return { ...state, publicAddress: action.value };
   if (action.type === "SET_PORT_MODE") return resetProbes({ ...state, portMode: action.mode });
   if (action.type === "SET_MANUAL_PORT") return resetProbes({ ...state, manualPort: action.value.replace(/\D/g, "").slice(0, 5) });
-  if (action.type === "GO_TO_PORT") return { ...state, step: 2 };
-  if (action.type === "GO_TO_HOST") return { ...state, step: 1 };
   if (action.type === "RESET_PROBE") return resetProbes(state);
-  if (action.type === "PROBE_QUEUED") return replaceProbe(state, action.slot, { phase: "QUEUED", operationId: action.operationId });
+  if (action.type === "PROBE_QUEUED") {
+    const next = replaceProbe(state, action.slot, { phase: "QUEUED", operationId: action.operationId });
+    return action.slot === "SECONDARY" ? next : { ...next, replaceReservationIds: [] };
+  }
   if (action.type === "PROBE_RUNNING") return replaceProbe(state, action.slot, { phase: "RUNNING", operationId: action.operationId });
   if (action.type === "PROBE_RESERVED") {
     const currentProbe = action.slot === "SECONDARY" ? state.secondaryProbe : state.probe;
@@ -134,6 +150,15 @@ export function reduceXrayCreateState(state: XrayCreateState, action: XrayCreate
     });
   }
   return replaceProbe(state, action.slot, { phase: "FAILED", errorCode: action.errorCode });
+}
+
+export function xrayBasicSetupReady(state: XrayCreateState, hosts: readonly XrayHostOption[]): boolean {
+  const selected = hosts.find((host) => host.id === state.hostId);
+  return !!selected?.canCreateXrayInbound
+    && state.name.trim().length > 0
+    && state.name.trim().length <= 128
+    && state.publicAddress.trim().length > 0
+    && state.publicAddress.trim().length <= 253;
 }
 
 export function hostUnavailableMessage(host: XrayHostOption): string {

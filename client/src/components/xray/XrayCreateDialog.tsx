@@ -34,6 +34,7 @@ import {
   nextSecondaryPortProbeInput,
   portReservationsReady,
   reduceXrayCreateState,
+  xrayBasicSetupReady,
   XRAY_CORE_DEPRECATED_WARNING,
   XRAY_HTTP_PLAINTEXT_AUTH_WARNING,
   XRAY_MIXED_PLAINTEXT_AUTH_WARNING,
@@ -64,7 +65,7 @@ export function XrayCreateDialog({ operationId, onClose, onOperationStarted, onS
   const [deployment, deploymentDispatch] = useReducer(reduceXrayDeploymentState, undefined, initialXrayDeploymentState);
   const [now, setNow] = useState(Date.now());
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
-  const [setupSection, setSetupSection] = useState<"BASIC" | "PROTOCOL" | "TRANSPORT">("BASIC");
+  const [setupSection, setSetupSection] = useState<"BASIC" | "PROTOCOL" | "TRANSPORT" | "PORT">("BASIC");
   const [grpcServiceName, setGrpcServiceName] = useState("forwardx-grpc");
   const [xhttpPath, setXhttpPath] = useState("/forwardx/xhttp-v1");
   const [webSocketPath, setWebSocketPath] = useState("/forwardx/ws-v1");
@@ -185,7 +186,6 @@ export function XrayCreateDialog({ operationId, onClose, onOperationStarted, onS
         || selectedProfile?.id === "WIREGUARD_UDP_NONE"
         || !listenerNetworksMatch(nextProfile, selectedProfile)) {
         setupDispatch({ type: "RESET_PROBE" });
-        setSetupSection("BASIC");
       }
     }
     setSelectedProfileId(profileId);
@@ -431,25 +431,26 @@ export function XrayCreateDialog({ operationId, onClose, onOperationStarted, onS
       : deployment.stage === "REALITY" ? "SECURITY"
       : deployment.stage === "CLIENTS" ? "ACCOUNT" : "CONFIRM";
   const reservationReady = portReservationsReady(setup, listenerNetworks, now);
+  const basicReady = xrayBasicSetupReady(setup, hosts);
   const securityReady = selectedProfile?.security === "TLS"
     ? !!selectedTlsCertificate && selectedTlsCertificate.status !== "EXPIRED"
       && validTlsServerName(deployment.tlsServerName)
       && tlsCertificateCoversServerName(selectedTlsCertificate, deployment.tlsServerName)
     : selectedProfile?.security === "NONE" || !!deployment.selectedReality;
   const enabledSections = new Set<XrayCreateSection>(["BASIC"]);
-  if (reservationReady) enabledSections.add("PROTOCOL");
-  if (reservationReady && selectedProfile) enabledSections.add("TRANSPORT");
-  if (reservationReady && selectedProfileValid) enabledSections.add("SECURITY");
-  if (reservationReady && selectedProfileValid && securityReady) enabledSections.add("ACCOUNT");
-  if (reservationReady && selectedProfileValid && securityReady
+  if (basicReady) enabledSections.add("PROTOCOL");
+  if (basicReady && selectedProfile) enabledSections.add("TRANSPORT");
+  if (basicReady && selectedProfileValid) enabledSections.add("PORT");
+  if (basicReady && reservationReady && selectedProfileValid) enabledSections.add("SECURITY");
+  if (basicReady && reservationReady && selectedProfileValid && securityReady) enabledSections.add("ACCOUNT");
+  if (basicReady && reservationReady && selectedProfileValid && securityReady
     && (selectedProfile?.id === "TUNNEL_TCP_LOCAL_NONE" || validInitialClients(deployment.clients))) enabledSections.add("CONFIRM");
   const selectableSections = selectableXrayCreateSections(activeSection, enabledSections);
   const selectSection = (section: XrayCreateSection) => {
     if (!selectableSections.has(section)) return;
-    if (section === "BASIC" || section === "PROTOCOL" || section === "TRANSPORT") {
+    if (section === "BASIC" || section === "PROTOCOL" || section === "TRANSPORT" || section === "PORT") {
       deploymentDispatch({ type: "BACK_SETUP" });
       setSetupSection(section);
-      if (section === "BASIC") setupDispatch({ type: "GO_TO_HOST" });
       return;
     }
     if (section === "SECURITY") deploymentDispatch({ type: "ENTER_REALITY" });
@@ -460,7 +461,7 @@ export function XrayCreateDialog({ operationId, onClose, onOperationStarted, onS
   };
   const sectionNumber = XRAY_CREATE_SECTIONS.indexOf(activeSection) + 1;
   const form = activeSection === "BASIC"
-    ? <XrayHostPortSteps state={setup} hosts={hosts} hostsLoading={hostsQuery.isLoading} now={now} listenerNetworks={listenerNetworks} onAction={dispatchSetup} onProbe={probe} onPortReady={() => setSetupSection("PROTOCOL")} />
+    ? <XrayHostPortSteps section="BASIC" state={setup} hosts={hosts} hostsLoading={hostsQuery.isLoading} now={now} onAction={dispatchSetup} onProbe={probe} onNext={() => setSetupSection("PROTOCOL")} />
     : activeSection === "PROTOCOL" || activeSection === "TRANSPORT"
       ? <XrayProfileSteps
           section={activeSection}
@@ -484,8 +485,21 @@ export function XrayCreateDialog({ operationId, onClose, onOperationStarted, onS
           onTunnelTargetPortChange={(value) => deploymentDispatch({ type: "SET_TUNNEL_TARGET_PORT", value })}
           onRetry={() => { void profilesQuery.refetch(); }}
           onBack={() => selectSection(activeSection === "PROTOCOL" ? "BASIC" : "PROTOCOL")}
-          onNext={() => activeSection === "PROTOCOL" ? setSetupSection("TRANSPORT") : deploymentDispatch({ type: "ENTER_REALITY" })}
+          onNext={() => activeSection === "PROTOCOL" ? setSetupSection("TRANSPORT") : setSetupSection("PORT")}
         />
+      : activeSection === "PORT"
+        ? <XrayHostPortSteps
+            section="PORT"
+            state={setup}
+            hosts={hosts}
+            hostsLoading={hostsQuery.isLoading}
+            now={now}
+            listenerNetworks={listenerNetworks}
+            onAction={dispatchSetup}
+            onProbe={probe}
+            onBack={() => setSetupSection("TRANSPORT")}
+            onNext={() => deploymentDispatch({ type: "ENTER_REALITY" })}
+          />
       : <XrayRealityClientSteps
           state={deployment}
           security={selectedProfile?.security === "TLS" ? "TLS" : selectedProfile?.security === "NONE" ? "NONE" : "REALITY"}
@@ -501,12 +515,12 @@ export function XrayCreateDialog({ operationId, onClose, onOperationStarted, onS
           certificatesError={tlsCertificatesQuery.isError}
           onRetryCertificates={() => { void tlsCertificatesQuery.refetch(); }}
           onAction={deploymentDispatch}
-          onBackFromSecurity={() => { deploymentDispatch({ type: "BACK_SETUP" }); setSetupSection("TRANSPORT"); }}
+          onBackFromSecurity={() => { deploymentDispatch({ type: "BACK_SETUP" }); setSetupSection("PORT"); }}
           onScan={scan}
           onSubmit={submit}
           submitting={createInbound.isPending || createInboundV2.isPending}
           canSubmit={currentHost?.canCreateXrayInbound === true && selectedProfileValid && securityReady}
           summary={summary}
         />;
-  return <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}><DialogContent onInteractOutside={(event) => { event.preventDefault(); }} className="flex max-w-5xl flex-col"><DialogHeader className="shrink-0"><DialogTitle>{operationId ? "Xray 节点部署" : "创建 Xray 节点"}</DialogTitle><DialogDescription>{operationId ? "从持久 operation 恢复真实部署状态。" : `分区 ${sectionNumber} / 6 · 只显示已验证 profile 支持的字段，提交前不会写入节点配置。`}</DialogDescription></DialogHeader>{operationId ? <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1"><XrayCreateOperationProgress operationId={operationId} onClose={onClose} onShowRuntime={onShowRuntime} /></div> : <>{hostsQuery.isError && <div role="alert" className="flex shrink-0 items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm"><span>主机状态加载失败，请重试。</span><Button type="button" size="sm" variant="outline" onClick={() => { void hostsQuery.refetch(); }}>重新加载</Button></div>}<div className="shrink-0"><XrayCreateSectionNav active={activeSection} enabled={selectableSections} onSelect={selectSection} /></div><div className="min-h-0 flex-1 overflow-y-auto overscroll-contain pb-1 pr-1">{form}</div></>}</DialogContent></Dialog>;
+  return <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}><DialogContent onInteractOutside={(event) => { event.preventDefault(); }} className="flex max-w-5xl flex-col"><DialogHeader className="shrink-0"><DialogTitle>{operationId ? "Xray 节点部署" : "创建 Xray 节点"}</DialogTitle><DialogDescription>{operationId ? "从持久 operation 恢复真实部署状态。" : `分区 ${sectionNumber} / 7 · 只显示已验证 profile 支持的字段，提交前不会写入节点配置。`}</DialogDescription></DialogHeader>{operationId ? <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1"><XrayCreateOperationProgress operationId={operationId} onClose={onClose} onShowRuntime={onShowRuntime} /></div> : <>{hostsQuery.isError && <div role="alert" className="flex shrink-0 items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm"><span>主机状态加载失败，请重试。</span><Button type="button" size="sm" variant="outline" onClick={() => { void hostsQuery.refetch(); }}>重新加载</Button></div>}<div className="shrink-0"><XrayCreateSectionNav active={activeSection} enabled={selectableSections} onSelect={selectSection} /></div><div className="min-h-0 flex-1 overflow-y-auto overscroll-contain pb-1 pr-1">{form}</div></>}</DialogContent></Dialog>;
 }

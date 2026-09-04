@@ -454,7 +454,7 @@ test("real Xray admin page is responsive and keeps secrets out of browser persis
   const createDialog = page.getByRole("dialog");
   await expect(createDialog.getByText("创建 Xray 节点", { exact: true })).toBeVisible();
   const createSections = createDialog.getByRole("navigation", { name: "创建节点配置分区" });
-  for (const label of ["基础配置", "协议", "传输", "安全", "账户", "确认"]) {
+  for (const label of ["基础配置", "协议", "传输", "端口", "安全", "账户", "确认"]) {
     await expect(createSections.getByText(label, { exact: true })).toBeVisible();
   }
   await expect.poll(() => createDialog.evaluate((dialog) => dialog.contains(document.activeElement))).toBe(true);
@@ -464,16 +464,9 @@ test("real Xray admin page is responsive and keeps secrets out of browser persis
   const wireGuardCreateDialog = page.getByRole("dialog");
   await wireGuardCreateDialog.getByRole("button", { name: /xray-browser-edge/ }).click();
   await wireGuardCreateDialog.getByLabel("节点名称").fill("Browser WireGuard Created");
-  await wireGuardCreateDialog.getByRole("button", { name: "下一步：检测端口" }).click();
-  await wireGuardCreateDialog.getByRole("button", { name: "自动检测可用端口" }).click();
-  await expect(wireGuardCreateDialog.getByText("端口可用", { exact: true })).toBeVisible();
   await wireGuardCreateDialog.getByRole("button", { name: "下一步：选择协议" }).click();
   const wireGuardProtocol = wireGuardCreateDialog.getByRole("button", { name: /WIREGUARD/ });
   await wireGuardProtocol.click();
-  await expect(wireGuardCreateDialog.getByText("UDP 端口检测与短期预留", { exact: true })).toBeVisible();
-  await wireGuardCreateDialog.getByRole("button", { name: "自动检测可用端口" }).click();
-  await expect(wireGuardCreateDialog.getByText("端口可用", { exact: true })).toBeVisible();
-  await wireGuardCreateDialog.getByRole("button", { name: "下一步：选择协议" }).click();
   await expect(wireGuardCreateDialog.getByRole("button", { name: /WIREGUARD/ })).toHaveAttribute("aria-pressed", "true");
   await expect(wireGuardCreateDialog.getByText("WireGuard 外层特征明显，可能被识别或封锁", { exact: true })).toBeVisible();
   await wireGuardCreateDialog.getByRole("button", { name: "下一步：选择传输" }).click();
@@ -486,6 +479,10 @@ test("real Xray admin page is responsive and keeps secrets out of browser persis
     await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1)).toBe(true);
     await expect(wireGuardCreateDialog.getByText("Xray 内置 / UDP / 无 TLS", { exact: true })).toBeVisible();
   }
+  await wireGuardCreateDialog.getByRole("button", { name: "下一步：检测端口" }).click();
+  await expect(wireGuardCreateDialog.getByText("UDP 端口检测与短期预留", { exact: true })).toBeVisible();
+  await wireGuardCreateDialog.getByRole("button", { name: "自动检测可用端口" }).click();
+  await expect(wireGuardCreateDialog.getByText("端口可用", { exact: true })).toBeVisible();
   await wireGuardCreateDialog.getByRole("button", { name: "下一步：配置安全" }).click();
   const wireGuardSections = wireGuardCreateDialog.getByRole("navigation", { name: "创建节点配置分区" });
   await page.clock.fastForward(61_000);
@@ -499,13 +496,13 @@ test("real Xray admin page is responsive and keeps secrets out of browser persis
   await expect(wireGuardCreateDialog.getByLabel("节点名称")).toHaveValue("Browser WireGuard Created");
   await expect(wireGuardCreateDialog.getByLabel("公网地址")).toHaveValue("8.8.8.8");
   await page.clock.setSystemTime(Date.now());
+  await wireGuardCreateDialog.getByRole("button", { name: "下一步：选择协议" }).click();
+  await expect(wireGuardCreateDialog.getByRole("button", { name: /WIREGUARD/ })).toHaveAttribute("aria-pressed", "true");
+  await wireGuardCreateDialog.getByRole("button", { name: "下一步：选择传输" }).click();
   await wireGuardCreateDialog.getByRole("button", { name: "下一步：检测端口" }).click();
   await wireGuardCreateDialog.getByRole("button", { name: "自动检测可用端口" }).click();
   await expect(wireGuardCreateDialog.getByText("端口可用", { exact: true })).toBeVisible();
   const replacementReservationId = issuedReservations.at(-1);
-  await wireGuardCreateDialog.getByRole("button", { name: "下一步：选择协议" }).click();
-  await expect(wireGuardCreateDialog.getByRole("button", { name: /WIREGUARD/ })).toHaveAttribute("aria-pressed", "true");
-  await wireGuardCreateDialog.getByRole("button", { name: "下一步：选择传输" }).click();
   await wireGuardCreateDialog.getByRole("button", { name: "下一步：配置安全" }).click();
   await expect(wireGuardCreateDialog.getByText("WireGuard 固定安全边界", { exact: true })).toBeVisible();
   await expect(wireGuardCreateDialog.getByText(/不接受密钥、PSK 或网络参数输入/)).toBeVisible();
@@ -539,7 +536,7 @@ test("real Xray admin page is responsive and keeps secrets out of browser persis
     spec: {},
     initialAccessEntries: [{ name: "Browser Phone" }, { name: "Browser Laptop" }],
   });
-  expect(probedNetworks).toEqual(["TCP", "UDP", "UDP"]);
+  expect(probedNetworks).toEqual(["UDP", "UDP"]);
   const serializedWireGuardPayload = JSON.stringify(createPayload);
   for (const forbidden of ["reality", "tlsCertificateId", "serverName", "uuid", "shortId", "flow", "privateKey", "publicKey", "preSharedKey", "psk", "allowedIPs", "keepAlive", "mtu", "dns", "route", "noKernelTun", "reserved"]) {
     expect(serializedWireGuardPayload.toLowerCase()).not.toContain(forbidden.toLowerCase());
@@ -704,9 +701,6 @@ test("HTTP management proxy create and share UI expose only the approved Basic-a
   const createDialog = page.getByRole("dialog");
   await createDialog.getByRole("button", { name: /xray-browser-edge/ }).click();
   await createDialog.getByLabel("节点名称").fill("Browser HTTP Created");
-  await createDialog.getByRole("button", { name: "下一步：检测端口" }).click();
-  await createDialog.getByRole("button", { name: "自动检测可用端口" }).click();
-  await expect(createDialog.getByText("端口可用", { exact: true })).toBeVisible();
   await createDialog.getByRole("button", { name: "下一步：选择协议" }).click();
   await createDialog.getByRole("button", { name: /HTTP 管理代理/ }).click();
   await expect(createDialog.getByText(/Basic 用户名和密码可能被链路观察者读取/)).toBeVisible();
@@ -715,6 +709,9 @@ test("HTTP management proxy create and share UI expose only the approved Basic-a
   await expect(createDialog.getByText("RAW / TCP / 无 TLS · 强制 Basic 认证", { exact: true })).toBeVisible();
   await expect(createDialog.getByText(/allowTransparent、账户凭据或任意 JSON/)).toBeVisible();
   await expect(createDialog.getByLabel(/用户名|密码|allowTransparent/i)).toHaveCount(0);
+  await createDialog.getByRole("button", { name: "下一步：检测端口" }).click();
+  await createDialog.getByRole("button", { name: "自动检测可用端口" }).click();
+  await expect(createDialog.getByText("端口可用", { exact: true })).toBeVisible();
   await createDialog.getByRole("button", { name: "下一步：配置安全" }).click();
   await expect(createDialog.getByText("HTTP 代理固定安全边界", { exact: true })).toBeVisible();
   await expect(createDialog.getByText(/强制 HTTP Basic；不允许匿名账户/)).toBeVisible();
@@ -858,9 +855,6 @@ test("Mixed management proxy create and share UI expose one TCP profile and two 
   const createDialog = page.getByRole("dialog");
   await createDialog.getByRole("button", { name: /xray-browser-edge/ }).click();
   await createDialog.getByLabel("节点名称").fill("Browser Mixed Created");
-  await createDialog.getByRole("button", { name: "下一步：检测端口" }).click();
-  await createDialog.getByRole("button", { name: "自动检测可用端口" }).click();
-  await expect(createDialog.getByText("端口可用", { exact: true })).toBeVisible();
   await createDialog.getByRole("button", { name: "下一步：选择协议" }).click();
   await createDialog.getByRole("button", { name: /Mixed（SOCKS5 \+ HTTP）/ }).click();
   await expect(createDialog.getByText(/SOCKS5 用户名\/密码和 HTTP Basic 凭据可能被链路观察者读取/)).toBeVisible();
@@ -869,6 +863,9 @@ test("Mixed management proxy create and share UI expose one TCP profile and two 
   await expect(createDialog.getByText("RAW / TCP / 无 TLS · SOCKS5 + HTTP 共用监听", { exact: true })).toBeVisible();
   await expect(createDialog.getByText(/不支持 SOCKS4\/4a 与 UDP/)).toBeVisible();
   await expect(createDialog.getByLabel(/用户名|密码|UDP|认证方式/i)).toHaveCount(0);
+  await createDialog.getByRole("button", { name: "下一步：检测端口" }).click();
+  await createDialog.getByRole("button", { name: "自动检测可用端口" }).click();
+  await expect(createDialog.getByText("端口可用", { exact: true })).toBeVisible();
   await createDialog.getByRole("button", { name: "下一步：配置安全" }).click();
   await expect(createDialog.getByText("Mixed 代理固定安全边界", { exact: true })).toBeVisible();
   await expect(createDialog.getByText(/SOCKS5 \+ HTTP\/CONNECT · 共用端口/)).toBeVisible();
@@ -1011,9 +1008,6 @@ test("Tunnel create and detail UI keep the endpoint local and submit no credenti
   const createDialog = page.getByRole("dialog");
   await createDialog.getByRole("button", { name: /xray-browser-edge/ }).click();
   await createDialog.getByLabel("节点名称").fill("Browser Tunnel Created");
-  await createDialog.getByRole("button", { name: "下一步：检测端口" }).click();
-  await createDialog.getByRole("button", { name: "自动检测可用端口" }).click();
-  await expect(createDialog.getByText("端口可用", { exact: true })).toBeVisible();
   await createDialog.getByRole("button", { name: "下一步：选择协议" }).click();
   await createDialog.getByRole("button", { name: /Tunnel（本机端口转发）/ }).click();
   await createDialog.getByRole("button", { name: "下一步：选择传输" }).click();
@@ -1022,6 +1016,9 @@ test("Tunnel create and detail UI keep the endpoint local and submit no credenti
   await createDialog.getByLabel("目标地址").fill("DB.EXAMPLE.COM");
   await createDialog.getByLabel("目标端口").fill("5432");
   await expect(createDialog.getByLabel(/portMap|followRedirect|TProxy|路由|出站/i)).toHaveCount(0);
+  await createDialog.getByRole("button", { name: "下一步：检测端口" }).click();
+  await createDialog.getByRole("button", { name: "自动检测可用端口" }).click();
+  await expect(createDialog.getByText("端口可用", { exact: true })).toBeVisible();
   await createDialog.getByRole("button", { name: "下一步：配置安全" }).click();
   await expect(createDialog.getByText("Tunnel 固定访问边界", { exact: true })).toBeVisible();
   await createDialog.getByRole("button", { name: "下一步：访问边界" }).click();

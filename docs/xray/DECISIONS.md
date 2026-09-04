@@ -120,6 +120,7 @@
 | `XRAY-ADR-113` | 已确认 | 由版本化 `FORWARDPLUS_XRAY_UI_POLICY_VERSION=1` 取代迁移标记推断并默认开启管理员 Xray UI。策略标记缺失的旧部署首次升级时无条件把历史 `FORWARDX_XRAY_ENABLED` 规范为 `1`；写入策略标记后才把后续显式关闭视为管理员选择并长期保留。本决定取代 `XRAY-ADR-110` 和 `XRAY-ADR-112` 的默认关闭与迁移标记回退规则 | 生产实例证明早期原版迁移可能同时缺少迁移标记并被旧安装器自动写入 `0`，该状态与管理员手工关闭无法从现有 `.env` 区分，导致入口在每次升级后继续隐藏。一次性策略迁移是覆盖全部历史迁移路径且仍允许未来明确关闭的最小兼容边界；代价是策略标记出现前的手工关闭会被开启一次。 |
 | `XRAY-ADR-114` | 已确认 | 快速配置探测受管 Xray 原端口时使用仅服务端可派生、创建/派发/结果三阶段一致性重验的精确 target-alias 授权；重复检测以旧规范编码的签名 probe result token 原子替换全部短期 reservation，不向浏览器暴露裸 reservation 集合 | 全局端口账本必须继续登记真实 Xray listener，但通用 probe 若无上下文会把合法目标引用误判为抢占；选择 engine 或立即重检又会撞到本向导上一轮 60 秒 host reservation。最小内部授权与签名批量替换同时保留跨主机唯一性和重检体验，且不修改 Agent payload 或数据库 schema。 |
 | `XRAY-ADR-115` | 已确认 | 普通转发规则新建表单先以全局账本预检，再由服务端对完整入口 host/network 集合复用既有单端口 `PORT_PROBE`；浏览器只持用途隔离签名 check id，全部成功后释放短期预留，最终 create 再取得正式 allocation。编辑自身 listener 不做 bind 探测 | 仅查所选主机数据库会把其他主机已用端口标绿，也无法发现数据库外进程；而直接探测编辑中的自身 listener 必然误报。服务端派生 fan-out 与短期签名聚合兼顾真实占用、跨主机唯一、不可删减结果和旧 Agent 合同兼容，最终 allocation 继续关闭探测后竞态。 |
+| `XRAY-ADR-116` | 已确认 | Xray 节点创建向导把端口从基础配置中独立出来，顺序固定为“基础配置 → 协议 → 传输 → 端口 → 安全 → 账户 → 确认”；端口探测只在确定 profile 后按其 listener network 执行，切换网络只使旧结果失效而不自动跳页 | 旧流程在选协议前默认做 TCP 探测，选择 Hysteria 2/mKCP/WireGuard 后又将用户跳回端口做 UDP 探测。先确定影响 listener 的 profile 再检测，可避免无效探测、意外回跳和错误网络预留。 |
 
 ## 更新规则
 

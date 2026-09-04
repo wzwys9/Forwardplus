@@ -1,7 +1,7 @@
 # 规格：ForwardX 受管 Xray
 
 状态：已批准  
-版本：0.22
+版本：0.24
 日期：2026-09-04
 
 实现状态：第一版 `XRAY-TASK-001..037`、多协议基础 `XRAY-TASK-038..042`、Xray-native profile `XRAY-TASK-043..052`、MTProto 独立服务首片 `XRAY-TASK-053`、AmneziaWG userspace 独立服务 `XRAY-TASK-054`、出口节点/中转联动 `XRAY-TASK-055` 与六种本地转发方式出口引用 `XRAY-TASK-056` 已完成；DNSPod 快速配置 `XRAY-TASK-057` 与六引擎创建/切换 `XRAY-TASK-058` 的可体验主流程已实现，集中运行验证待补；TUN 保持 `NOT_IMPLEMENTED`。Reality 默认候选为 `v2`，固定 Xray 默认版本仍为 `v26.3.27`。
@@ -119,7 +119,7 @@
 - `XRAY-MP-016` `TROJAN_RAW_REALITY` v1 使用严格空 spec、RAW TCP、Reality 和 `NONE` flow；每个账户由服务端生成 32-byte 随机值并以 43 位 canonical base64url password 保存到 generic access secret，`legacyClientId` 必须为 `NULL`，不得创建或伪造 `xray_clients` 行。分享 URI 固定为 `trojan://<encoded-password>@<endpoint>?type=tcp&security=reality...` 且不含 flow/fallback。
 - `XRAY-MP-017` TLS 第一版只接受管理员在浏览器中粘贴或选择的 PEM 完整证书链与未加密 PEM 私钥；浏览器读取为文本后调用受鉴权接口，不上传或保存原文件名。证书按主机托管并可被同一主机的多个 inbound 引用，不接受 Agent 文件路径、PFX/PKCS#12、JKS、压缩包、加密私钥、任意 TLS JSON 或跨主机引用。证书链最大 16 KiB、最多四张证书，私钥最大 8 KiB；服务端必须验证 PEM 结构、有效期、DNS SAN、叶证书与私钥匹配及批准的 RSA/ECDSA 算法。
 - `XRAY-MP-018` TLS 私钥在面板数据库中使用证书稳定身份绑定的 AEAD 加密；面板为固定 `v26.3.27` 生成内联 `certificate`/`key` 配置，不生成 `certificateFile`/`keyFile`。轮换复用主机 generation、完整快照、Agent 配置测试、原子切换和 last-good；被 inbound 引用的证书不得删除。第一版不做 ACME、自动续期、多证书 SNI、明文私钥导出、OCSP/ECH 或自定义密码套件。
-- `XRAY-MP-019` 创建界面采用由服务端可用 profile 驱动的“基础配置 / 协议 / 传输 / 安全 / 账户 / 确认”分区。协议、传输或安全变化必须重新归一化为一个明确 profile 并清除不兼容的隐藏字段；未完成 profile、嗅探、fallback、高级 JSON 和路由不显示。该交互只借鉴 3x-ui 的信息分组，不复制其任意组合或配置透传模型。
+- `XRAY-MP-019` 创建界面采用由服务端可用 profile 驱动的“基础配置 / 协议 / 传输 / 端口 / 安全 / 账户 / 确认”分区。基础配置只收集主机、名称和公网地址；只有协议与传输已归一化为明确 profile 后才允许进入端口分区，并按该 profile 的 `listenerNetworks` 直接执行 TCP、UDP 或同端口 TCP+UDP 探测，不先做默认 TCP 探测。改变主机或 listener network 必须使旧结果失效，但保留其他表单草稿且不自动跳回基础配置。协议、传输或安全变化仍必须清除不兼容的隐藏字段；未完成 profile、嗅探、fallback、高级 JSON 和路由不显示。该交互只借鉴 3x-ui 的信息分组，不复制其任意组合或配置透传模型。
 - `XRAY-MP-020` VLESS/Trojan TLS 使用下表 13 个独立 profile；VLESS RAW 同时提供标准 TLS 和 Vision 两种明确 profile，对应参考界面的 flow 开关。其余传输和全部 Trojan profile 固定 `NONE` flow，不接受隐藏 flow。
 - `XRAY-MP-021` TLS profile 的 `serverName` 是 profile 外的共同必填字段：只接受 1–253 字节的规范化 ASCII DNS 名称，不接受 IP、通配符或任意 SNI，并且必须被所选同主机证书的 DNS SAN 覆盖。RAW/mKCP 使用严格空 v1 spec；WebSocket、HTTPUpgrade、XHTTP 只接受严格 `{ path }`；gRPC 只接受严格 `{ serviceName }`。path 和 serviceName 沿用现有已验证的 1–128 字节字符集；所有额外 Host、headers、early data、authority、multiMode、XHTTP extra、mKCP 参数、FinalMask、PROXY protocol 和 TLS 高级字段均拒绝。
 - `XRAY-MP-022` 所有 TLS 分享材料固定包含 `security=tls`、规范化 `sni`、`fp=chrome` 和所选证书叶证书 SHA-256 的 `pcs`；VLESS 另含 `encryption=none`，只有 `VLESS_RAW_TLS_VISION` 含 `flow=xtls-rprx-vision`。这使受管自签证书无需 `allowInsecure` 也可验证；证书轮换会改变 `pcs`，应用新 generation 后管理员必须重新分发分享材料。

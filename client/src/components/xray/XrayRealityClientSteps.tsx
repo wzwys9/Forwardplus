@@ -88,7 +88,7 @@ function RealityStep({ state, onAction, onScan, onBackFromSecurity }: Pick<Props
         {state.scan.phase === "FAILED" && <p role="alert" className="flex gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm"><AlertTriangle className="h-4 w-4 shrink-0 text-destructive" aria-hidden={true} />扫描失败：{state.scan.errorCode}。请检查主机状态或目标后重试。</p>}
       </div>
       {state.scan.phase === "SUCCESS" && <div className="space-y-2">{state.scan.results.map((item) => <Candidate key={item.target} item={item} selected={state.selectedReality?.target === item.target} onSelect={() => onAction({ type: "SELECT_REALITY", candidate: item })} />)}{state.scan.results.length === 0 && <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">扫描没有返回候选，请重新扫描。</p>}</div>}
-      <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => onBackFromSecurity ? onBackFromSecurity() : onAction({ type: "BACK_SETUP" })}>返回传输</Button><Button type="button" disabled={!state.selectedReality} onClick={() => onAction({ type: "GO_CLIENTS" })}>下一步：账户</Button></div>
+      <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => onBackFromSecurity ? onBackFromSecurity() : onAction({ type: "BACK_SETUP" })}>返回端口</Button><Button type="button" disabled={!state.selectedReality} onClick={() => onAction({ type: "GO_CLIENTS" })}>下一步：账户</Button></div>
     </div>
   );
 }
@@ -109,7 +109,7 @@ function TlsStep(props: Pick<Props,
       {props.state.tlsServerName && !serverNameValid && <p role="alert" className="text-sm text-destructive">SNI 必须是 1–253 位 ASCII DNS 名称，不能是 IP 或通配符。</p>}
       {selected && serverNameValid && !covered && <p role="alert" className="text-sm text-destructive">所选证书的 DNS SAN 不覆盖该 SNI。</p>}
       <p className="rounded-lg border border-border/60 bg-muted/30 p-3 text-sm text-muted-foreground">分享链接会固定携带叶证书 pin，不使用 <code>allowInsecure</code>；证书轮换后需要重新分享。</p>
-      <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => props.onBackFromSecurity ? props.onBackFromSecurity() : props.onAction({ type: "BACK_SETUP" })}>返回传输</Button><Button type="button" disabled={!canContinue} onClick={() => props.onAction({ type: "GO_CLIENTS" })}>下一步：账户</Button></div>
+      <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => props.onBackFromSecurity ? props.onBackFromSecurity() : props.onAction({ type: "BACK_SETUP" })}>返回端口</Button><Button type="button" disabled={!canContinue} onClick={() => props.onAction({ type: "GO_CLIENTS" })}>下一步：账户</Button></div>
     </div>
   );
 }
@@ -125,7 +125,7 @@ function NoTransportSecurityStep({ onAction, onBackFromSecurity, accessKind }: P
           <dt className="text-muted-foreground">出站</dt><dd>唯一固定目标 · 默认 direct</dd>
         </dl>
         <p className="rounded-lg border border-border/60 bg-muted/30 p-3 text-sm text-muted-foreground">该入口不会暴露到公网，也不生成客户端、账户、分享或订阅；回环边界不提供传输加密。</p>
-        <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => onBackFromSecurity ? onBackFromSecurity() : onAction({ type: "BACK_SETUP" })}>返回传输</Button><Button type="button" onClick={() => onAction({ type: "GO_CLIENTS_NONE" })}>下一步：访问边界</Button></div>
+        <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => onBackFromSecurity ? onBackFromSecurity() : onAction({ type: "BACK_SETUP" })}>返回端口</Button><Button type="button" onClick={() => onAction({ type: "GO_CLIENTS_NONE" })}>下一步：访问边界</Button></div>
       </div>
     );
   }
@@ -139,7 +139,7 @@ function NoTransportSecurityStep({ onAction, onBackFromSecurity, accessKind }: P
           <dt className="text-muted-foreground">配置</dt><dd>服务端生成并分配 peer 地址</dd>
         </dl>
         <p className="rounded-lg border border-border/60 bg-muted/30 p-3 text-sm text-muted-foreground">界面不接受密钥、PSK 或网络参数输入；创建后按 peer 导出独立配置。</p>
-        <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => onBackFromSecurity ? onBackFromSecurity() : onAction({ type: "BACK_SETUP" })}>返回传输</Button><Button type="button" onClick={() => onAction({ type: "GO_CLIENTS_NONE" })}>下一步：peer</Button></div>
+        <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => onBackFromSecurity ? onBackFromSecurity() : onAction({ type: "BACK_SETUP" })}>返回端口</Button><Button type="button" onClick={() => onAction({ type: "GO_CLIENTS_NONE" })}>下一步：peer</Button></div>
       </div>
     );
   }
@@ -154,7 +154,7 @@ function NoTransportSecurityStep({ onAction, onBackFromSecurity, accessKind }: P
         </dl>
         <p role="alert" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm">{XRAY_HTTP_PLAINTEXT_AUTH_WARNING}</p>
         <p className="rounded-lg border border-border/60 bg-muted/30 p-3 text-sm text-muted-foreground">界面不接受用户名、密码、allowTransparent 或任意 JSON；创建后按账户生成独立代理地址。</p>
-        <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => onBackFromSecurity ? onBackFromSecurity() : onAction({ type: "BACK_SETUP" })}>返回传输</Button><Button type="button" onClick={() => onAction({ type: "GO_CLIENTS_NONE" })}>下一步：账户</Button></div>
+        <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => onBackFromSecurity ? onBackFromSecurity() : onAction({ type: "BACK_SETUP" })}>返回端口</Button><Button type="button" onClick={() => onAction({ type: "GO_CLIENTS_NONE" })}>下一步：账户</Button></div>
       </div>
     );
   }
@@ -169,7 +169,7 @@ function NoTransportSecurityStep({ onAction, onBackFromSecurity, accessKind }: P
         </dl>
         <p role="alert" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm">{XRAY_MIXED_PLAINTEXT_AUTH_WARNING}</p>
         <p className="rounded-lg border border-border/60 bg-muted/30 p-3 text-sm text-muted-foreground">界面不接受用户名、密码、UDP 或任意 JSON；创建后按账户生成 SOCKS5 和 HTTP 两个代理地址。</p>
-        <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => onBackFromSecurity ? onBackFromSecurity() : onAction({ type: "BACK_SETUP" })}>返回传输</Button><Button type="button" onClick={() => onAction({ type: "GO_CLIENTS_NONE" })}>下一步：账户</Button></div>
+        <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => onBackFromSecurity ? onBackFromSecurity() : onAction({ type: "BACK_SETUP" })}>返回端口</Button><Button type="button" onClick={() => onAction({ type: "GO_CLIENTS_NONE" })}>下一步：账户</Button></div>
       </div>
     );
   }
@@ -182,7 +182,7 @@ function NoTransportSecurityStep({ onAction, onBackFromSecurity, accessKind }: P
         <dt className="text-muted-foreground">传输</dt><dd>RAW / TCP</dd>
       </dl>
       <p className="rounded-lg border border-border/60 bg-muted/30 p-3 text-sm text-muted-foreground">界面不接受密钥、method 或任意 JSON 输入；创建后按账户生成独立分享链接。</p>
-      <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => onBackFromSecurity ? onBackFromSecurity() : onAction({ type: "BACK_SETUP" })}>返回传输</Button><Button type="button" onClick={() => onAction({ type: "GO_CLIENTS_NONE" })}>下一步：账户</Button></div>
+      <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => onBackFromSecurity ? onBackFromSecurity() : onAction({ type: "BACK_SETUP" })}>返回端口</Button><Button type="button" onClick={() => onAction({ type: "GO_CLIENTS_NONE" })}>下一步：账户</Button></div>
     </div>
   );
 }

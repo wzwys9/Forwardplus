@@ -154,7 +154,7 @@ export function XrayProfileSteps(props: Props) {
       {selected.advisoryCode === "WIREGUARD_BLOCKING_RISK" && <p role="alert" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm">{XRAY_WIREGUARD_BLOCKING_WARNING}</p>}
       {selected.advisoryCode === "PLAINTEXT_PROXY_AUTH_RISK" && <p role="alert" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm">{XRAY_HTTP_PLAINTEXT_AUTH_WARNING}</p>}
       {selected.advisoryCode === "PLAINTEXT_MIXED_AUTH_RISK" && <p role="alert" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm">{XRAY_MIXED_PLAINTEXT_AUTH_WARNING}</p>}
-      <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={props.onBack}>返回协议</Button><Button type="button" disabled={!serviceNameValid || !pathValid || !tunnelTargetValid} onClick={props.onNext}>下一步：配置安全</Button></div>
+      <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={props.onBack}>返回协议</Button><Button type="button" disabled={!serviceNameValid || !pathValid || !tunnelTargetValid} onClick={props.onNext}>下一步：检测端口</Button></div>
     </div>
   );
 }

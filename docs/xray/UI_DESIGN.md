@@ -1,6 +1,6 @@
 # Xray 面板设计
 
-状态：第一版界面已实施；多协议创建流程已批准并按 profile 垂直切片增量开放；DNSPod + Realm 快速配置界面已批准。与 `SPEC.md` 0.22 配套。
+状态：第一版界面已实施；多协议创建流程已批准并按 profile 垂直切片增量开放；DNSPod + Realm 快速配置界面已批准。与 `SPEC.md` 0.24 配套。
 
 ## 1. 导航
 
@@ -258,16 +258,17 @@ Xray：v26.3.27 · 运行中 · 4 个节点
 
 ## 12. 多协议创建流程
 
-多协议阶段把现有四步 Dialog 演进为 profile 驱动的宽 Dialog。信息架构借鉴 3X-UI 创建入站时的分区方式，但保留 ForwardX 的服务端 profile 权威和部署状态机。顶部固定为六个分区：
+多协议阶段把现有四步 Dialog 演进为 profile 驱动的宽 Dialog。信息架构借鉴 3X-UI 创建入站时的分区方式，但保留 ForwardX 的服务端 profile 权威和部署状态机。顶部固定为七个分区：
 
-1. `基础配置`：主机、节点名称、公网地址、监听端口和真实网络探测。
+1. `基础配置`：主机、节点名称和公网地址。
 2. `协议`：只显示 catalog 中至少存在一个可用 profile 的协议。
 3. `传输`：从当前协议的可用 profile 派生 RAW/gRPC/XHTTP 等选择，并仅显示对应严格字段。
-4. `安全`：从当前协议+传输的可用 profile 派生；Reality 显示目标扫描，TLS 显示受管证书选择，none 不显示伪安全字段。
-5. `账户`：协议专属账户/peer 名称；UUID、password、auth、key 等仍由服务端生成或按严格表单处理。
-6. `确认`：完整摘要、目标核心版本和部署 operation。
+4. `端口`：只在协议与传输已确定一个 profile 后可用；按 `listenerNetworks` 直接探测 TCP、UDP 或同端口 TCP+UDP。Hysteria 2 直接进入 UDP 探测，不先创建 TCP 探测。
+5. `安全`：从当前协议+传输的可用 profile 派生；Reality 显示目标扫描，TLS 显示受管证书选择，none 不显示伪安全字段。
+6. `账户`：协议专属账户/peer 名称；UUID、password、auth、key 等仍由服务端生成或按严格表单处理。
+7. `确认`：完整摘要、目标核心版本和部署 operation。
 
-分区允许返回已完成步骤；依赖未满足的后续分区禁用并显示原因。协议/传输/安全切换必须通过 catalog 选择一个确定 profile，清除不属于该 profile 的 `serviceName/path/serverName/certificateId/flow` 等字段；不得保留不可见旧值。界面不提供高级 JSON、嗅探、fallback 或路由。Vision 只在兼容 profile 中出现；协议变更不在编辑页原地转换，使用“创建替代节点”操作。
+分区允许返回已完成步骤；依赖未满足的后续分区禁用并显示原因。协议/传输/安全切换必须通过 catalog 选择一个确定 profile，清除不属于该 profile 的 `serviceName/path/serverName/certificateId/flow` 等字段；不得保留不可见旧值。若返回更改 profile 导致 listener network 变化，旧端口结果失效，但界面留在当前协议/传输分区；管理员主动进入端口分区后再按新网络检测。界面不提供高级 JSON、嗅探、fallback 或路由。Vision 只在兼容 profile 中出现；协议变更不在编辑页原地转换，使用“创建替代节点”操作。
 
 当前已开放 `VLESS_RAW_REALITY_VISION`、`VLESS_GRPC_REALITY`、`VLESS_XHTTP_REALITY` 与 `TROJAN_RAW_REALITY`。选择 gRPC 时只增加严格 `serviceName` 输入；选择 XHTTP 时只增加严格 `path` 输入并说明固定 auto、无高级字段；选择 Trojan 时不显示 password、shortId 或 flow 输入。Trojan 详情只展示 generic-only 账户及凭据“已配置（隐藏）”状态，CRUD/分享使用 generic access id；现有 Reality VLESS 仍使用旧客户端 id。
 

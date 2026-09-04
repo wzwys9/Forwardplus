@@ -1,12 +1,13 @@
 import { Check } from "lucide-react";
 
-export const XRAY_CREATE_SECTIONS = ["BASIC", "PROTOCOL", "TRANSPORT", "SECURITY", "ACCOUNT", "CONFIRM"] as const;
+export const XRAY_CREATE_SECTIONS = ["BASIC", "PROTOCOL", "TRANSPORT", "PORT", "SECURITY", "ACCOUNT", "CONFIRM"] as const;
 export type XrayCreateSection = typeof XRAY_CREATE_SECTIONS[number];
 
 const labels: Record<XrayCreateSection, string> = {
   BASIC: "基础配置",
   PROTOCOL: "协议",
   TRANSPORT: "传输",
+  PORT: "端口",
   SECURITY: "安全",
   ACCOUNT: "账户",
   CONFIRM: "确认",
@@ -30,7 +31,7 @@ export function XrayCreateSectionNav(props: {
   const activeIndex = XRAY_CREATE_SECTIONS.indexOf(props.active);
   return (
     <nav aria-label="创建节点配置分区" className="-mx-1 overflow-x-auto px-1">
-      <ol className="flex min-w-[680px] border-b border-border/70">
+      <ol className="flex min-w-[780px] border-b border-border/70">
         {XRAY_CREATE_SECTIONS.map((section, index) => {
           const enabled = props.enabled.has(section);
           const completed = index < activeIndex && enabled;

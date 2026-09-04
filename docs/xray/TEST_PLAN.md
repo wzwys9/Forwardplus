@@ -133,7 +133,9 @@ TASK057 端口资源归属补充只跑聚焦矩阵：一个 SQLite repository �
 - 节点/运行环境 tabs 可通过 URL 状态恢复。
 - 列表 loading skeleton、空状态、错误重试和分页正常。
 - 离线/不兼容主机显示但禁选，并有可见原因。
-- 创建四步骤键盘可操作，提交失败保留输入。
+- 创建向导各步骤键盘可操作，提交失败保留输入。
+- 多协议创建顺序为基础配置、协议、传输、端口、安全、账户、确认；未确定 profile 时不发起端口探测。
+- Hysteria 2/WireGuard/mKCP 首次端口检测直接使用 UDP，Shadowsocks TCP+UDP 在同一端口分别取得两项预留；返回更改 listener network 后不自动跳回基础配置。
 - operation 页面刷新后继续显示真实阶段，终态停止轮询。
 - Agent offline 显示“状态未知”而非“已停止”。
 - 多客户端增删、启停、分享和二维码交互正确。

@@ -14,9 +14,11 @@ import {
   type XrayCreateAction,
   type XrayCreateState,
   type XrayHostOption,
+  xrayBasicSetupReady,
 } from "./xrayCreateFlow";
 
 type Props = {
+  section: "BASIC" | "PORT";
   state: XrayCreateState;
   hosts: XrayHostOption[];
   hostsLoading: boolean;
@@ -25,7 +27,8 @@ type Props = {
   listenerNetworks?: readonly ("TCP" | "UDP")[];
   onAction: (action: XrayCreateAction) => void;
   onProbe: () => void;
-  onPortReady?: () => void;
+  onBack?: () => void;
+  onNext: () => void;
 };
 
 function HostStep({
@@ -33,10 +36,10 @@ function HostStep({
   hosts,
   hostsLoading,
   onAction,
-}: Omit<Props, "now" | "onProbe">) {
+  onNext,
+}: Omit<Props, "now" | "onProbe" | "onBack">) {
   const selected = hosts.find((host) => host.id === state.hostId);
-  const canContinue = !!selected?.canCreateXrayInbound && state.name.trim().length > 0
-    && state.name.trim().length <= 128 && state.publicAddress.trim().length > 0 && state.publicAddress.trim().length <= 253;
+  const canContinue = xrayBasicSetupReady(state, hosts);
   return (
     <div className="space-y-5">
       <div><h3 className="font-semibold">主机和基本信息</h3><p className="mt-1 text-sm text-muted-foreground">不可用主机仍会显示原因，但不能进入部署流程。</p></div>
@@ -56,7 +59,7 @@ function HostStep({
         <div className="space-y-1.5"><Label htmlFor="xray-create-address">公网地址</Label><Input id="xray-create-address" maxLength={253} value={state.publicAddress} onChange={(event) => onAction({ type: "SET_PUBLIC_ADDRESS", value: event.target.value })} placeholder="公网 IPv4 或域名" /></div>
       </div>
       {selected && !selected.canCreateXrayInbound && <p role="alert" className="flex gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" aria-hidden={true} />{hostUnavailableMessage(selected)}；已填写内容会保留。</p>}
-      <div className="flex justify-end"><Button type="button" disabled={!canContinue} onClick={() => onAction({ type: "GO_TO_PORT" })}>下一步：检测端口</Button></div>
+      <div className="flex justify-end"><Button type="button" disabled={!canContinue} onClick={onNext}>下一步：选择协议</Button></div>
     </div>
   );
 }
@@ -81,7 +84,7 @@ function ProbeStatus({ network, probe }: {
   );
 }
 
-function PortStep({ state, hosts, now, listenerNetwork = "TCP", listenerNetworks, onAction, onProbe, onPortReady }: Omit<Props, "hostsLoading">) {
+function PortStep({ state, hosts, now, listenerNetwork = "TCP", listenerNetworks, onAction, onProbe, onBack, onNext }: Omit<Props, "hostsLoading">) {
   const host = hosts.find((item) => item.id === state.hostId);
   const networks = listenerNetworks ?? [listenerNetwork];
   const dualNetwork = networks.length === 2;
@@ -106,12 +109,12 @@ function PortStep({ state, hosts, now, listenerNetwork = "TCP", listenerNetworks
         {dualNetwork && <ProbeStatus network={networks[1] ?? "UDP"} probe={secondaryProbe} />}
       </div>
       {host && !host.canCreateXrayInbound && <p role="alert" className="text-sm text-destructive">{hostUnavailableMessage(host)}；已保留表单，请恢复后重试。</p>}
-      <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={() => onAction({ type: "GO_TO_HOST" })}>返回上一步</Button><Button type="button" disabled={!canProbe} onClick={onProbe}>{probe.canReprobe && probe.phase !== "IDLE" ? `重新探测${dualNetwork ? " TCP + UDP" : ""}` : state.portMode === "AUTO" ? `自动检测${dualNetwork ? "同端口" : "可用端口"}` : "检测并预留端口"}</Button></div>
-      {ready && <div className="flex justify-end"><Button type="button" onClick={onPortReady}>下一步：选择协议</Button></div>}
+      <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"><Button type="button" variant="outline" onClick={onBack}>返回传输</Button><Button type="button" disabled={!canProbe} onClick={onProbe}>{probe.canReprobe && probe.phase !== "IDLE" ? `重新探测${dualNetwork ? " TCP + UDP" : ""}` : state.portMode === "AUTO" ? `自动检测${dualNetwork ? "同端口" : "可用端口"}` : "检测并预留端口"}</Button></div>
+      {ready && <div className="flex justify-end"><Button type="button" onClick={onNext}>下一步：配置安全</Button></div>}
     </div>
   );
 }
 
 export function XrayHostPortSteps(props: Props) {
-  return props.state.step === 1 ? <HostStep {...props} /> : <PortStep {...props} />;
+  return props.section === "BASIC" ? <HostStep {...props} /> : <PortStep {...props} />;
 }

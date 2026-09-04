@@ -73,8 +73,8 @@ test("mKCP UI identifies UDP, exposes no tuning fields, and explains an Agent ca
   assert.match(gatedMarkup, /需要升级 Agent 以支持 UDP 端口探测和监听确认/);
 
   let state = reduceXrayCreateState(initialXrayCreateState(), { type: "SELECT_HOST", host: hosts[0] });
-  state = reduceXrayCreateState(state, { type: "GO_TO_PORT" });
   const portMarkup = renderToStaticMarkup(<XrayHostPortSteps
+    section="PORT"
     state={state}
     hosts={hosts}
     hostsLoading={false}
@@ -82,8 +82,36 @@ test("mKCP UI identifies UDP, exposes no tuning fields, and explains an Agent ca
     listenerNetwork="UDP"
     onAction={() => undefined}
     onProbe={() => undefined}
+    onBack={() => undefined}
+    onNext={() => undefined}
   />);
   assert.match(portMarkup, /UDP 端口检测与短期预留/);
+});
+
+test("Hysteria 2 reaches its first port check as UDP after profile selection", () => {
+  const hysteriaProfile = {
+    id: "HYSTERIA2_TLS", protocol: "HYSTERIA2", transport: "HYSTERIA", security: "TLS", clientFlow: "NONE",
+    listenerNetworks: ["UDP"] as const, clientCredentialType: "HYSTERIA_AUTH", shareFormat: "HYSTERIA2_URI",
+    testedCoreVersion: "v26.3.27" as const, isAvailable: true, unavailableReasonCode: null,
+  } as const;
+  const state = reduceXrayCreateState(initialXrayCreateState(), { type: "SELECT_HOST", host: hosts[0] });
+  const markup = renderToStaticMarkup(<XrayHostPortSteps
+    section="PORT"
+    state={state}
+    hosts={hosts}
+    hostsLoading={false}
+    now={Date.now()}
+    listenerNetworks={hysteriaProfile.listenerNetworks}
+    onAction={() => undefined}
+    onProbe={() => undefined}
+    onBack={() => undefined}
+    onNext={() => undefined}
+  />);
+
+  assert.equal(listenerNetworkForXrayProfile(hysteriaProfile), "UDP");
+  assert.match(markup, /UDP 端口检测与短期预留/);
+  assert.match(markup, /返回传输/);
+  assert.doesNotMatch(markup, /TCP 端口检测/);
 });
 
 test("Shadowsocks dual-network UI distinguishes TCP from same-port TCP plus UDP", () => {
@@ -112,7 +140,6 @@ test("Shadowsocks dual-network UI distinguishes TCP from same-port TCP plus UDP"
   assert.match(profileMarkup, /TCP \+ UDP/);
 
   let state = reduceXrayCreateState(initialXrayCreateState(), { type: "SELECT_HOST", host: hosts[0] });
-  state = reduceXrayCreateState(state, { type: "GO_TO_PORT" });
   state = reduceXrayCreateState(state, { type: "PROBE_QUEUED", operationId: "probe-tcp" });
   state = reduceXrayCreateState(state, { type: "PROBE_RESERVED", selectedPort: 24443, reservationId: "reservation-tcp", expiresAt: "2026-09-01T00:10:00Z" });
   assert.deepEqual(nextSecondaryPortProbeInput(state, dualProfile.listenerNetworks, Date.parse("2026-09-01T00:05:00Z")), {
@@ -130,6 +157,7 @@ test("Shadowsocks dual-network UI distinguishes TCP from same-port TCP plus UDP"
   assert.deepEqual(currentXrayPortReplacementIds(state), ["reservation-tcp", "reservation-udp"]);
 
   const portMarkup = renderToStaticMarkup(<XrayHostPortSteps
+    section="PORT"
     state={state}
     hosts={hosts}
     hostsLoading={false}
@@ -137,16 +165,18 @@ test("Shadowsocks dual-network UI distinguishes TCP from same-port TCP plus UDP"
     listenerNetworks={dualProfile.listenerNetworks}
     onAction={() => undefined}
     onProbe={() => undefined}
+    onBack={() => undefined}
+    onNext={() => undefined}
   />);
   assert.match(portMarkup, /TCP \+ UDP 同端口检测与短期预留/);
   assert.match(portMarkup, /TCP[^<]*已预留|TCP[\s\S]*端口可用/);
   assert.match(portMarkup, /UDP[^<]*已预留|UDP[\s\S]*端口可用/);
-  assert.match(portMarkup, /下一步：选择协议/);
+  assert.match(portMarkup, /下一步：配置安全/);
 
   const reset = reduceXrayCreateState(state, { type: "RESET_PROBE" });
   assert.equal(reset.probe.phase, "IDLE");
   assert.equal(reset.secondaryProbe.phase, "IDLE");
-  assert.deepEqual(currentXrayPortReplacementIds(reset), []);
+  assert.deepEqual(currentXrayPortReplacementIds(reset), ["reservation-tcp", "reservation-udp"]);
 });
 
 test("create flow preserves draft through offline failure and reservation expiry", () => {
@@ -232,12 +262,11 @@ test("host and port steps keep unavailable hosts visible with reasons and waitin
   let state = reduceXrayCreateState(initialXrayCreateState(), { type: "SELECT_HOST", host: hosts[0] });
   state = reduceXrayCreateState(state, { type: "SET_NAME", value: "香港 Reality" });
   const hostMarkup = renderToStaticMarkup(
-    <XrayHostPortSteps state={state} hosts={hosts} hostsLoading={false} now={Date.now()} onAction={() => undefined} onProbe={() => undefined} />,
+    <XrayHostPortSteps section="BASIC" state={state} hosts={hosts} hostsLoading={false} now={Date.now()} onAction={() => undefined} onProbe={() => undefined} onNext={() => undefined} />,
   );
-  state = reduceXrayCreateState(state, { type: "GO_TO_PORT" });
   state = reduceXrayCreateState(state, { type: "PROBE_QUEUED", operationId: "probe-1" });
   const portMarkup = renderToStaticMarkup(
-    <XrayHostPortSteps state={state} hosts={hosts} hostsLoading={false} now={Date.now()} onAction={() => undefined} onProbe={() => undefined} />,
+    <XrayHostPortSteps section="PORT" state={state} hosts={hosts} hostsLoading={false} now={Date.now()} onAction={() => undefined} onProbe={() => undefined} onBack={() => undefined} onNext={() => undefined} />,
   );
   assert.match(hostMarkup, /日本-02/);
   assert.match(hostMarkup, /Agent 离线，无法检测端口或部署/);
@@ -246,11 +275,13 @@ test("host and port steps keep unavailable hosts visible with reasons and waitin
   assert.match(hostMarkup, /disabled/);
   assert.match(hostMarkup, /香港 Reality/);
   assert.doesNotMatch(hostMarkup, /协议配置|VLESS · RAW · Reality/);
+  assert.match(hostMarkup, /下一步：选择协议/);
+  assert.doesNotMatch(hostMarkup, /自动分配|手动端口|检测并预留端口/);
   assert.match(portMarkup, /等待 Agent 探测端口/);
 
   const offlineHosts = hosts.map((host) => host.id === 1 ? { ...host, isOnline: false, canCreateXrayInbound: false, unavailableReasonCode: "AGENT_OFFLINE" as const } : host);
   const offlineMarkup = renderToStaticMarkup(
-    <XrayHostPortSteps state={{ ...state, step: 1 }} hosts={offlineHosts} hostsLoading={false} now={Date.now()} onAction={() => undefined} onProbe={() => undefined} />,
+    <XrayHostPortSteps section="BASIC" state={state} hosts={offlineHosts} hostsLoading={false} now={Date.now()} onAction={() => undefined} onProbe={() => undefined} onNext={() => undefined} />,
   );
   assert.match(offlineMarkup, /Agent 离线，无法检测端口或部署；已填写内容会保留/);
   assert.match(offlineMarkup, /value="香港 Reality"/);
