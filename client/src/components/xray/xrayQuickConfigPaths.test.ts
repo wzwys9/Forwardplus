@@ -40,6 +40,17 @@ test("相同路径跨运营商复用合法，DNS 示意只取入口", () => {
   assert.deepEqual(result.dnsEntries.map((entry) => entry.address), Array(4).fill("192.0.2.1"));
 });
 
+test("受管落地主机可作为唯一直达入口，不产生自我转发段", () => {
+  const paths = emptyQuickConfigPaths();
+  for (const carrier of Object.keys(paths) as Array<keyof typeof paths>) {
+    paths[carrier] = [{ id: carrier, hops: ["4:IPV4"] }];
+  }
+  const result = inspectQuickConfigPaths(paths, hosts, 4);
+  assert.deepEqual(result.issues, []);
+  assert.equal(result.uniqueForwardHostCount, 0);
+  assert.equal(result.dnsEntries.length, 4);
+});
+
 test("同主机双地址族不同下一跳、跨路径环路均标记冲突", () => {
   const paths = emptyQuickConfigPaths();
   paths.TELECOM = [{ id: "t", hops: ["1:IPV4", "2:IPV4"] }];
