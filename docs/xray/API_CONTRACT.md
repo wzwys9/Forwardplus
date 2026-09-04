@@ -825,9 +825,9 @@ type QuickConfigPreviewDto = {
   dnsRecords: Array<(
     | { routeKind: "CARRIER"; carrier: "TELECOM" | "UNICOM" | "MOBILE" | "EDUCATION" }
     | { routeKind: "DEFAULT"; carrier: null }
-  ) & { providerLineId: string; recordType: "A" | "AAAA"; value: string; ttl: number; action: "CREATE" | "REPLACE" }>;
+  ) & { providerLineId: string; recordType: "A" | "AAAA"; value: string; ttl: number; action: "CREATE" | "REPLACE" | "REUSE" }>;
   conflictingRecords: Array<
-    | (DomainRecordProjection & { recordType: "A" | "AAAA"; action: "REPLACE" })
+    | (DomainRecordProjection & { recordType: "A" | "AAAA"; action: "REPLACE" | "DELETE" })
     | (DomainRecordProjection & { recordType: "CNAME"; action: "DELETE" })
   >;
   preservedRecords: DomainRecordProjection[];
@@ -839,6 +839,8 @@ type QuickConfigPreviewDto = {
 ```
 
 token 最长 5 分钟并绑定上述全部规范输入、目标/account/catalog/record-set revision、probe results 和管理员。
+
+编辑时 `REUSE` 由服务端实时读取和当前活动拓扑的 recordId/tuple/hash 归属证明派生，浏览器不能提交复用身份。先为全部一致记录一对一保留，再为变化记录分配剩余同类型记录；`conflictingRecords` 只包含真正修改或删除的记录，复用项不在其中。执行端保留现有持久 DNS 步骤类型，但一致记录只验证、不执行 provider 写入。
 
 `xray.quickConfigs.createApply({ previewToken })` 在重新验证 token、账号有效期、targetVersion、domain record-set、host/capability、probe TTL 和端口账本后，事务性取得 domain claim/global allocation，建立 immutable topology 和持久 operation。任何检查后竞态均零外部写入失败；响应 `{ quickConfigId, operationId, state:"APPLYING" }`。浏览器不能在 apply 时重传或覆盖 DNS/rule 计划。`apply` 是 tRPC 路由保留字，不得作为 procedure 名称。
 

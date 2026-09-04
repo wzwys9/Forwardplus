@@ -259,6 +259,8 @@
 
 ### 3.17 DNSPod 全局账号与出口快速配置
 
+- `XRAY-QC-031` 编辑预览按当前配置所有权与完整 FQDN/type/动态 lineId/value/TTL 区分复用、新建、修改和删除。仅当前活动拓扑严格拥有且启用、tuple/hash 一致的远端记录允许显示复用，不列入替换/删除清单。执行先保护所有一致记录的 providerId，复用只读取验证与转移本地拓扑归属，不向 DNSPod 重复 create/update/delete；变化项不得抢占稍后待复用的记录。最终提交仍重验远端快照、归属和 revision；第三方、重复或漂移记录不得凭值相同自动接管。
+
 - `XRAY-QC-001` 快速配置只允许管理员使用。系统设置新增独立 DNS 服务商账户；首版 provider 固定为 DNSPod 且全局只允许一个启用账户，但账户、zone、line 和 secret 数据模型不得把“一个账号”编码成不可扩展的单例结构。
 - `XRAY-QC-002` DNSPod `SecretId` 与 `SecretKey` 都按凭据处理，使用稳定账户身份绑定的版本化 AEAD envelope 保存；普通设置 DTO 只返回已配置/验证状态和掩码。既有 DDNS 的明文 `system_settings` 凭据不得成为快速配置的权威来源，也不得在迁移时静默复制后继续保留第二份明文。
 - `XRAY-QC-003` DNSPod 客户端复用用户提供的 `~/dnspod_test` 已验证 TC3 行为作为只读参考，固定官方 endpoint/service/version、超时、有限重试、响应大小和稳定错误映射；域名、记录类型及运营商 line/lineId 必须从 API 动态获取并缓存，不硬编码套餐相关 lineId，不增加生产依赖。

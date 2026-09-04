@@ -1,5 +1,13 @@
 # Xray 测试计划
 
+## MAINT-024 编辑 DNS 差量复用关键回归
+
+- 10 条自身托管 A 完全一致及顺序改变：预览全部 REUSE，无替换/删除；执行零 provider 写。
+- 原 10 条 A 加一条 AAAA：只显示/执行 1 次创建，原 10 个 providerId 保留。
+- 修改项排在一致项前：先保留一致项，执行只修改对应变化记录；旧拓扑交出 providerId，不被旧配置清理误删。
+- TTL/动态线路变化、第三方同值、CNAME 删除不误标复用；重复记录继续 fail closed。
+- 本地 SQLite + fake provider 定向回归即可，不以真实 DNS 变更或全量 Agent 矩阵作为本维护门禁。
+
 状态：已批准。测试名称和命令在实施任务中补充，但验收场景不得删除或弱化；TASK057 采用风险聚焦的精简矩阵。与 `SPEC.md` 0.22 配套。
 
 TASK057 端口资源归属补充只跑聚焦矩阵：一个 SQLite repository 目标覆盖 A 唯一资源复用、B 自动资源、引用数、重复收敛和停用拒绝；schema 目标检查新增列/索引及 MySQL/PostgreSQL 描述；前端以 TypeScript 和一次相关页面构建验证移除主机投影、计数和开关锁定。Agent payload 未变化，不因此运行 Go 全量或 Xray 协议矩阵。
