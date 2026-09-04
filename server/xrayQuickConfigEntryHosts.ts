@@ -119,6 +119,10 @@ function publicIpv6(value: unknown): string | null {
   return address;
 }
 
+export function normalizeQuickConfigPublicIp(value: unknown, family: "IPV4" | "IPV6"): string | null {
+  return family === "IPV4" ? publicIpv4(value) : publicIpv6(value);
+}
+
 function hostEndpoints(row: EntryHostRow): QuickConfigEntryHostEndpoint[] {
   const ipv4 = publicIpv4(row.ipv4) ?? publicIpv4(row.primaryAddress);
   const ipv6 = publicIpv6(row.ipv6) ?? publicIpv6(row.primaryAddress);
