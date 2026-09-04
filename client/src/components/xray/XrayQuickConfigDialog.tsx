@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, Clock3, Globe2, Loader2, Network, Server } from "lucide-react";
+import { filterQuickConfigPathEngines } from "@shared/xrayQuickConfigForwardEngines";
+import { XrayQuickConfigCarrierPaths } from "./XrayQuickConfigCarrierPaths";
+import { quickConfigPathInput, quickConfigPathsFromEntries } from "./xrayQuickConfigPaths";
+import { AlertTriangle, CheckCircle2, Clock3, Globe2, Loader2, Network } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -26,7 +29,6 @@ import {
   XRAY_QUICK_CONFIG_STEPS,
   xrayQuickConfigCarriersComplete,
   xrayQuickConfigEditIdentity,
-  xrayQuickConfigEndpointKey,
   type XrayQuickConfigCarrier,
   type XrayQuickConfigDomainCheck,
   type XrayQuickConfigEntryHost,
@@ -50,13 +52,6 @@ const carrierLabels: Record<XrayQuickConfigCarrier, string> = {
   EDUCATION: "教育网",
 };
 
-const entryReasonLabels: Record<string, string> = {
-  HOST_OFFLINE: "Agent 离线或心跳已过期",
-  AGENT_CAPABILITY_MISSING: "Agent 缺少端口检查能力",
-  UDP_CAPABILITY_REQUIRED: "需要升级 Agent 以支持 UDP 端口检查",
-  QUICK_CONFIG_HOST_UNAVAILABLE: "Realm 未启用或主机没有有效公网地址",
-};
-
 const domainErrorLabels: Record<string, string> = {
   DOMAIN_INVALID: "域名格式无效，请只填写相对主机记录。",
   DOMAIN_CHECK_INVALID: "域名检查已失效，请重新检查。",
@@ -77,6 +72,7 @@ const planningErrorLabels: Record<string, string> = {
   QUICK_CONFIG_TARGET_CHANGED: "落地节点配置已变化，请关闭向导后重新选择。",
   QUICK_CONFIG_TARGET_UNSUPPORTED: "落地节点当前不可用于快速配置。",
   QUICK_CONFIG_HOST_UNAVAILABLE: "入口主机不可用，请返回并调整运营商入口。",
+  QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED: "当前路径或新端口需要跨 IPv4/IPv6 转发，或落地使用域名；请返回选择 Realm、GOST 等进程型引擎。",
   HOST_OFFLINE: "有入口服务器已离线，请恢复后重新检测。",
   UDP_CAPABILITY_REQUIRED: "有入口服务器缺少 UDP 检测能力，请升级 Agent。",
   GLOBAL_PORT_PROBE_FAILED: "端口检测失败，请稍后重试。",
@@ -95,6 +91,7 @@ const engineReasonLabels: Record<string, string> = {
   UDP_CAPABILITY_REQUIRED: "至少一台服务器缺少 UDP 端口检查能力",
   QUICK_CONFIG_HOST_UNAVAILABLE: "至少一台服务器当前不满足转发前置条件",
   QUICK_CONFIG_ADDRESS_UNAVAILABLE: "所选 IPv4/IPv6 地址无法由该引擎共同使用",
+  QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED: "路径包含跨 IPv4/IPv6 转发或域名落地，请选择 Realm、GOST 等进程型引擎",
 };
 
 function safeErrorCode(error: unknown) {
@@ -115,7 +112,7 @@ function safePlanningError(error: unknown) {
 type CarrierRoutesInput = Array<{
   carrier: XrayQuickConfigCarrier;
   providerLineId: string;
-  endpoints: Array<{ hostId: number; addressFamily: "IPV4" | "IPV6" }>;
+  endpoints: Array<{ hostId: number; addressFamily: "IPV4" | "IPV6"; relays?: Array<{ hostId: number; addressFamily: "IPV4" | "IPV6" }> }>;
 }>;
 
 function selectedCarrierRoutes(
@@ -123,15 +120,16 @@ function selectedCarrierRoutes(
   zone: DnsZone | undefined,
 ): CarrierRoutesInput | null {
   const routes: CarrierRoutesInput = [];
+  const paths = state.carrierPaths ?? quickConfigPathsFromEntries(state.carrierEndpoints);
   for (const carrier of XRAY_QUICK_CONFIG_CARRIERS) {
     const line = zone?.carrierLines.find((item) => item.category === carrier);
     if (!line || line.status !== "AVAILABLE") return null;
-    const endpoints = state.carrierEndpoints[carrier].flatMap((key) => {
-      const [rawHostId, addressFamily] = key.split(":");
-      const hostId = Number(rawHostId);
-      if (!Number.isSafeInteger(hostId) || hostId <= 0 || (addressFamily !== "IPV4" && addressFamily !== "IPV6")) return [];
-      return [{ hostId, addressFamily } satisfies CarrierRoutesInput[number]["endpoints"][number]];
-    });
+    const endpoints: CarrierRoutesInput[number]["endpoints"] = [];
+    for (const path of paths[carrier]) {
+      const endpoint = quickConfigPathInput(path);
+      if (!endpoint) return null;
+      endpoints.push(endpoint);
+    }
     if (endpoints.length === 0) return null;
     routes.push({ carrier, providerLineId: line.providerLineId, endpoints });
   }
@@ -141,8 +139,8 @@ function selectedCarrierRoutes(
 function selectedEngineEntries(routes: CarrierRoutesInput | null) {
   if (!routes) return [];
   const entries = new Map<string, { hostId: number; addressFamily: "IPV4" | "IPV6" }>();
-  for (const endpoint of routes.flatMap((route) => route.endpoints)) {
-    entries.set(`${endpoint.hostId}:${endpoint.addressFamily}`, endpoint);
+  for (const endpoint of routes.flatMap((route) => route.endpoints.flatMap(entry => [entry, ...(entry.relays ?? [])]))) {
+    entries.set(`${endpoint.hostId}:${endpoint.addressFamily}`, { hostId: endpoint.hostId, addressFamily: endpoint.addressFamily });
   }
   return [...entries.values()].sort((left, right) => left.hostId - right.hostId
     || left.addressFamily.localeCompare(right.addressFamily));
@@ -352,67 +350,6 @@ function DomainStep(props: {
   );
 }
 
-function CarrierStep(props: {
-  state: ReturnType<typeof initialXrayQuickConfigFlowState>;
-  zone: DnsZone | undefined;
-  hosts: XrayQuickConfigEntryHost[];
-  loading: boolean;
-  error: boolean;
-  confirmedValid: boolean;
-  onToggle: (carrier: XrayQuickConfigCarrier, endpointKey: string) => void;
-  onBack: () => void;
-  onNext: () => void;
-  onRetry: () => void;
-}) {
-  const complete = xrayQuickConfigCarriersComplete(props.state);
-  if (props.loading) return <div className="space-y-5"><div className="space-y-3" aria-busy="true" aria-label="正在加载入口主机"><Skeleton className="h-24 w-full" /><Skeleton className="h-24 w-full" /><Skeleton className="h-24 w-full" /></div><Button type="button" variant="outline" onClick={props.onBack}>返回：域名</Button></div>;
-  if (props.error) return <div className="space-y-5"><Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>入口主机加载失败</AlertTitle><AlertDescription className="space-y-3"><p>请检查面板连接后重试。</p><Button type="button" size="sm" variant="outline" onClick={props.onRetry}>重新加载</Button></AlertDescription></Alert><Button type="button" variant="outline" onClick={props.onBack}>返回：域名</Button></div>;
-  return (
-    <div className="space-y-5">
-      <div><h3 className="font-semibold">为四类运营商选择入口</h3><p className="mt-1 text-sm text-muted-foreground">每类至少选择一个“服务器 + 地址族”。同一服务器的 IPv4/IPv6 与多条线路会共用一个统一转发 listener。</p></div>
-      {!props.confirmedValid && <Alert variant="destructive"><Clock3 className="h-4 w-4" /><AlertTitle>域名确认已过期</AlertTitle><AlertDescription>可以查看已选入口，但继续前需要返回域名步骤重新检查。</AlertDescription></Alert>}
-      {XRAY_QUICK_CONFIG_CARRIERS.map((carrier) => {
-        const line = props.zone?.carrierLines.find((item) => item.category === carrier);
-        return (
-          <fieldset key={carrier} className="rounded-lg border border-border/60 p-4">
-            <legend className="px-1 text-sm font-semibold">{carrierLabels[carrier]}</legend>
-            <p className="mb-3 text-xs text-muted-foreground">{line?.status === "AVAILABLE" ? `DNSPod 线路：${line.name}` : "该运营商线路目录不可用"}</p>
-            <div className="grid gap-2 sm:grid-cols-2">
-              {props.hosts.flatMap((host) => host.endpoints.length > 0
-                ? host.endpoints.map((endpoint) => {
-                    const key = xrayQuickConfigEndpointKey(host.hostId, endpoint.addressFamily);
-                    const selected = props.state.carrierEndpoints[carrier].includes(key);
-                    return (
-                      <button
-                        key={key}
-                        type="button"
-                        disabled={!host.eligible || line?.status !== "AVAILABLE"}
-                        aria-pressed={selected}
-                        onClick={() => props.onToggle(carrier, key)}
-                        className="flex min-w-0 items-start gap-3 rounded-lg border border-border/60 p-3 text-left transition-colors enabled:hover:bg-muted/60 disabled:cursor-not-allowed disabled:opacity-55 aria-pressed:border-primary aria-pressed:bg-primary/5"
-                      >
-                        <Server className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
-                        <span className="min-w-0">
-                          <span className="block truncate text-sm font-medium">{host.name} · {endpoint.addressFamily === "IPV4" ? "IPv4" : "IPv6"}</span>
-                          <span className="mt-0.5 block break-all font-mono text-xs text-muted-foreground">{endpoint.address}</span>
-                          {!host.eligible && <span className="mt-1 block text-xs text-destructive">{entryReasonLabels[host.disabledReasonCode ?? ""] ?? "该主机暂不可用"}</span>}
-                        </span>
-                      </button>
-                    );
-                  })
-                : [<div key={`${host.hostId}:empty`} className="rounded-lg border border-dashed p-3 text-sm text-muted-foreground"><span className="font-medium text-foreground">{host.name}</span><br />没有有效公网 IPv4/IPv6</div>])}
-            </div>
-            {props.hosts.length === 0 && <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">暂无受管入口主机。</p>}
-          </fieldset>
-        );
-      })}
-      <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
-        <Button type="button" variant="outline" onClick={props.onBack}>返回：域名</Button>
-        <Button type="button" disabled={!complete || !props.confirmedValid} onClick={props.onNext}>下一步：转发引擎</Button>
-      </div>
-    </div>
-  );
-}
 
 type ForwardEngineCatalog = AppRouterOutputs["xray"]["quickConfigs"]["forwardEngines"];
 
@@ -470,14 +407,14 @@ function PortStep(props: {
     && (props.manualPort.length > 0 || (result?.status === "CONFLICT" && result.resolution === "MANUAL"));
   return (
     <div className="space-y-5">
-      <div><h3 className="font-semibold">检查统一对外端口</h3><p className="mt-1 text-sm text-muted-foreground">先核对全局端口账本，再由所有需要转发的入口并行检查 TCP 和 UDP。检查结果短期有效。</p></div>
+      <div><h3 className="font-semibold">检查统一对外端口</h3><p className="mt-1 text-sm text-muted-foreground">先核对全局端口账本，再由全部入口和中转服务器并行检查 TCP 和 UDP。所有段使用同一端口，末段连接落地原端口；检查结果短期有效。</p></div>
       {props.busy && <Alert><Loader2 className="h-4 w-4 animate-spin" /><AlertTitle>正在检测端口 {success?.selectedPort ?? props.target.endpoint.port}</AlertTitle><AlertDescription>{props.progress ? `已完成 ${props.progress.completedHosts} / ${props.progress.totalHosts} 台入口服务器` : "正在创建各入口的 TCP/UDP 检测任务…"}</AlertDescription></Alert>}
       {props.error && <Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>端口检测失败</AlertTitle><AlertDescription>{props.error}</AlertDescription></Alert>}
       {result?.status === "CONFLICT" && (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>端口 {result.requestedPort} 存在冲突</AlertTitle>
-          <AlertDescription>{result.resolution === "MANUAL" ? "请选择一个新的统一对外端口。" : `系统推荐端口 ${result.recommendation.port}，确认后会再次检查所有入口。`}</AlertDescription>
+          <AlertDescription>{result.resolution === "MANUAL" ? "请选择一个新的统一对外端口。修改已有路径的下一跳时，也需要新端口以保留旧链路。" : `系统推荐端口 ${result.recommendation.port}，确认后会再次检查全部入口和中转。`}</AlertDescription>
         </Alert>
       )}
       {result?.status === "FAILED" && <Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>检测未通过</AlertTitle><AlertDescription>{planningErrorLabels[result.reasonCode] ?? result.reasonCode}</AlertDescription></Alert>}
@@ -655,6 +592,10 @@ export function XrayQuickConfigDialog(props: {
     refetchInterval: state.step === "ENGINE" ? 15_000 : false,
     refetchOnWindowFocus: true,
   });
+  const directLandingHostId = !state.manualPort || Number(state.manualPort) === props.target.endpoint.port
+    ? props.target.host?.id : undefined;
+  const engineCatalog = useMemo(() => filterQuickConfigPathEngines(engineQuery.data,
+    carrierRoutes?.flatMap(route => route.endpoints.map(endpoint => [endpoint, ...(endpoint.relays ?? [])])) ?? [], props.target.endpoint.address, directLandingHostId), [engineQuery.data, carrierRoutes, props.target.endpoint.address, directLandingHostId]);
   const portResultQuery = trpc.xray.quickConfigs.portChecksResult.useQuery({ portCheckId: state.portCheckId ?? "" }, {
     enabled: !!state.portCheckId,
     retry: false,
@@ -701,7 +642,7 @@ export function XrayQuickConfigDialog(props: {
   }, [portResultQuery.error]);
 
   useEffect(() => {
-    const catalog = engineQuery.data;
+    const catalog = engineCatalog;
     if (!catalog || engineEntries.length === 0) return;
     if (state.engine) {
       const selected = catalog.items.find((item) => item.engine === state.engine);
@@ -715,7 +656,7 @@ export function XrayQuickConfigDialog(props: {
     autoEngineDraftRef.current = engineDraftKey;
     const preferred = catalog.items.find((item) => item.engine === (props.edit?.engine ?? catalog.defaultEngine));
     if (preferred?.eligible) dispatch({ type: "SET_ENGINE", engine: preferred.engine });
-  }, [engineDraftKey, engineEntries.length, engineQuery.data, props.edit?.engine, state.engine]);
+  }, [engineDraftKey, engineEntries.length, engineCatalog, props.edit?.engine, state.engine]);
 
   const startPortCheck = async (choice: { mode: "TARGET_ORIGINAL" } | { mode: "MANUAL"; port: number } | { mode: "RECOMMENDED"; recommendationToken: string }) => {
     if (!state.confirmedDomainToken || !carrierRoutes || !state.engine) return;
@@ -793,7 +734,7 @@ export function XrayQuickConfigDialog(props: {
     const value = new Set<XrayQuickConfigStep>();
     if (confirmedValid) value.add("DOMAIN");
     if (confirmedValid && xrayQuickConfigCarriersComplete(state)) value.add("CARRIERS");
-    const engineAvailable = !!state.engine && !!engineQuery.data?.items.find((item) => item.engine === state.engine)?.eligible;
+    const engineAvailable = !!state.engine && !!engineCatalog?.items.find((item) => item.engine === state.engine)?.eligible;
     if (engineAvailable) value.add("ENGINE");
     const portValid = state.portResult?.status === "SUCCESS" && Date.parse(state.portResult.expiresAt) > now;
     if (portValid) value.add("PORT");
@@ -801,7 +742,7 @@ export function XrayQuickConfigDialog(props: {
     if (state.preview) value.add("PREVIEW");
     if (operationQuery.data?.status === "SUCCESS") value.add("APPLY");
     return value;
-  }, [confirmedValid, engineQuery.data, now, operationQuery.data?.status, state]);
+  }, [confirmedValid, engineCatalog, now, operationQuery.data?.status, state]);
   const activeIndex = XRAY_QUICK_CONFIG_STEPS.indexOf(state.step);
   const navigableFurthestStepIndex = state.applyResult ? -1 : confirmedValid
     ? state.furthestStepIndex
@@ -818,7 +759,7 @@ export function XrayQuickConfigDialog(props: {
   const portExpired = !!portSuccess && Date.parse(portSuccess.expiresAt) <= now;
   const portProgress = portResultQuery.data?.status === "RUNNING" ? portResultQuery.data : null;
   const portBusy = portCheckCreate.isPending || !!state.portCheckId;
-  const selectedEngineLabel = engineQuery.data?.items.find((item) => item.engine === state.engine)?.label
+  const selectedEngineLabel = engineCatalog?.items.find((item) => item.engine === state.engine)?.label
     ?? state.engine ?? "转发引擎";
   const recheckOriginalPort = () => {
     dispatch({ type: "CLEAR_PORT_CHECK" });
@@ -856,19 +797,20 @@ export function XrayQuickConfigDialog(props: {
               if (advance) dispatch({ type: "GO_TO_STEP", step: "CARRIERS" });
             }}
             onNext={goNext}
-          /> : state.step === "CARRIERS" ? <CarrierStep
+          /> : state.step === "CARRIERS" ? <XrayQuickConfigCarrierPaths
             state={state}
-            zone={selectedZone}
+            target={props.target}
+            linesAvailable={!!selectedZone && XRAY_QUICK_CONFIG_CARRIERS.every(carrier => selectedZone.carrierLines.some(line => line.category === carrier && line.status === "AVAILABLE"))}
             hosts={entryHosts}
             loading={entryHostsQuery.isLoading}
             error={entryHostsQuery.isError}
             confirmedValid={confirmedValid}
-            onToggle={(carrier, endpointKey) => dispatch({ type: "TOGGLE_CARRIER_ENDPOINT", carrier, endpointKey })}
+            onChange={paths => dispatch({ type: "SET_CARRIER_PATHS", paths })}
             onBack={goBack}
             onNext={goNext}
             onRetry={() => { void entryHostsQuery.refetch(); }}
           /> : state.step === "ENGINE" ? <EngineStep
-            catalog={engineQuery.data}
+            catalog={engineCatalog}
             selected={state.engine}
             loading={engineQuery.isLoading}
             error={engineQuery.isError}

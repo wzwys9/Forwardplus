@@ -1,4 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { emptyQuickConfigPaths } from "./xrayQuickConfigPaths";
+import { XrayQuickConfigTopologyPaths } from "./XrayQuickConfigTopologyPaths";
+import { filterQuickConfigPathEngines } from "@shared/xrayQuickConfigForwardEngines";
 import { Activity, AlertTriangle, ArrowRight, ArrowRightLeft, Copy, ExternalLink, Eye, Loader2, Pencil, RefreshCw, RotateCcw, Route, Search, Server, Trash2 } from "lucide-react";
 import { getQueryKey } from "@trpc/react-query";
 import { useQueryClient } from "@tanstack/react-query";
@@ -55,6 +58,7 @@ const engineDisabledReasonLabels: Record<string, string> = {
   UDP_CAPABILITY_REQUIRED: "至少一台入口主机缺少端口探测或监听确认能力。",
   QUICK_CONFIG_HOST_UNAVAILABLE: "至少一台入口主机不满足快速配置条件。",
   QUICK_CONFIG_ADDRESS_UNAVAILABLE: "至少一台入口主机缺少所选 IPv4/IPv6 地址。",
+  QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED: "此路径有跨地址族转发或域名落地，iptables/nftables 不支持。",
 };
 
 function engineLabel(engine: string) {
@@ -421,6 +425,7 @@ function QuickConfigDetailDialog(props: { id: number; onClose: () => void; onEdi
       if (route.hostId === null) continue;
       const entry = { hostId: route.hostId, addressFamily: route.addressFamily };
       entries.set(`${entry.hostId}:${entry.addressFamily}`, entry);
+      for (const hop of route.relays) entries.set(`${hop.hostId}:${hop.addressFamily}`, { hostId: hop.hostId, addressFamily: hop.addressFamily });
     }
     return [...entries.values()];
   }, [detail?.activeTopology?.routes]);
@@ -429,6 +434,8 @@ function QuickConfigDetailDialog(props: { id: number; onClose: () => void; onEdi
     retry: false,
     refetchOnWindowFocus: true,
   });
+  const pathEngineCatalog = filterQuickConfigPathEngines(engineCatalogQuery.data, detail?.activeTopology?.routes.filter(route => route.routeMode === "FORWARD")
+    .map(route => [{ hostId: route.hostId!, addressFamily: route.addressFamily }, ...route.relays]) ?? [], detail?.activeTopology?.targetAddress ?? "");
   const operationId = detail?.currentOperationId ?? submittedOperationId ?? detail?.lastOperation?.operationId ?? 0;
   const operationQuery = trpc.xray.quickConfigs.operation.useQuery({ operationId }, {
     enabled: operationId > 0,
@@ -688,7 +695,7 @@ function QuickConfigDetailDialog(props: { id: number; onClose: () => void; onEdi
                 {engineSwitchOpen && currentEngine && <EngineSwitchEditor
                   currentEngine={currentEngine}
                   selectedEngine={selectedEngine}
-                  catalog={engineCatalogQuery.data}
+                  catalog={pathEngineCatalog}
                   catalogLoading={engineCatalogQuery.isLoading}
                   catalogError={engineCatalogQuery.isError}
                   preview={engineSwitchPreview}
@@ -707,6 +714,7 @@ function QuickConfigDetailDialog(props: { id: number; onClose: () => void; onEdi
                 {shareRequested && shareQuery.isLoading && <div className="space-y-2" aria-busy="true"><Skeleton className="h-20 w-full" /><Skeleton className="h-9 w-full" /></div>}
                 {shareQuery.data && <section className="space-y-3 rounded-lg border p-4"><div><h3 className="font-semibold">连接信息</h3><p className="mt-1 text-xs text-muted-foreground">敏感内容只保留在当前内存；复制或关闭详情后立即清除。</p></div><Textarea readOnly value={shareText(shareQuery.data)} className="min-h-24 break-all font-mono text-xs" aria-label="快速配置连接信息" /><Button type="button" className="w-full" onClick={() => { void copyShare(); }}><Copy className="mr-2 h-4 w-4" />复制并清除</Button></section>}
                 {shareError && <Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>连接信息不可用</AlertTitle><AlertDescription className="space-y-3"><p>{detail.targetType === "XRAY_INBOUND" && shareError === "QUICK_CONFIG_TARGET_UNSUPPORTED" ? "所选账号已停用、待删除或不属于该节点，请重新选择。" : `服务端拒绝生成连接信息（${shareError}）。`}</p><Button type="button" size="sm" variant="outline" onClick={() => { setShareError(null); if (detail.targetType === "XRAY_INBOUND") setShareAccountPickerOpen(true); else requestExternalShare(); }}>重试</Button></AlertDescription></Alert>}
+                <XrayQuickConfigTopologyPaths detail={detail} />
                 <QuickConfigRulesSection detail={detail} />
                 <section className="space-y-3"><h3 className="font-semibold">DNS 记录（{detail.dnsRecords.length}）</h3>{detail.dnsRecords.length === 0 ? <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">尚无托管 DNS 记录。</p> : <div className="space-y-2">{detail.dnsRecords.map((record) => <div key={record.recordRef} className="flex min-w-0 flex-wrap items-center gap-2 rounded-lg border p-3 text-sm"><Badge variant="outline">{record.recordType}</Badge><span className="break-all font-mono text-xs">{record.value}</span><Badge className="ml-auto" variant={record.status === "APPLIED" ? "default" : record.status === "DRIFTED" ? "destructive" : "secondary"}>{record.status}</Badge><span className="w-full text-xs text-muted-foreground">线路 {record.providerLineId} · TTL {record.ttl}{record.lastVerifiedAt ? ` · 最近验证 ${new Date(record.lastVerifiedAt).toLocaleString()}` : ""}</span></div>)}</div>}</section>
                 {operation && <OperationSummary operation={operation} />}
@@ -765,10 +773,12 @@ export function XrayQuickConfigPanel(props: {
     const carrierEndpoints: XrayQuickConfigEditDraft["carrierEndpoints"] = {
       TELECOM: [], UNICOM: [], MOBILE: [], EDUCATION: [],
     };
+    const carrierPaths = emptyQuickConfigPaths();
     for (const route of active.routes) {
       if (route.lineCategory === "DEFAULT" || route.hostId === null) continue;
       const key = xrayQuickConfigEndpointKey(route.hostId, route.addressFamily);
       if (!carrierEndpoints[route.lineCategory].includes(key)) carrierEndpoints[route.lineCategory].push(key);
+      carrierPaths[route.lineCategory].push({ id: `route-${route.routeId}`, hops: [key, ...route.relays.map(hop => xrayQuickConfigEndpointKey(hop.hostId, hop.addressFamily))] });
     }
     const target: XrayQuickConfigTarget = {
       targetType: detail.targetType,
@@ -780,6 +790,7 @@ export function XrayQuickConfigPanel(props: {
       eligible: true,
       disabledReasonCode: null,
       shareCapability: detail.target.shareCapability,
+      host: detail.target.host,
     };
     dialogTriggerRef.current = detailTriggerRef.current;
     detailTriggerRef.current = null;
@@ -799,6 +810,7 @@ export function XrayQuickConfigPanel(props: {
           lineName: lineLabels[active.routes.find((route) => route.routeId === record.routeId)?.lineCategory ?? ""] ?? record.providerLineId,
         })),
         carrierEndpoints,
+        carrierPaths,
         engine: currentEngine,
         publicPort: active.publicPort,
         defaultRoutes: active.routes.filter((route) => route.lineCategory === "DEFAULT").map((route) => ({

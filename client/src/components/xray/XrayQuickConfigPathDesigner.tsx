@@ -18,6 +18,7 @@ type DesignerProps = {
   target: XrayQuickConfigTarget; hosts: readonly XrayQuickConfigEntryHost[];
   loading: boolean; error: boolean; onRetry: () => void; onClose: () => void;
   initialPaths?: QuickConfigPaths;
+  onAccept?: (paths: QuickConfigPaths) => void;
 };
 
 function PathSummary({ paths, hosts, target }: Pick<DesignerProps, "hosts" | "target"> & { paths: QuickConfigPaths }) {
@@ -25,7 +26,7 @@ function PathSummary({ paths, hosts, target }: Pick<DesignerProps, "hosts" | "ta
   return <section className="min-w-0 space-y-5">
     <div><h3 data-path-summary-title tabIndex={-1} className="font-semibold outline-none">路径汇总</h3><p className="mt-1 text-sm text-muted-foreground">尚未进行端口检测或网络连通性验证</p></div>
     <Alert><Route className="h-4 w-4" /><AlertTitle>设计预览，不是实际下发配置</AlertTitle>
-      <AlertDescription>DNS 只会指向每条路径的入口，中转服务器不加入入口解析。本版未确定逐跳端口、转发引擎或默认线路，不创建 DNS 和转发规则。</AlertDescription></Alert>
+      <AlertDescription>DNS 只指向入口，中转不加入入口解析。所有段使用统一对外端口，末段连接落地原端口；需要在正式向导继续选择引擎、检测端口、确认默认线路，最终提交才创建规则和 DNS。</AlertDescription></Alert>
     {inspection.issues.length === 0 && <p className="flex items-center gap-2 text-sm"><CheckCircle2 className="h-4 w-4" />路径结构检查通过 · 涉及 {inspection.uniqueForwardHostCount} 台转发服务器</p>}
     {XRAY_QUICK_CONFIG_CARRIERS.map((carrier) => <section key={carrier} className="min-w-0 space-y-3 rounded-lg border p-3 sm:p-4">
       <h4 className="font-semibold">{labels[carrier]} · {paths[carrier].length} 条路径</h4>
@@ -44,7 +45,7 @@ function PathSummary({ paths, hosts, target }: Pick<DesignerProps, "hosts" | "ta
   </section>;
 }
 
-/** Deliberately accepts no save/apply callback: drafts cannot reach the old direct-route planner. */
+/** Accept only transfers a validated in-memory draft to the formal wizard; it never applies it. */
 export function XrayQuickConfigPathDesigner(props: DesignerProps) {
   const [paths, setPaths] = useState<QuickConfigPaths>(() => props.initialPaths ?? emptyQuickConfigPaths());
   const [carrier, setCarrier] = useState<XrayQuickConfigCarrier>("TELECOM");
@@ -100,7 +101,7 @@ export function XrayQuickConfigPathDesigner(props: DesignerProps) {
     <Dialog open onOpenChange={(open) => { if (!open) requestClose(); }}>
       <DialogContent className="flex h-[calc(100dvh-1.5rem)] min-h-0 w-[calc(100vw-1.5rem)] max-h-[calc(100dvh-1.5rem)] max-w-5xl flex-col gap-0 p-0 sm:max-h-[92dvh] sm:p-0 [&>button]:right-2 [&>button]:top-2 [&>button]:h-11 [&>button]:w-11">
         <DialogHeader className="shrink-0 border-b p-4 pr-12 text-left sm:p-5 sm:pr-12">
-          <div className="flex flex-wrap items-center gap-2"><DialogTitle>路径设计</DialogTitle><Badge variant="secondary">仅交互预览</Badge></div>
+          <div className="flex flex-wrap items-center gap-2"><DialogTitle>{props.onAccept ? "配置运营商路径" : "路径设计"}</DialogTitle><Badge variant="secondary">{props.onAccept ? "尚未提交" : "仅交互预览"}</Badge></div>
           <DialogDescription className="break-all">落地：{props.target.name} · {props.target.protocol}</DialogDescription>
         </DialogHeader>
         {!summary && <div className={`shrink-0 grid-cols-2 gap-2 border-b p-3 sm:grid-cols-4 ${mobileEditing ? "hidden lg:grid" : "grid"}`} role="group" aria-label="选择运营商">
@@ -148,10 +149,11 @@ export function XrayQuickConfigPathDesigner(props: DesignerProps) {
                 </div>}
         </div>
         <footer className="shrink-0 space-y-2 border-t bg-background p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-5">
-          <p className="text-xs text-muted-foreground" role="status">{total} 条路径 · 仅预览，不下发、不保存到服务器</p>
+          <p className="text-xs text-muted-foreground" role="status">{total} 条路径 · {props.onAccept ? "使用路径后继续引擎与端口检查，不会立即下发" : "仅预览，不下发、不保存到服务器"}</p>
           <div className="grid grid-cols-2 gap-2 sm:flex sm:justify-end">
-            <Button type="button" variant="outline" className="h-11 min-w-0 px-2" onClick={requestClose}>关闭预览</Button>
+            <Button type="button" variant="outline" className="h-11 min-w-0 px-2" onClick={requestClose}>{props.onAccept ? "取消调整" : "关闭预览"}</Button>
             <Button type="button" className="h-11 min-w-0 px-2 sm:px-4" disabled={props.loading || props.error || total === 0} onClick={() => setSummary(!summary)}>{summary ? "继续调整路径" : "查看路径汇总"}</Button>
+            {props.onAccept && <Button type="button" className="col-span-2 h-11" disabled={props.loading || props.error || inspection.issues.length > 0} onClick={() => props.onAccept?.(structuredClone(paths))}>使用这些路径</Button>}
           </div>
         </footer>
       </DialogContent>
