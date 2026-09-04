@@ -61,6 +61,7 @@ type RecordItem = Readonly<{
   ttl: number;
   status: string | null;
   recordRevision: string;
+  inUse: boolean;
 }>;
 
 type EditorState = Readonly<{
@@ -83,6 +84,7 @@ const DNS_ERROR_MESSAGES: Record<string, string> = {
   DNS_PROVIDER_INVALID_RESPONSE: "DNSPod 返回了无法验证的响应。",
   DNS_ZONE_NOT_FOUND: "所选域名已不在当前账号中，请刷新目录。",
   DNS_ZONE_IN_USE: "该域名正在被快速配置使用，只允许查看。",
+  DNS_SUBDOMAIN_IN_USE: "该子域名正在被系统使用，请通过对应快速配置调整解析。",
   DNS_RECORD_NOT_FOUND: "该记录已不存在，请刷新列表。",
   DNS_RECORD_CHANGED: "该记录已在其他位置发生变化，请刷新后再操作。",
   DNS_WRITE_UNCERTAIN: "DNSPod 写入结果暂时无法确认，请先刷新列表，不要重复提交。",
@@ -243,38 +245,66 @@ export default function DnsRecordManagementCard({
   const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
+  const [subdomain, setSubdomain] = useState<string | null>(null);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [removing, setRemoving] = useState<RecordItem | null>(null);
   const selectedZone = availableZones.find((zone) => zone.zoneId === selectedZoneId) ?? availableZones[0] ?? null;
+  const utils = trpc.useUtils();
 
   useEffect(() => {
     if (selectedZoneId !== null && availableZones.some((zone) => zone.zoneId === selectedZoneId)) return;
     setSelectedZoneId(availableZones[0]?.zoneId ?? null);
+    setSubdomain(null);
+    setEditor(null);
+    setRemoving(null);
+    setPage(1);
   }, [availableZones, selectedZoneId]);
 
+  const groupsQuery = trpc.xray.dnsRecords.groups.useQuery({
+    zoneId: selectedZone?.zoneId ?? 1, search: search || undefined, page, pageSize: 20,
+  }, {
+    enabled: accountValid && selectedZone !== null && subdomain === null,
+    retry: false, refetchOnWindowFocus: false,
+  });
   const recordsQuery = trpc.xray.dnsRecords.list.useQuery({
     zoneId: selectedZone?.zoneId ?? 1,
+    subdomain: subdomain ?? undefined,
     search: search || undefined,
     page,
     pageSize: 20,
   }, {
-    enabled: accountValid && selectedZone !== null,
+    enabled: accountValid && selectedZone !== null && subdomain !== null,
     retry: false,
     refetchOnWindowFocus: false,
   });
   const createMutation = trpc.xray.dnsRecords.create.useMutation({ gcTime: 0 });
   const updateMutation = trpc.xray.dnsRecords.update.useMutation({ gcTime: 0 });
   const removeMutation = trpc.xray.dnsRecords.remove.useMutation({ gcTime: 0 });
-  const currentZoneInUse = recordsQuery.data?.zone.inUse ?? selectedZone?.inUse ?? false;
-  const totalPages = Math.max(1, Math.ceil((recordsQuery.data?.total ?? 0) / 20));
+  const currentSubdomainInUse = subdomain !== null && (recordsQuery.data?.subdomain?.inUse ?? true);
+  const activeQuery = subdomain === null ? groupsQuery : recordsQuery;
+  const totalPages = Math.max(1, Math.ceil((activeQuery.data?.total ?? 0) / 20));
   const mutationPending = createMutation.isPending || updateMutation.isPending;
 
   useEffect(() => {
-    if (page > totalPages) setPage(totalPages);
-  }, [page, totalPages]);
+    if (activeQuery.data && page > totalPages) setPage(totalPages);
+  }, [activeQuery.data, page, totalPages]);
+
+  const openSubdomain = (name: string | null) => {
+    setSubdomain(name);
+    setPage(1);
+    setSearchInput("");
+    setSearch("");
+    setEditor(null);
+    setRemoving(null);
+  };
+
+  const refreshRecords = async () => {
+    await Promise.all([utils.xray.dnsRecords.groups.invalidate(), utils.xray.dnsRecords.list.invalidate()]);
+  };
 
   const chooseZone = (value: string) => {
     setSelectedZoneId(Number(value));
+    setSubdomain(null);
     setPage(1);
     setSearchInput("");
     setSearch("");
@@ -290,7 +320,7 @@ export default function DnsRecordManagementCard({
 
   const submitEditor = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!selectedZone || !editor || currentZoneInUse || !editor.lineId) return;
+    if (!selectedZone || !editor || currentSubdomainInUse || !editor.lineId) return;
     const payload = {
       zoneId: selectedZone.zoneId,
       subdomain: editor.subdomain.trim(),
@@ -311,8 +341,8 @@ export default function DnsRecordManagementCard({
         });
         toast.success("DNS 记录已更新");
       }
-      setEditor(null);
-      await recordsQuery.refetch();
+      openSubdomain(payload.subdomain.toLowerCase());
+      await refreshRecords();
     } catch (error) {
       toast.error(dnsErrorMessage(error, "DNS 记录操作失败，请稍后重试。"));
     } finally {
@@ -322,7 +352,7 @@ export default function DnsRecordManagementCard({
   };
 
   const confirmRemove = async () => {
-    if (!selectedZone || !removing || currentZoneInUse) return;
+    if (!selectedZone || !removing || currentSubdomainInUse || removing.inUse) return;
     try {
       await removeMutation.mutateAsync({
         zoneId: selectedZone.zoneId,
@@ -331,7 +361,7 @@ export default function DnsRecordManagementCard({
       });
       setRemoving(null);
       toast.success("DNS 记录已删除");
-      await recordsQuery.refetch();
+      await refreshRecords();
     } catch (error) {
       toast.error(dnsErrorMessage(error, "DNS 记录删除失败，请稍后重试。"));
     } finally {
@@ -351,22 +381,22 @@ export default function DnsRecordManagementCard({
             </div>
             <div>
               <CardTitle>DNS 管理</CardTitle>
-              <CardDescription className="mt-1.5">实时读取 DNSPod 记录，管理 A、AAAA 和 CNAME。</CardDescription>
+              <CardDescription className="mt-1.5">按子域名查看解析，进入管理页增删改查 A、AAAA 和 CNAME。</CardDescription>
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button type="button" variant="outline" onClick={() => recordsQuery.refetch()} disabled={!selectedZone || recordsQuery.isFetching}>
-              {recordsQuery.isFetching ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+            <Button type="button" variant="outline" onClick={() => activeQuery.refetch()} disabled={!selectedZone || activeQuery.isFetching}>
+              {activeQuery.isFetching ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
               刷新记录
             </Button>
             <Button
               type="button"
-              onClick={() => selectedZone && setEditor(emptyEditor(selectedZone))}
-              disabled={!selectedZone || currentZoneInUse}
-              title={currentZoneInUse ? "该域名正在被快速配置使用" : undefined}
+              onClick={() => selectedZone && setEditor({ ...emptyEditor(selectedZone), subdomain: subdomain ?? "" })}
+              disabled={!selectedZone || currentSubdomainInUse || mutationPending || removeMutation.isPending}
+              title={currentSubdomainInUse ? "该子域名正在被系统使用" : undefined}
             >
               <Plus className="mr-2 h-4 w-4" />
-              添加记录
+              {subdomain === null ? "添加子域名" : "添加解析"}
             </Button>
           </div>
         </div>
@@ -383,7 +413,7 @@ export default function DnsRecordManagementCard({
             <div className="grid gap-3 lg:grid-cols-[minmax(14rem,24rem)_1fr] lg:items-end">
               <div className="space-y-2">
                 <Label htmlFor="dns-record-zone">域名</Label>
-                <Select value={selectedZone ? String(selectedZone.zoneId) : undefined} onValueChange={chooseZone}>
+                <Select value={selectedZone ? String(selectedZone.zoneId) : undefined} disabled={mutationPending || removeMutation.isPending} onValueChange={chooseZone}>
                   <SelectTrigger id="dns-record-zone"><SelectValue placeholder="选择域名" /></SelectTrigger>
                   <SelectContent>
                     {availableZones.map((zone) => <SelectItem key={zone.zoneId} value={String(zone.zoneId)}>{zone.name}</SelectItem>)}
@@ -405,37 +435,55 @@ export default function DnsRecordManagementCard({
               </form>
             </div>
 
-            {currentZoneInUse && recordsQuery.data?.zone && (
+            {subdomain !== null && (
+              <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-muted/15 p-3">
+                <Button type="button" variant="outline" size="sm" disabled={mutationPending || removeMutation.isPending} onClick={() => openSubdomain(null)}><ChevronLeft className="mr-1 h-4 w-4" />返回子域名列表</Button>
+                <span className="min-w-0 break-all font-medium">{subdomain === "@" ? selectedZone?.name : `${subdomain}.${selectedZone?.name}`}</span>
+              </div>
+            )}
+
+            {subdomain !== null && recordsQuery.data?.subdomain?.inUse && (
               <Alert>
                 <ShieldCheck className="h-4 w-4" />
-                <AlertTitle>该域名正在使用，当前只读</AlertTitle>
+                <AlertTitle>该子域名正在使用，当前只读</AlertTitle>
                 <AlertDescription>
-                  {recordsQuery.data.zone.quickConfigReferenceCount} 个快速配置、
-                  {recordsQuery.data.zone.managedRecordCount} 条托管记录、
-                  {recordsQuery.data.zone.activeOperationCount} 个执行中任务正在引用此域名。
-                  请通过对应快速配置修改或删除，避免解析与转发拓扑失去一致性。
+                  请通过对应快速配置调整解析。执行中的域名切换和未清理记录也会保持保护；同主域名下其他未占用的子域名可以正常管理。
                 </AlertDescription>
               </Alert>
             )}
 
-            {recordsQuery.isLoading ? (
+            {activeQuery.isLoading ? (
               <div className="flex min-h-40 items-center justify-center rounded-lg border text-sm text-muted-foreground">
                 <Loader2 className="mr-2 h-4 w-4 animate-spin text-primary" />
                 正在读取 DNSPod 记录
               </div>
-            ) : recordsQuery.error ? (
+            ) : activeQuery.error ? (
               <Alert variant="destructive">
                 <AlertTriangle className="h-4 w-4" />
                 <AlertTitle>DNS 记录加载失败</AlertTitle>
                 <AlertDescription className="flex flex-wrap items-center justify-between gap-3">
-                  <span>{dnsErrorMessage(recordsQuery.error, "暂时无法读取 DNSPod 记录。")}</span>
-                  <Button type="button" size="sm" variant="outline" onClick={() => recordsQuery.refetch()}>重新加载</Button>
+                  <span>{dnsErrorMessage(activeQuery.error, "暂时无法读取 DNSPod 记录。")}</span>
+                  <Button type="button" size="sm" variant="outline" onClick={() => activeQuery.refetch()}>重新加载</Button>
                 </AlertDescription>
               </Alert>
-            ) : (recordsQuery.data?.items.length ?? 0) === 0 ? (
+            ) : (activeQuery.data?.items.length ?? 0) === 0 ? (
               <div className="rounded-lg border border-dashed px-6 py-12 text-center">
                 <p className="font-medium">{search ? "没有匹配的 DNS 记录" : "当前域名没有 DNS 记录"}</p>
-                <p className="mt-1 text-sm text-muted-foreground">{search ? "可以更换关键词后重新搜索。" : "未被快速配置占用时，可以添加第一条记录。"}</p>
+                <p className="mt-1 text-sm text-muted-foreground">{search ? "可以更换关键词后重新搜索。" : currentSubdomainInUse ? "可通过快速配置的同步功能补齐缺失解析。" : "可以添加第一条记录。"}</p>
+              </div>
+            ) : subdomain === null ? (
+              <div className="rounded-lg border">
+                <Table>
+                  <TableHeader><TableRow><TableHead>子域名</TableHead><TableHead>解析记录</TableHead><TableHead>使用状态</TableHead><TableHead className="text-right">操作</TableHead></TableRow></TableHeader>
+                  <TableBody>{groupsQuery.data?.items.map((group) => (
+                    <TableRow key={group.fqdn}>
+                      <TableCell className="min-w-40 break-all font-medium">{group.fqdn}</TableCell>
+                      <TableCell><span>{group.recordCount} 条</span><div className="mt-1 flex flex-wrap gap-1">{group.recordTypes.map((type) => <Badge key={type} variant="outline">{type}</Badge>)}</div></TableCell>
+                      <TableCell><Badge variant={group.inUse ? "secondary" : "outline"}>{group.inUse ? "系统使用中 · 只读" : "可管理"}</Badge></TableCell>
+                      <TableCell className="text-right"><Button type="button" variant="outline" size="sm" disabled={mutationPending || removeMutation.isPending} onClick={() => openSubdomain(group.subdomain)}>管理解析<ChevronRight className="ml-1 h-4 w-4" /></Button></TableCell>
+                    </TableRow>
+                  ))}</TableBody>
+                </Table>
               </div>
             ) : (
               <div className="rounded-lg border">
@@ -453,7 +501,7 @@ export default function DnsRecordManagementCard({
                   </TableHeader>
                   <TableBody>
                     {recordsQuery.data?.items.map((record) => {
-                      const writable = writableRecordType(record.recordType) && !currentZoneInUse;
+                      const writable = writableRecordType(record.recordType) && !record.inUse && !currentSubdomainInUse;
                       return (
                         <TableRow key={record.providerRecordId}>
                           <TableCell className="font-medium" title={record.fqdn}>{record.subdomain}</TableCell>
@@ -469,7 +517,7 @@ export default function DnsRecordManagementCard({
                                 variant="ghost"
                                 size="icon"
                                 aria-label={`编辑 ${record.fqdn}`}
-                                title={!writable ? currentZoneInUse ? "域名正在使用，当前只读" : "首版只编辑 A、AAAA 和 CNAME" : "编辑记录"}
+                                title={!writable ? record.inUse ? "子域名正在使用，当前只读" : "只编辑 A、AAAA 和 CNAME" : "编辑记录"}
                                 disabled={!writable}
                                 onClick={() => selectedZone && setEditor(recordEditor(record, selectedZone))}
                               >
@@ -481,7 +529,7 @@ export default function DnsRecordManagementCard({
                                 size="icon"
                                 className="text-destructive hover:text-destructive"
                                 aria-label={`删除 ${record.fqdn}`}
-                                title={!writable ? currentZoneInUse ? "域名正在使用，当前只读" : "首版只删除 A、AAAA 和 CNAME" : "删除记录"}
+                                title={!writable ? record.inUse ? "子域名正在使用，当前只读" : "只删除 A、AAAA 和 CNAME" : "删除记录"}
                                 disabled={!writable}
                                 onClick={() => setRemoving(record)}
                               >
@@ -497,9 +545,9 @@ export default function DnsRecordManagementCard({
               </div>
             )}
 
-            {recordsQuery.data && recordsQuery.data.total > 0 && (
+            {activeQuery.data && activeQuery.data.total > 0 && (
               <div className="flex flex-col gap-3 text-sm text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
-                <span>共 {recordsQuery.data.total} 条 · 第 {recordsQuery.data.page} / {totalPages} 页</span>
+                <span>共 {activeQuery.data.total} {subdomain === null ? "个域名" : "条解析"} · 第 {activeQuery.data.page} / {totalPages} 页</span>
                 <div className="flex gap-2">
                   <Button type="button" size="sm" variant="outline" disabled={page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
                     <ChevronLeft className="mr-1 h-4 w-4" />上一页
@@ -539,7 +587,7 @@ export default function DnsRecordManagementCard({
           )}
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => setRemoving(null)}>取消</Button>
-            <Button type="button" variant="destructive" onClick={confirmRemove} disabled={removeMutation.isPending || currentZoneInUse}>
+            <Button type="button" variant="destructive" onClick={confirmRemove} disabled={removeMutation.isPending || currentSubdomainInUse || removing?.inUse}>
               {removeMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               确认删除
             </Button>

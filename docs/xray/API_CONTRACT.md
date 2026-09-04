@@ -591,7 +591,11 @@ profileId 固定为 `VLESS_RAW_TLS`、`VLESS_RAW_TLS_VISION`、`TROJAN_RAW_TLS`�
 - `update({ zoneId, providerRecordId, expectedRecordRevision, subdomain, recordType, lineId, value, ttl })` 在写入前用 `DescribeRecord` 回读并比对 revision，远端已变更时返回 `DNS_RECORD_CHANGED`，不覆盖。
 - `remove({ zoneId, providerRecordId, expectedRecordRevision })` 同样先回读并比对 revision，仅删除该精确 recordId。
 
-三个 mutation 均必须在 provider 写入前从数据库重新计算 zone 占用；占用时返回 `DNS_ZONE_IN_USE` 冲突。账号/catalog revision 变化、记录被第三方改写、recordId 不属于选定 zone 都必须 fail closed。写请求出现结果不明时返回 `DNS_WRITE_UNCERTAIN`，界面要求刷新而不自动重试。
+`groups({ zoneId, search?, page=1, pageSize=20 })` 实时读取完整的有界 DNSPod 列表，按规范完整名称聚合后分页，返回每组 `{ subdomain, fqdn, recordCount, recordTypes, inUse }`。未删除配置、有效 claim、未清理托管记录和活动 operation 涉及的名称即使远端零记录也进入聚合列表。`list` 增加可选精确 `subdomain` 过滤；返回 `subdomain:{name,fqdn,inUse}|null`，每条记录增加 `inUse`，原 zone 聚合占用字段继续保留但不代表记录写权限。聚合搜索命中任一记录时返回整个组的真实记录数。
+
+三个 mutation 均必须在 provider 写入前从数据库重新计算完整子域名占用；占用时返回 `DNS_SUBDOMAIN_IN_USE` 冲突。create 检查目标名称，update 回读 provider recordId 后同时检查原名与新名，remove 检查回读原名。账号/catalog revision 变化、记录被第三方改写、recordId 不属于选定 zone 都必须 fail closed。写请求出现结果不明时返回 `DNS_WRITE_UNCERTAIN`，界面要求刷新而不自动重试。账号和 zone 删除/换绑仍受既有引用保护。
+
+编辑域名检查的 `DomainCheckDto` 增加可选 `ownedRecordRefs:string[]`，只包含当前 edit identity 对应托管记录且 provider recordId、zone、FQDN、type、line、value、TTL/hash 完全吻合的投影引用。该字段只辅助原域名的确认交互，不进入 token 或授予写权限；最终确认与 editApply 继续实时复核完整记录快照。新建请求不返回此字段。
 
 ## 19. 快速配置 API（TASK057）
 

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { isIP } from "node:net";
 
 import { normalizeDnsProviderZoneName } from "./dnsProviderCatalog";
+import { listDnsProviderUsedNames } from "./dnsProviderSubdomainUsage";
 import {
   DnsPodProviderClient,
   DnsPodProviderError,
@@ -34,6 +35,7 @@ export type DnsProviderRecordServiceErrorCode =
   | "DNS_PROVIDER_INVALID_RESPONSE"
   | "DNS_ZONE_NOT_FOUND"
   | "DNS_ZONE_IN_USE"
+  | "DNS_SUBDOMAIN_IN_USE"
   | "DNS_RECORD_NOT_FOUND"
   | "DNS_RECORD_CHANGED"
   | "DNS_WRITE_UNCERTAIN"
@@ -67,9 +69,11 @@ export type DnsProviderRecordSafeDto = Readonly<{
   ttl: number;
   status: string | null;
   recordRevision: string;
+  inUse: boolean;
 }>;
 
 type ZoneContext = Readonly<{
+  accountId: number;
   zone: DnsProviderZoneSafeDto;
   providerZone: DnsPodZone;
   credentials: DnsPodCredentials;
@@ -159,12 +163,16 @@ function revisionForRecord(record: DnsPodRecord): string {
   ]), "utf8").digest("hex");
 }
 
-function safeRecord(record: DnsPodRecord, zoneName: string): DnsProviderRecordSafeDto {
+function recordFqdn(subdomain: string, zoneName: string): string {
+  return subdomain === "@" ? zoneName : `${subdomain}.${zoneName}`;
+}
+
+function safeRecord(record: DnsPodRecord, zoneName: string, usedNames: ReadonlySet<string>): DnsProviderRecordSafeDto {
   const subdomain = record.subdomain.toLowerCase();
   return {
     providerRecordId: record.providerRecordId,
     subdomain,
-    fqdn: subdomain === "@" ? zoneName : `${subdomain}.${zoneName}`,
+    fqdn: recordFqdn(subdomain, zoneName),
     recordType: record.recordType,
     providerLineId: record.providerLineId,
     lineName: record.lineName,
@@ -172,6 +180,7 @@ function safeRecord(record: DnsPodRecord, zoneName: string): DnsProviderRecordSa
     ttl: record.ttl,
     status: record.status,
     recordRevision: revisionForRecord(record),
+    inUse: usedNames.has(recordFqdn(subdomain, zoneName)),
   };
 }
 
@@ -205,6 +214,7 @@ async function zoneContext(zoneIdValue: unknown, options: DnsProviderRecordServi
       || credentials.accountRevision !== account.accountRevision
       || credentials.bindingRevision !== account.bindingRevision) fail("DNS_PROVIDER_INVALID");
     return {
+      accountId: account.accountId,
       zone,
       providerZone: {
         providerZoneId: zone.providerZoneId,
@@ -222,6 +232,17 @@ async function zoneContext(zoneIdValue: unknown, options: DnsProviderRecordServi
 function clientFor(context: ZoneContext, options: DnsProviderRecordServiceOptions): DnsRecordClient {
   return options.clientFactory?.(context.credentials)
     ?? new DnsPodProviderClient({ credentials: context.credentials });
+}
+
+async function usedNamesFor(context: ZoneContext) {
+  return listDnsProviderUsedNames(context.accountId, context.zone.zoneId, context.zone.name);
+}
+
+async function assertNamesWritable(context: ZoneContext, names: readonly string[]) {
+  const used = await usedNamesFor(context);
+  if (names.some((name) => used.has(recordFqdn(name.trim().toLowerCase(), context.zone.name)))) {
+    fail("DNS_SUBDOMAIN_IN_USE");
+  }
 }
 
 function writeInput(input: {
@@ -251,6 +272,7 @@ function writeInput(input: {
 
 export async function listDnsProviderRecords(input: {
   zoneId: number;
+  subdomain?: string;
   search?: string;
   recordType?: string;
   page?: number;
@@ -260,6 +282,7 @@ export async function listDnsProviderRecords(input: {
   total: number;
   page: number;
   pageSize: number;
+  subdomain: { name: string; fqdn: string; inUse: boolean } | null;
   zone: Pick<DnsProviderZoneSafeDto, "zoneId" | "name" | "inUse" | "quickConfigReferenceCount" | "managedRecordCount" | "activeOperationCount">;
 }> {
   const page = pageNumber(input.page ?? 1, Number.MAX_SAFE_INTEGER);
@@ -270,10 +293,13 @@ export async function listDnsProviderRecords(input: {
     : boundedText(input.recordType, 16).toUpperCase();
   if (typeFilter && !/^[A-Z][A-Z0-9]{0,15}$/.test(typeFilter)) fail("DNS_PROVIDER_INVALID");
   const context = await zoneContext(input.zoneId, options);
+  const subdomain = input.subdomain === undefined ? null : boundedText(input.subdomain, 253).toLowerCase();
   try {
     const records = await clientFor(context, options).listRecords({ zone: context.providerZone });
-    const filtered = records.map((record) => safeRecord(record, context.zone.name)).filter((record) => (
-      (!typeFilter || record.recordType === typeFilter)
+    const usedNames = await usedNamesFor(context);
+    const filtered = records.map((record) => safeRecord(record, context.zone.name, usedNames)).filter((record) => (
+      (subdomain === null || record.subdomain === subdomain)
+      && (!typeFilter || record.recordType === typeFilter)
       && (!search || [record.subdomain, record.fqdn, record.recordType, record.lineName, record.value]
         .some((value) => value.toLowerCase().includes(search)))
     )).sort((left, right) => (
@@ -288,6 +314,10 @@ export async function listDnsProviderRecords(input: {
       total: filtered.length,
       page,
       pageSize,
+      subdomain: subdomain === null ? null : {
+        name: subdomain, fqdn: recordFqdn(subdomain, context.zone.name),
+        inUse: usedNames.has(recordFqdn(subdomain, context.zone.name)),
+      },
       zone: {
         zoneId: context.zone.zoneId,
         name: context.zone.name,
@@ -297,6 +327,51 @@ export async function listDnsProviderRecords(input: {
         activeOperationCount: context.zone.activeOperationCount,
       },
     };
+  } catch (error) {
+    mapError(error);
+  }
+}
+
+export async function listDnsProviderRecordGroups(input: {
+  zoneId: number; search?: string; page?: number; pageSize?: number;
+}, options: DnsProviderRecordServiceOptions = {}) {
+  const page = pageNumber(input.page ?? 1, Number.MAX_SAFE_INTEGER);
+  const pageSize = pageNumber(input.pageSize ?? 20, 100);
+  const search = boundedText(input.search ?? "", 128, true).toLowerCase();
+  const context = await zoneContext(input.zoneId, options);
+  try {
+    const records = await clientFor(context, options).listRecords({ zone: context.providerZone });
+    const used = await usedNamesFor(context);
+    const groups = new Map<string, {
+      subdomain: string; fqdn: string; recordCount: number; recordTypes: string[]; inUse: boolean;
+    }>();
+    const matches = new Set<string>();
+    const ensureGroup = (subdomain: string) => {
+      let group = groups.get(subdomain);
+      if (!group) {
+        const fqdn = recordFqdn(subdomain, context.zone.name);
+        group = { subdomain, fqdn, recordCount: 0, recordTypes: [], inUse: used.has(fqdn) };
+        groups.set(subdomain, group);
+        if (!search || fqdn.includes(search) || subdomain.includes(search)) matches.add(subdomain);
+      }
+      return group;
+    };
+    for (const record of records) {
+      const group = ensureGroup(record.subdomain.trim().toLowerCase());
+      group.recordCount += 1;
+      if (!group.recordTypes.includes(record.recordType)) group.recordTypes.push(record.recordType);
+      if ([record.recordType, record.lineName, record.value].some((value) => value.toLowerCase().includes(search))) {
+        matches.add(group.subdomain);
+      }
+    }
+    for (const fqdn of used) {
+      if (fqdn === context.zone.name) ensureGroup("@");
+      else if (fqdn.endsWith(`.${context.zone.name}`)) ensureGroup(fqdn.slice(0, -(context.zone.name.length + 1)));
+    }
+    const items = [...groups.values()].filter((group) => matches.has(group.subdomain))
+      .sort((left, right) => left.subdomain.localeCompare(right.subdomain, "en"));
+    for (const group of items) group.recordTypes.sort();
+    return { items: items.slice((page - 1) * pageSize, page * pageSize), total: items.length, page, pageSize };
   } catch (error) {
     mapError(error);
   }
@@ -312,9 +387,10 @@ export async function createDnsProviderRecord(input: {
 }, options: DnsProviderRecordServiceOptions = {}): Promise<{ providerRecordId: string }> {
   return withKeyedTaskLock(`dns-provider-record-zone:${positiveInteger(input.zoneId)}`, async () => {
     const context = await zoneContext(input.zoneId, options);
-    if (context.zone.inUse) fail("DNS_ZONE_IN_USE");
     try {
-      return await clientFor(context, options).createRecord(writeInput(input, context));
+      const payload = writeInput(input, context);
+      await assertNamesWritable(context, [payload.subdomain]);
+      return await clientFor(context, options).createRecord(payload);
     } catch (error) {
       mapError(error);
     }
@@ -333,14 +409,16 @@ export async function updateDnsProviderRecord(input: {
 }, options: DnsProviderRecordServiceOptions = {}): Promise<{ providerRecordId: string }> {
   return withKeyedTaskLock(`dns-provider-record-zone:${positiveInteger(input.zoneId)}`, async () => {
     const context = await zoneContext(input.zoneId, options);
-    if (context.zone.inUse) fail("DNS_ZONE_IN_USE");
     const id = providerRecordId(input.providerRecordId);
     const expected = recordRevision(input.expectedRecordRevision);
     const client = clientFor(context, options);
     try {
       const current = await client.getRecord({ zone: context.providerZone, providerRecordId: id });
       if (revisionForRecord(current) !== expected) fail("DNS_RECORD_CHANGED");
-      return await client.updateRecord({ ...writeInput(input, context), providerRecordId: id });
+      writableRecordType(current.recordType);
+      const payload = writeInput(input, context);
+      await assertNamesWritable(context, [current.subdomain, payload.subdomain]);
+      return await client.updateRecord({ ...payload, providerRecordId: id });
     } catch (error) {
       mapError(error);
     }
@@ -354,13 +432,14 @@ export async function removeDnsProviderRecord(input: {
 }, options: DnsProviderRecordServiceOptions = {}): Promise<{ providerRecordId: string }> {
   return withKeyedTaskLock(`dns-provider-record-zone:${positiveInteger(input.zoneId)}`, async () => {
     const context = await zoneContext(input.zoneId, options);
-    if (context.zone.inUse) fail("DNS_ZONE_IN_USE");
     const id = providerRecordId(input.providerRecordId);
     const expected = recordRevision(input.expectedRecordRevision);
     const client = clientFor(context, options);
     try {
       const current = await client.getRecord({ zone: context.providerZone, providerRecordId: id });
       if (revisionForRecord(current) !== expected) fail("DNS_RECORD_CHANGED");
+      writableRecordType(current.recordType);
+      await assertNamesWritable(context, [current.subdomain]);
       await client.deleteRecord({ zone: context.providerZone, providerRecordId: id });
       return { providerRecordId: id };
     } catch (error) {

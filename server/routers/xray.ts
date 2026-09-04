@@ -105,6 +105,7 @@ import {
   createDnsProviderRecord,
   DnsProviderRecordServiceError,
   listDnsProviderRecords,
+  listDnsProviderRecordGroups,
   removeDnsProviderRecord,
   updateDnsProviderRecord,
 } from "../dnsProviderRecordService";
@@ -718,7 +719,7 @@ function dnsProviderRecordTrpcError(error: unknown): never {
   if (!(error instanceof DnsProviderRecordServiceError)) return internalXrayTrpcError();
   const code = error.code === "DNS_ZONE_NOT_FOUND" || error.code === "DNS_RECORD_NOT_FOUND"
     ? "NOT_FOUND"
-    : error.code === "DNS_ZONE_IN_USE" || error.code === "DNS_RECORD_CHANGED"
+    : error.code === "DNS_ZONE_IN_USE" || error.code === "DNS_SUBDOMAIN_IN_USE" || error.code === "DNS_RECORD_CHANGED"
       ? "CONFLICT"
       : error.code === "DNS_PROVIDER_NOT_CONFIGURED" || error.code === "DNS_PROVIDER_VALIDATION_STALE"
         || error.code === "DNS_PROVIDER_CATALOG_STALE"
@@ -894,11 +895,19 @@ export const xrayRouter = router({
       }),
   }),
   dnsRecords: router({
+    groups: adminProcedure
+      .input(z.object({ zoneId: positiveId, search: z.string().trim().max(128).optional(), page, pageSize: pageSize.default(20) }).strict())
+      .query(async ({ input, ctx }) => {
+        setSensitiveResponseHeaders(ctx.res);
+        try { return await listDnsProviderRecordGroups(input); }
+        catch (error) { dnsProviderRecordTrpcError(error); }
+      }),
     list: adminProcedure
       .input(z.object({
         zoneId: positiveId,
         search: z.string().trim().max(128).optional(),
         recordType: z.string().trim().min(1).max(16).regex(/^[A-Za-z][A-Za-z0-9]{0,15}$/).optional(),
+        subdomain: z.string().trim().min(1).max(253).optional(),
         page,
         pageSize: pageSize.default(20),
       }).strict())

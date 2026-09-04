@@ -5,7 +5,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 
-test("DNS record service lists records, protects revisions, and locks zones used by quick config", () => {
+test("DNS record service groups names and protects only used subdomains, including both sides of a rename", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forwardx-dns-record-service-"));
   const script = String.raw`
     import assert from "node:assert/strict";
@@ -190,15 +190,109 @@ test("DNS record service lists records, protects revisions, and locks zones used
       );
       const readOnlyList = await service.listDnsProviderRecords({ zoneId: zone.zoneId, page: 1, pageSize: 20 }, options);
       assert.equal(readOnlyList.zone.inUse, true);
+      const free = await service.createDnsProviderRecord({
+        zoneId: zone.zoneId, subdomain: "free", recordType: "A",
+        lineId: defaultLine.lineId, value: "1.1.1.1", ttl: 600,
+      }, options);
+      assert.ok(free.providerRecordId);
       await expectCode(service.createDnsProviderRecord({
         zoneId: zone.zoneId,
-        subdomain: "blocked",
+        subdomain: "MANAGED",
         recordType: "A",
         lineId: defaultLine.lineId,
         value: "1.1.1.1",
         ttl: 600,
-      }, options), "DNS_ZONE_IN_USE");
-      assert.equal(records.some((item) => item.subdomain === "blocked"), false);
+      }, options), "DNS_SUBDOMAIN_IN_USE");
+      assert.equal(records.some((item) => item.subdomain === "managed"), false);
+
+      await service.createDnsProviderRecord({
+        zoneId: zone.zoneId, subdomain: "www", recordType: "AAAA",
+        lineId: defaultLine.lineId, value: "2001:4860:4860::8888", ttl: 600,
+      }, options);
+      const groups = await service.listDnsProviderRecordGroups({ zoneId: zone.zoneId, pageSize: 100 }, options);
+      assert.equal(groups.items.find((g) => g.subdomain === "www").recordCount, 2);
+      assert.deepEqual(groups.items.find((g) => g.subdomain === "www").recordTypes, ["A", "AAAA"]);
+      assert.equal(groups.items.find((g) => g.subdomain === "managed").recordCount, 0);
+      assert.equal(groups.items.find((g) => g.subdomain === "managed").inUse, true);
+      const matched = await service.listDnsProviderRecordGroups({ zoneId: zone.zoneId, search: "8.8.8.8" }, options);
+      assert.equal(matched.items[0].recordCount, 2);
+      const paged = await service.listDnsProviderRecordGroups({ zoneId: zone.zoneId, pageSize: 1, page: 2 }, options);
+      assert.equal(paged.total, groups.total);
+      assert.equal(paged.items[0].fqdn, groups.items[1].fqdn);
+      const detail = await service.listDnsProviderRecords({ zoneId: zone.zoneId, subdomain: "www" }, options);
+      assert.equal(detail.total, 2);
+      assert.equal(detail.subdomain.inUse, false);
+      const exactMissing = await service.listDnsProviderRecords({ zoneId: zone.zoneId, subdomain: "ww" }, options);
+      assert.equal(exactMissing.total, 0);
+      const www = detail.items.find((r) => r.recordType === "A");
+      await expectCode(service.updateDnsProviderRecord({
+        zoneId: zone.zoneId, providerRecordId: www.providerRecordId,
+        expectedRecordRevision: www.recordRevision, subdomain: "managed",
+        recordType: "A", lineId: defaultLine.lineId, value: "1.1.1.1", ttl: 600,
+      }, options), "DNS_SUBDOMAIN_IN_USE");
+
+      records.push({ ...records[0], providerRecordId: "900", subdomain: "managed" });
+      const locked = await service.listDnsProviderRecords({ zoneId: zone.zoneId, subdomain: "managed" }, options);
+      assert.equal(locked.items[0].inUse, true);
+      assert.equal(locked.subdomain.inUse, true);
+      await expectCode(service.updateDnsProviderRecord({
+        zoneId: zone.zoneId, providerRecordId: "900", expectedRecordRevision: locked.items[0].recordRevision,
+        subdomain: "renamed", recordType: "A", lineId: defaultLine.lineId, value: "1.1.1.1", ttl: 600,
+      }, options), "DNS_SUBDOMAIN_IN_USE");
+      await expectCode(service.removeDnsProviderRecord({
+        zoneId: zone.zoneId, providerRecordId: "900", expectedRecordRevision: locked.items[0].recordRevision,
+      }, options), "DNS_SUBDOMAIN_IN_USE");
+
+      const qc = (await runtime.queryRaw("SELECT id FROM xray_quick_configs"))[0];
+      await runtime.executeRaw(
+        "INSERT INTO xray_quick_config_domain_claims (claimKey, dnsAccountId, zoneId, normalizedRelativeName, quickConfigId, revision, createdAt, updatedAt) VALUES (?, ?, ?, 'next', ?, 1, ?, ?)",
+        ["c".repeat(64), account.accountId, zone.zoneId, qc.id, new Date(), new Date()],
+      );
+      await expectCode(service.createDnsProviderRecord({
+        zoneId: zone.zoneId, subdomain: "next", recordType: "A",
+        lineId: defaultLine.lineId, value: "1.1.1.1", ttl: 600,
+      }, options), "DNS_SUBDOMAIN_IN_USE");
+      await runtime.executeRaw(
+        "INSERT INTO xray_quick_config_dns_records (quickConfigId, routeId, dnsAccountId, zoneId, recordTag, fqdn, recordType, providerLineId, value, ttl, status, appliedRevision, remoteTupleHash, createdAt, updatedAt) VALUES (?, 1, ?, ?, 'old-dns', 'old.example.com', 'A', '0', '1.1.1.1', 600, 'DELETE_PENDING', 1, ?, ?, ?)",
+        [qc.id, account.accountId, zone.zoneId, "d".repeat(64), new Date(), new Date()],
+      );
+      await runtime.executeRaw("UPDATE xray_quick_configs SET state = 'REMOVED' WHERE id = ?", [qc.id]);
+      await expectCode(service.createDnsProviderRecord({
+        zoneId: zone.zoneId, subdomain: "old", recordType: "A",
+        lineId: defaultLine.lineId, value: "1.1.1.1", ttl: 600,
+      }, options), "DNS_SUBDOMAIN_IN_USE");
+      await runtime.executeRaw("UPDATE xray_quick_config_dns_records SET status = 'REMOVED'");
+      const operationId = await runtime.insertAndGetId("xray_quick_config_operations", {
+        operationTag: "domain-switch", quickConfigId: qc.id, type: "EDIT", status: "RUNNING",
+        phase: "DNS_REMOVING", expectedRevision: 1, requestSummaryJson: "{}", createdByUserId: 1,
+      });
+      await runtime.insertAndGetId("xray_quick_config_dns_record_backups", {
+        operationId, dnsAccountId: account.accountId, zoneId: zone.zoneId, providerRecordId: "800",
+        fqdn: "retiring.example.com", recordType: "A", providerLineId: "0", value: "1.1.1.1",
+        ttl: 600, remoteTupleHash: "e".repeat(64), snapshotOrder: 0, state: "CAPTURED",
+      });
+      await expectCode(service.createDnsProviderRecord({
+        zoneId: zone.zoneId, subdomain: "retiring", recordType: "A",
+        lineId: defaultLine.lineId, value: "1.1.1.1", ttl: 600,
+      }, options), "DNS_SUBDOMAIN_IN_USE");
+      await runtime.executeRaw("UPDATE xray_quick_config_operations SET status = 'SUCCESS', phase = 'COMPLETED' WHERE id = ?", [operationId]);
+      const released = await service.listDnsProviderRecordGroups({ zoneId: zone.zoneId }, options);
+      assert.equal(released.items.some((g) => g.inUse), false);
+      await service.createDnsProviderRecord({
+        zoneId: zone.zoneId, subdomain: "old", recordType: "A",
+        lineId: defaultLine.lineId, value: "1.1.1.1", ttl: 600,
+      }, options);
+
+      const originalGet = client.getRecord;
+      client.getRecord = async (input) => {
+        const result = await originalGet(input);
+        await runtime.executeRaw("UPDATE xray_quick_configs SET state = 'ACTIVE', fqdn = 'www.example.com', relativeName = 'www' WHERE id = ?", [qc.id]);
+        return result;
+      };
+      await expectCode(service.removeDnsProviderRecord({
+        zoneId: zone.zoneId, providerRecordId: www.providerRecordId, expectedRecordRevision: www.recordRevision,
+      }, options), "DNS_SUBDOMAIN_IN_USE");
+      assert.ok(records.some((r) => r.providerRecordId === www.providerRecordId));
     } finally {
       await runtime.closeDatabase();
     }

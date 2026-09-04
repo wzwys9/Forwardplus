@@ -706,3 +706,10 @@ MAINT-006 已以提交 `d2af667`、`281e0e8`、`e61ef7a`（交接提交 `bca83c9
 - provider client 回归用有效数字 recordId 调用 `DescribeRecord`，模拟 DNSPod 返回 `InvalidParameter.RecordIdInvalid`，断言稳定错误为 `DNS_PROVIDER_RECORD_NOT_FOUND`，且错误对象、JSON 和 stack 不暴露 provider code、message、RequestId 或凭据。
 - 保留现有同步决策回归：单记录不存在且完整列表没有精确匹配时进入 CREATE；存在未归属同值、重复或跨配置记录时仍 fail closed。
 - 只运行 DNSPod client 和快速配置同步决策聚焦测试、TypeScript、VitePress 文档构建与差异检查；不执行真实 DNS 写入、浏览器、Go、六引擎或服务端全量。
+
+## 76. MAINT-022 子域名管理与编辑域名选择（2026-09-05）
+
+- SQLite 服务回归：同 zone 的已用/未用子域名分别锁定/可写；update 原名和目标名双检查，getRecord 等待期间出现占用仍拒绝；claim、未清理记录、活动操作保持保护，清理后解除。
+- 聚合回归：同名称跨线路/IP只计一组，聚合后分页，二级精确过滤不包含相似名称，零远端记录的受管名称仍显示只读。
+- 编辑回归：保留原域名/更换域名切换失效旧确认并保留可复用草稿；原域名只有严格匹配的托管记录可合并确认，第三方/漂移记录需显式确认。
+- 集中执行上述聚焦测试、TypeScript、前端构建与文档构建；未改 Agent，不跑 Go/协议或服务端全量，不操作线上 DNS。
