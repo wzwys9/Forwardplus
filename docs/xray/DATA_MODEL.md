@@ -1,6 +1,6 @@
 # Xray 数据模型
 
-状态：第一版、多协议增量模型与独立 managed-services 模型已实施；DNSPod 快速配置与同步模型已批准，与 `SPEC.md` 0.26 配套。
+状态：第一版、多协议增量模型与独立 managed-services 模型已实施；DNSPod 快速配置、多跳路径与同步模型已批准，与 `SPEC.md` 0.27 配套。
 
 ## 1. 设计原则
 
