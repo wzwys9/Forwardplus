@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { serializeQuickConfigRelays } from "./xrayQuickConfigTopology";
 
 import { pushAgentRefresh } from "./agentEvents";
 import { quoteIdentifier } from "./dbCompat";
@@ -263,6 +264,7 @@ async function replacementRecords(plan: QuickConfigImmutablePlan) {
 }
 
 type RouteDraft = {
+  relayHopsJson: string | null;
   lineCategory: "DEFAULT" | "TELECOM" | "UNICOM" | "MOBILE" | "EDUCATION";
   providerLineId: string;
   sourceType: "LANDING" | "MANAGED_HOST";
@@ -283,6 +285,7 @@ function routeDrafts(plan: QuickConfigImmutablePlan): RouteDraft[] {
       hostId: endpoint.hostId,
       addressFamily: endpoint.addressFamily,
       address: endpoint.address,
+      relayHopsJson: serializeQuickConfigRelays(endpoint.relays ?? []),
       routeMode: landing ? "DIRECT" as const : "FORWARD" as const,
     };
   }));
@@ -295,6 +298,8 @@ function routeDrafts(plan: QuickConfigImmutablePlan): RouteDraft[] {
     hostId: candidate.hostId,
     addressFamily: candidate.addressFamily,
     address: candidate.address,
+    relayHopsJson: serializeQuickConfigRelays(candidate.sourceType === "MANAGED_HOST"
+      ? plan.carrierRoutes.flatMap(route => route.endpoints).find(endpoint => endpoint.hostId === candidate.hostId && endpoint.addressFamily === candidate.addressFamily)?.relays ?? [] : []),
     routeMode: candidate.sourceType === "LANDING" ? "DIRECT" as const : "FORWARD" as const,
   }));
   const seen = new Set<string>();

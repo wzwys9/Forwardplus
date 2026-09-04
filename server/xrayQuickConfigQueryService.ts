@@ -1,3 +1,4 @@
+import { parseQuickConfigRelays, type QuickConfigRelay } from "./xrayQuickConfigTopology";
 import {
   resolveStoredXrayInboundDefinition,
   type XrayProfileShareFormat,
@@ -68,6 +69,7 @@ export type QuickConfigSummary = Readonly<{
 }>;
 
 export type QuickConfigRouteDto = Readonly<{
+  relays: QuickConfigRelay[];
   routeId: number;
   lineCategory: QuickConfigLineCategory;
   providerLineId: string;
@@ -115,6 +117,7 @@ export type QuickConfigOperationDto = Readonly<{
 
 export type QuickConfigDetail = QuickConfigSummary & Readonly<{
   target: Readonly<{
+    host?: { id: number; name: string };
     targetVersion: string;
     protocol: string;
     endpoint: Readonly<{ address: string; port: number }>;
@@ -348,7 +351,7 @@ const summarySelect = (where: string) => {
                  qc.${q("targetType")}, qc.${q("xrayInboundId")}, qc.${q("externalProxyNodeId")},
                  qc.${q("state")}, qc.${q("currentOperationId")}, qc.${q("createdAt")}, qc.${q("updatedAt")},
                  qc.${q("targetVersion")}, qc.${q("activeTopologyRevisionId")}, qc.${q("desiredTopologyRevisionId")},
-                 xi.${q("name")} AS ${q("inboundName")}, xi.${q("publicAddress")} AS ${q("inboundAddress")},
+                 xi.${q("hostId")} AS ${q("inboundHostId")}, xi.${q("name")} AS ${q("inboundName")}, xi.${q("publicAddress")} AS ${q("inboundAddress")},
                  xi.${q("listenPort")} AS ${q("inboundPort")}, xi.${q("protocol")} AS ${q("inboundProtocol")},
                  xi.${q("transport")} AS ${q("inboundTransport")}, xi.${q("security")} AS ${q("inboundSecurity")},
                  xi.${q("profileId")} AS ${q("inboundProfileId")}, xi.${q("specVersion")} AS ${q("inboundSpecVersion")},
@@ -442,7 +445,7 @@ async function loadTopology(topologyRevisionId: number | null, quickConfigId: nu
   if (!row) invalidProjection();
   const routes = await queryRaw<Row>(
     `SELECT ${q("id")}, ${q("lineCategory")}, ${q("providerLineId")}, ${q("sourceType")}, ${q("hostId")},
-            ${q("addressFamily")}, ${q("address")}, ${q("routeMode")}, ${q("state")}
+            ${q("addressFamily")}, ${q("address")}, ${q("routeMode")}, ${q("relayHopsJson")}, ${q("state")}
        FROM ${q("xray_quick_config_routes")}
       WHERE ${q("topologyRevisionId")} = ? AND ${q("quickConfigId")} = ?
       ORDER BY ${q("sortOrder")} ASC, ${q("id")} ASC`,
@@ -456,6 +459,7 @@ async function loadTopology(topologyRevisionId: number | null, quickConfigId: nu
     targetAddress: boundedText(row.targetAddress, 512),
     targetPort: port(row.targetPort),
     routes: routes.map((route) => ({
+      relays: parseQuickConfigRelays(route.relayHopsJson),
       routeId: positiveInteger(route.id),
       lineCategory: enumValue(route.lineCategory, LINE_CATEGORIES),
       providerLineId: boundedText(route.providerLineId, 128),
@@ -502,7 +506,7 @@ async function loadRules(
     [quickConfigId, ...ids.params],
   );
   const routeRows = await queryRaw<Row>(
-    `SELECT ${q("topologyRevisionId")}, ${q("hostId")}, ${q("lineCategory")}
+    `SELECT ${q("topologyRevisionId")}, ${q("hostId")}, ${q("lineCategory")}, ${q("relayHopsJson")}
        FROM ${q("xray_quick_config_routes")}
       WHERE ${q("quickConfigId")} = ? AND ${q("topologyRevisionId")} IN ${ids.sql}
         AND ${q("routeMode")} = 'FORWARD'
@@ -514,10 +518,12 @@ async function loadRules(
     const topologyId = positiveInteger(route.topologyRevisionId);
     const hostId = optionalPositiveInteger(route.hostId);
     if (hostId === null) continue;
-    const key = `${topologyId}:${hostId}`;
-    const lines = linesByTopologyHost.get(key) ?? new Set<QuickConfigLineCategory>();
-    lines.add(enumValue(route.lineCategory, LINE_CATEGORIES));
-    linesByTopologyHost.set(key, lines);
+    for (const hopHostId of [hostId, ...parseQuickConfigRelays(route.relayHopsJson).map(hop => hop.hostId)]) {
+      const key = `${topologyId}:${hopHostId}`;
+      const lines = linesByTopologyHost.get(key) ?? new Set<QuickConfigLineCategory>();
+      lines.add(enumValue(route.lineCategory, LINE_CATEGORIES));
+      linesByTopologyHost.set(key, lines);
+    }
   }
   const priority = (topologyId: number) => preferActiveTopology
     ? topologyId === activeTopologyRevisionId ? 2 : topologyId === desiredTopologyRevisionId ? 1 : 0
@@ -697,6 +703,7 @@ function targetDetail(
   }
   return {
     targetVersion: boundedText(row.targetVersion, 64),
+    ...(summary.targetType === "XRAY_INBOUND" && row.inboundHostId != null ? { host: { id: positiveInteger(row.inboundHostId), name: `Host #${positiveInteger(row.inboundHostId)}` } } : {}),
     protocol,
     endpoint: { address, port: endpointPort },
     shareCapability,
