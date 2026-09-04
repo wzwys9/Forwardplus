@@ -99,6 +99,7 @@ export type XrayQuickConfigFlowState = {
   editDefaultRoutes: XrayQuickConfigEditDraft["defaultRoutes"];
   portCheckId: string | null;
   portResult: XrayQuickConfigPortResult | null;
+  replaceProbeResult: { token: string; expiresAt: string } | null;
   defaultCandidateIds: string[];
   preview: XrayQuickConfigPreview | null;
   applyResult: XrayQuickConfigApplyResult | null;
@@ -142,6 +143,7 @@ export function initialXrayQuickConfigFlowState(draft?: XrayQuickConfigEditDraft
     editDefaultRoutes: draft?.defaultRoutes ?? [],
     portCheckId: null,
     portResult: null,
+    replaceProbeResult: null,
     defaultCandidateIds: [],
     preview: null,
     applyResult: null,
@@ -154,6 +156,21 @@ export function xrayQuickConfigEndpointKey(hostId: number, addressFamily: "IPV4"
 
 export function xrayQuickConfigCarriersComplete(state: XrayQuickConfigFlowState) {
   return XRAY_QUICK_CONFIG_CARRIERS.every((carrier) => state.carrierEndpoints[carrier].length > 0);
+}
+
+function replacementProbeResult(state: XrayQuickConfigFlowState) {
+  return state.portResult?.status === "SUCCESS"
+    ? { token: state.portResult.probeResultToken, expiresAt: state.portResult.expiresAt }
+    : state.replaceProbeResult;
+}
+
+export function activeXrayQuickConfigReplacementProbeToken(
+  state: XrayQuickConfigFlowState,
+  now = Date.now(),
+): string | undefined {
+  const replacement = replacementProbeResult(state);
+  const expiresAt = replacement ? Date.parse(replacement.expiresAt) : Number.NaN;
+  return replacement && Number.isFinite(expiresAt) && expiresAt > now ? replacement.token : undefined;
 }
 
 export function reduceXrayQuickConfigFlow(
@@ -179,6 +196,7 @@ export function reduceXrayQuickConfigFlow(
       manualPort: "",
       portCheckId: null,
       portResult: null,
+      replaceProbeResult: null,
       defaultCandidateIds: [],
       preview: null,
       applyResult: null,
@@ -202,6 +220,7 @@ export function reduceXrayQuickConfigFlow(
       editDefaultRoutes: action.draft.defaultRoutes,
       portCheckId: null,
       portResult: null,
+      replaceProbeResult: null,
       defaultCandidateIds: [],
       preview: null,
       applyResult: null,
@@ -223,6 +242,7 @@ export function reduceXrayQuickConfigFlow(
       manualPort: "",
       portCheckId: null,
       portResult: null,
+      replaceProbeResult: replacementProbeResult(state),
       defaultCandidateIds: [],
       preview: null,
       applyResult: null,
@@ -237,6 +257,7 @@ export function reduceXrayQuickConfigFlow(
       manualPort: "",
       portCheckId: null,
       portResult: null,
+      replaceProbeResult: replacementProbeResult(state),
       defaultCandidateIds: [],
       preview: null,
       applyResult: null,
@@ -251,6 +272,7 @@ export function reduceXrayQuickConfigFlow(
       manualPort: action.value,
       portCheckId: null,
       portResult: null,
+      replaceProbeResult: replacementProbeResult(state),
       defaultCandidateIds: [],
       preview: null,
       applyResult: null,
@@ -262,6 +284,7 @@ export function reduceXrayQuickConfigFlow(
       ...state,
       portCheckId: action.portCheckId,
       portResult: null,
+      replaceProbeResult: null,
       defaultCandidateIds: [],
       preview: null,
       applyResult: null,
@@ -274,6 +297,7 @@ export function reduceXrayQuickConfigFlow(
       ...state,
       portCheckId: null,
       portResult: action.result,
+      replaceProbeResult: null,
       defaultCandidateIds: success
         ? success.defaultRouteCandidates.filter((candidate) => state.editDefaultRoutes.length > 0
           ? state.editDefaultRoutes.some((route) => route.sourceType === candidate.sourceType
@@ -293,6 +317,7 @@ export function reduceXrayQuickConfigFlow(
       ...state,
       portCheckId: null,
       portResult: null,
+      replaceProbeResult: replacementProbeResult(state),
       defaultCandidateIds: [],
       preview: null,
       applyResult: null,

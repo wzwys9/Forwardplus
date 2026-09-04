@@ -281,6 +281,7 @@
 - `XRAY-QC-022` DNSPod CreateRecord 返回成功或结果不明确后，新记录允许在最多 30 秒的有界窗口内暂时不可查询；worker 必须用相同 FQDN/type/动态 lineId/value/TTL 和 provider recordId 轮询对账，不能立即报告失败。RETRY 只有在前序同 quick config 的 DNS_CREATE step 已实际进入尝试状态、远端 tuple 完全一致且 recordId 无其他面板归属时才可接管该记录；缺任一证明继续按 `DNS_RECORD_DRIFT` fail closed。
 - `XRAY-QC-023` 链路管理的“端口转发”主列表只展示真实 `port` 资源卡片，不追加规则级或主机级投影。快速配置创建的每条普通规则必须通过独立的 `portResourceGroupId` 归属一个同 owner、同 host、同 engine 的真实 `port` 资源：若恰有一个已启用候选则复用；若没有候选、候选不唯一或已存在同 identity 的系统资源则幂等使用/创建名称为“快速配置默认生成”的系统资源。该归属只服务资源目录与控制联动，不得复用 `forwardGroupId`、生成模板/子规则或改变 Agent desired。
 - `XRAY-QC-024` `port` 资源的引用数必须等于未待删除的用户模板规则数加快速配置规则数。快速配置引用大于零时，服务端必须拒绝停用、删除或改变资源 identity/runtime 字段，界面至少禁用关闭开关并说明原因；名称等纯展示字段是否可改由接口显式限制。面板启动时必须幂等收敛历史未归属或 engine 已变化的快速配置规则，不能重建数据面或重复下发 Agent。
+- `XRAY-QC-025` 受管 Xray 使用目标原端口时，其他入口主机的实际探测只能通过服务端内部派生的精确 `inboundId + port` target-alias 授权忽略该 inbound 自身的全局占用；授权在探测创建、Agent 任务派发和结果接受时都必须用单次一致性查询重新验证 ACTIVE allocation、稳定 runtimeTag、同主机公开 owning reference，不能由浏览器或 Agent 构造。快速配置重新检测或切换引擎时，可以提交上一轮服务端签名的 probe result token；服务端必须拒绝非规范编码，并先完整验证管理员、域名、目标和其中全部 host/network reservation，再一次性释放，任何错配不得部分释放。
 
 - `XRAY-AC-015` 一个加密保存并验证通过的 DNSPod 账户可列出多个可用 zone 和动态线路；无账号、错误凭据和失效验证会禁用创建且不泄露 SecretId/SecretKey。
 - `XRAY-AC-016` `dfd` 与 `hk.dfd` 能在所选 zone 下完成检查/确认；`@`、通配符和非法输入被拒绝。同名 A/AAAA/CNAME 必须显式确认替换，TXT/MX/CAA 保留，检查后竞态会在提交前被发现。
@@ -292,6 +293,7 @@
 - `XRAY-AC-022` provider 新建成功但记录短时不可见时，operation 在有界窗口内完成对账并保存 recordId；进程/网络在保存前中断后，新 RETRY 可以且只能凭前序写 intent 接管唯一精确匹配记录，不重复创建、不误接管第三方记录。
 - `XRAY-AC-023` 服务器 A 只有一个符合条件的 `port` 资源 `dfaf`，且一条用户模板规则和一条快速配置规则使用 A 时，`dfaf` 显示引用数 2，关闭开关不可用；服务器 B 没有符合条件的资源而存在快速配置规则时，同一列表出现真实的“快速配置默认生成”资源卡片，不显示“实际规则”主机汇总项或下方明细区。
 - `XRAY-AC-024` 历史规则收敛、创建、编辑新增 host、失败重试和 engine 切换后，每条活动快速配置规则都归属正确端口资源；重复启动/重试不重复创建系统资源，待删除规则不再计数，任何锁定绕过都由服务端拒绝。
+- `XRAY-AC-025` 已运行的受管 Xray 原端口可在其他入口主机完成 TCP/UDP 快速配置探测并生成 `TARGET_ALIAS`；切换引擎或立即重检不会撞到同一向导上一轮预留，而其他 Xray、规则、隧道、受管服务、跨管理员 token 和探测期间 owner 变化仍被拒绝。
 
 | kind | runtime/version | listener | 分享 | 开放门槛 |
 |---|---|---|---|---|

@@ -10,6 +10,7 @@ test("Xray port operations exclude known ports and reserve one concurrent probe 
   const databasePath = path.join(directory, "operations.db");
   const script = String.raw`
     import assert from "node:assert/strict";
+    import crypto from "node:crypto";
     import path from "node:path";
     import { pathToFileURL } from "node:url";
     const moduleUrl = (file) => pathToFileURL(path.join(process.cwd(), file)).href;
@@ -18,6 +19,7 @@ test("Xray port operations exclude known ports and reserve one concurrent probe 
     const backfill = await import(moduleUrl("server/globalPortBackfill.ts"));
     const reservations = await import(moduleUrl("server/portReservations.ts"));
     const operations = await import(moduleUrl("server/xrayPortOperations.ts"));
+    const planning = await import(moduleUrl("server/xrayQuickConfigPlanningService.ts"));
     const { xrayRouter } = await import(moduleUrl("server/routers/xray.ts"));
 
     const expectCode = async (promise, code) => assert.rejects(promise, (error) => error?.code === code);
@@ -35,6 +37,28 @@ test("Xray port operations exclude known ports and reserve one concurrent probe 
       },
       error: null,
     });
+    const stableValue = (value) => Array.isArray(value)
+      ? value.map(stableValue)
+      : value && typeof value === "object"
+        ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableValue(value[key])]))
+        : value;
+    const signPlanningToken = (payload, secret) => {
+      const key = crypto.createHmac("sha256", secret)
+        .update("forwardx-xray-quick-config-planning-token:v1", "utf8").digest();
+      const body = Buffer.from(JSON.stringify(stableValue(payload)), "utf8").toString("base64url");
+      const unsigned = "qcp1." + body;
+      return unsigned + "." + crypto.createHmac("sha256", key).update(unsigned, "utf8").digest("base64url");
+    };
+    const makeEquivalentNonCanonicalSignature = (token) => {
+      const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+      const parts = token.split(".");
+      const last = parts[2].at(-1);
+      const index = alphabet.indexOf(last);
+      assert.equal(index % 4, 0);
+      parts[2] = parts[2].slice(0, -1) + alphabet[index + 1];
+      assert.deepEqual(Buffer.from(parts[2], "base64url"), Buffer.from(token.split(".")[2], "base64url"));
+      return parts.join(".");
+    };
 
     try {
       await runtime.connectDatabase({ type: "sqlite", sqlite: { path: process.env.FORWARDX_TEST_DB } });
@@ -50,6 +74,60 @@ test("Xray port operations exclude known ports and reserve one concurrent probe 
       const held = reservations.tryReserveHostPort(10, 15000, "tcp");
       assert.ok(held);
       await backfill.backfillGlobalPortAllocations();
+
+      const [knownInbound] = await runtime.queryRaw("SELECT id FROM xray_inbounds WHERE runtimeTag = 'xray-known' LIMIT 1");
+      assert.ok(knownInbound?.id);
+      await expectCode(
+        operations.createXrayPortProbeOperation({ hostId: 11, userId: 1, mode: "MANUAL", manualPort: 14000 }),
+        "PORT_IN_USE",
+      );
+      const targetAliasProbe = await operations.createXrayPortProbeOperation({
+        hostId: 11,
+        userId: 1,
+        mode: "MANUAL",
+        manualPort: 14000,
+        targetAlias: { inboundId: Number(knownInbound.id), port: 14000 },
+      });
+      const [targetAliasTask] = await operations.takeXrayPortProbeTasks(11, 1);
+      assert.deepEqual(targetAliasTask.payload, { network: "tcp", listenAddress: "0.0.0.0", ports: [14000] });
+      await operations.completeXrayPortProbeTask(11, successfulResult(targetAliasTask));
+      const targetAliasResult = await operations.getXrayPortProbeOperationResult(targetAliasProbe.operationId, 1);
+      assert.equal(targetAliasResult.status, "SUCCESS");
+      operations.consumeXrayPortReservation({
+        reservationId: targetAliasResult.reservationId,
+        hostId: 11,
+        userId: 1,
+        port: 14000,
+      });
+
+      const invalidBeforeDispatchProbe = await operations.createXrayPortProbeOperation({
+        hostId: 11,
+        userId: 1,
+        mode: "MANUAL",
+        manualPort: 14000,
+        targetAlias: { inboundId: Number(knownInbound.id), port: 14000 },
+      });
+      await runtime.executeRaw("UPDATE xray_inbounds SET runtimeTag = 'xray-changed' WHERE id = ?", [knownInbound.id]);
+      assert.deepEqual(await operations.takeXrayPortProbeTasks(11, 1), []);
+      const invalidBeforeDispatchResult = await operations.getXrayPortProbeOperationResult(invalidBeforeDispatchProbe.operationId, 1);
+      assert.equal(invalidBeforeDispatchResult.status, "FAILED");
+      assert.equal(invalidBeforeDispatchResult.errorCode, "PORT_IN_USE");
+      await runtime.executeRaw("UPDATE xray_inbounds SET runtimeTag = 'xray-known' WHERE id = ?", [knownInbound.id]);
+
+      const staleTargetAliasProbe = await operations.createXrayPortProbeOperation({
+        hostId: 11,
+        userId: 1,
+        mode: "MANUAL",
+        manualPort: 14000,
+        targetAlias: { inboundId: Number(knownInbound.id), port: 14000 },
+      });
+      const [staleTargetAliasTask] = await operations.takeXrayPortProbeTasks(11, 1);
+      await runtime.executeRaw("UPDATE xray_inbounds SET runtimeTag = 'xray-changed' WHERE id = ?", [knownInbound.id]);
+      await operations.completeXrayPortProbeTask(11, successfulResult(staleTargetAliasTask));
+      const staleTargetAliasResult = await operations.getXrayPortProbeOperationResult(staleTargetAliasProbe.operationId, 1);
+      assert.equal(staleTargetAliasResult.status, "FAILED");
+      assert.equal(staleTargetAliasResult.errorCode, "PORT_IN_USE");
+      await runtime.executeRaw("UPDATE xray_inbounds SET runtimeTag = 'xray-known' WHERE id = ?", [knownInbound.id]);
 
       const usedOnOtherHost = await operations.collectXrayUsedPorts(11);
       assert.equal(usedOnOtherHost.has(28255), true);
@@ -228,6 +306,12 @@ test("Xray port operations exclude known ports and reserve one concurrent probe 
       const caller = xrayRouter.createCaller(context({ id: 1, username: "admin-a", role: "admin", accountEnabled: true }));
       const memberCaller = xrayRouter.createCaller(context({ id: 2, username: "member", role: "user", accountEnabled: true }));
       await assert.rejects(() => memberCaller.portProbes.create({ hostId: 10, mode: "MANUAL", manualPort: 16002 }), (error) => error?.code === "FORBIDDEN");
+      await assert.rejects(() => caller.portProbes.create({
+        hostId: 11,
+        mode: "MANUAL",
+        manualPort: 14000,
+        targetAlias: { inboundId: Number(knownInbound.id), port: 14000 },
+      }), (error) => error?.code === "BAD_REQUEST");
       await assert.rejects(() => caller.portProbes.create({ hostId: 10, mode: "AUTO", manualPort: 16002 }), (error) => error?.code === "BAD_REQUEST");
       const routed = await caller.portProbes.create({ hostId: 10, mode: "MANUAL", manualPort: 16002 });
       assert.equal((await caller.portProbes.result({ operationId: routed.operationId })).status, "QUEUED");
@@ -286,6 +370,76 @@ test("Xray port operations exclude known ports and reserve one concurrent probe 
         userId: 1,
         port: 16004,
       }, async (dual) => [dual.tcp.network, dual.udp.network]), ["tcp", "udp"]);
+
+      const batchTcpProbe = await caller.portProbes.create({ hostId: 10, mode: "MANUAL", manualPort: 16008, network: "TCP" });
+      const [batchTcpTask] = await operations.takeXrayPortProbeTasks(10, 1);
+      await operations.completeXrayPortProbeTask(10, successfulResult(batchTcpTask));
+      const batchTcp = await caller.portProbes.result({ operationId: batchTcpProbe.operationId });
+      const batchUdpProbe = await caller.portProbes.create({ hostId: 10, mode: "MANUAL", manualPort: 16008, network: "UDP" });
+      const [batchUdpTask] = await operations.takeXrayPortProbeTasks(10, 1);
+      await operations.completeXrayPortProbeTask(10, successfulResult(batchUdpTask));
+      const batchUdp = await caller.portProbes.result({ operationId: batchUdpProbe.operationId });
+      await expectCode(Promise.resolve().then(() => operations.releaseXrayPortProbeReservations({
+        userId: 2,
+        reservations: [
+          { reservationId: batchTcp.reservationId, hostId: 10, port: 16008, network: "TCP" },
+          { reservationId: batchUdp.reservationId, hostId: 10, port: 16008, network: "UDP" },
+        ],
+      })), "PORT_RESERVATION_MISMATCH");
+      assert.equal(operations.validateXrayPortReservation({ reservationId: batchTcp.reservationId, hostId: 10, userId: 1, port: 16008, network: "TCP" }).port, 16008);
+      assert.equal(operations.validateXrayPortReservation({ reservationId: batchUdp.reservationId, hostId: 10, userId: 1, port: 16008, network: "UDP" }).port, 16008);
+      const planningSecret = "quick-config-replacement-test-secret";
+      const confirmedDomainTokenHash = "b".repeat(64);
+      const targetVersion = "a".repeat(64);
+      const now = Date.now();
+      const replacementToken = signPlanningToken({
+        v: 1,
+        kind: "PROBE_RESULT",
+        nonce: "A".repeat(22),
+        runTag: "quick-config-test-run",
+        userId: 1,
+        confirmedDomainTokenHash,
+        targetType: "XRAY_INBOUND",
+        targetId: Number(knownInbound.id),
+        targetVersion,
+        engine: "realm",
+        selectedPort: 16008,
+        rewritten: true,
+        carrierRoutes: [],
+        carrierRoutesHash: "c".repeat(64),
+        hostSetHash: "d".repeat(64),
+        reservations: [
+          { reservationId: batchTcp.reservationId, hostId: 10, port: 16008, network: "tcp", operationId: batchTcp.operationId, expiresAt: batchTcp.expiresAt },
+          { reservationId: batchUdp.reservationId, hostId: 10, port: 16008, network: "udp", operationId: batchUdp.operationId, expiresAt: batchUdp.expiresAt },
+        ],
+        candidates: [],
+        issuedAt: now,
+        expiresAt: Math.min(Date.parse(batchTcp.expiresAt), Date.parse(batchUdp.expiresAt)),
+      }, planningSecret);
+      await expectCode(Promise.resolve().then(() => planning.releaseQuickConfigProbeResultReservations({
+        token: replacementToken,
+        userId: 2,
+        confirmedDomainTokenHash,
+        target: { targetType: "XRAY_INBOUND", targetId: Number(knownInbound.id), targetVersion },
+      }, { tokenSecret: planningSecret })), "QUICK_CONFIG_PREVIEW_INVALID");
+      assert.equal(operations.validateXrayPortReservation({ reservationId: batchTcp.reservationId, hostId: 10, userId: 1, port: 16008, network: "TCP" }).port, 16008);
+      const tamperedReplacementToken = makeEquivalentNonCanonicalSignature(replacementToken);
+      assert.notEqual(tamperedReplacementToken, replacementToken);
+      await expectCode(Promise.resolve().then(() => planning.releaseQuickConfigProbeResultReservations({
+        token: tamperedReplacementToken,
+        userId: 1,
+        confirmedDomainTokenHash,
+        target: { targetType: "XRAY_INBOUND", targetId: Number(knownInbound.id), targetVersion },
+      }, { tokenSecret: planningSecret })), "QUICK_CONFIG_PREVIEW_INVALID");
+      assert.equal(operations.validateXrayPortReservation({ reservationId: batchUdp.reservationId, hostId: 10, userId: 1, port: 16008, network: "UDP" }).port, 16008);
+      planning.releaseQuickConfigProbeResultReservations({
+        token: replacementToken,
+        userId: 1,
+        confirmedDomainTokenHash,
+        target: { targetType: "XRAY_INBOUND", targetId: Number(knownInbound.id), targetVersion },
+      }, { tokenSecret: planningSecret });
+      await expectCode(Promise.resolve().then(() => operations.validateXrayPortReservation({ reservationId: batchTcp.reservationId, hostId: 10, userId: 1, port: 16008, network: "TCP" })), "PORT_RESERVATION_EXPIRED");
+      await expectCode(Promise.resolve().then(() => operations.validateXrayPortReservation({ reservationId: batchUdp.reservationId, hostId: 10, userId: 1, port: 16008, network: "UDP" })), "PORT_RESERVATION_EXPIRED");
 
       const initialImmediateProbe = await operations.createXrayPortProbeOperation({ hostId: 10, userId: 1, mode: "MANUAL", manualPort: 16005 });
       const [initialImmediateTask] = await operations.takeXrayPortProbeTasks(10, 1);

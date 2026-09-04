@@ -69,6 +69,11 @@ export type GlobalPortAllocationDto = Readonly<{
   reservedUntil: string | null;
 }>;
 
+export type XrayInboundPortTargetAlias = Readonly<{
+  inboundId: number;
+  port: number;
+}>;
+
 type Row = Record<string, unknown>;
 const RESERVATION_TTL_MS = 60_000;
 const RECLAIM_DELAY_MS = 12 * 60 * 60 * 1_000;
@@ -304,6 +309,32 @@ export async function inspectGlobalPortReferenceAllocation(
   reference: GlobalPortReferenceInput,
 ): Promise<GlobalPortAllocationDto | null> {
   return (await allocationForReference(reference))?.allocation ?? null;
+}
+
+export async function assertActiveXrayInboundPortTargetAlias(
+  input: XrayInboundPortTargetAlias,
+): Promise<GlobalPortAllocationDto> {
+  const inboundId = positiveId(input.inboundId);
+  const port = newListenerPort(input.port);
+  const q = quoteIdentifier;
+  const rows = await queryRaw<Row>(
+    `SELECT a.*
+       FROM ${q("global_port_allocations")} a
+       JOIN ${q("global_port_allocation_references")} r ON r.${q("allocationId")} = a.${q("id")}
+       JOIN ${q("xray_inbounds")} i ON i.${q("id")} = r.${q("resourceId")}
+      WHERE a.${q("port")} = ? AND a.${q("status")} = 'ACTIVE'
+        AND a.${q("primaryOwnerType")} = 'XRAY_INBOUND' AND a.${q("primaryOwnerTag")} IS NOT NULL
+        AND r.${q("resourceType")} = 'XRAY_INBOUND' AND r.${q("resourceId")} = ?
+        AND r.${q("isOwning")} = ? AND r.${q("role")} = 'PUBLIC_LISTENER'
+        AND r.${q("ownerGroupTag")} = a.${q("primaryOwnerTag")}
+        AND r.${q("hostId")} = i.${q("hostId")}
+        AND i.${q("listenPort")} = a.${q("port")} AND i.${q("runtimeTag")} = a.${q("primaryOwnerTag")}
+        AND i.${q("isEnabled")} = ? AND i.${q("pendingDelete")} = ?
+      LIMIT 1`,
+    [port, inboundId, true, true, false],
+  );
+  if (!rows[0]) throw new GlobalPortAllocationError("GLOBAL_PORT_CONFLICT");
+  return allocationDto(rows[0]);
 }
 
 export async function assertGlobalPortAvailable(portValue: unknown, allowedOwner?: GlobalPortOwner): Promise<void> {

@@ -690,3 +690,10 @@ MAINT-006 已以提交 `d2af667`、`281e0e8`、`e61ef7a`（交接提交 `bca83c9
 4. **UI：** reducer/组件检查 Realm 默认、六项禁用原因、入口变化清除下游、全局单选、切换短暂中断提示、返回修改和实际 engine 展示；单个 320×500 Chromium 主流程覆盖创建与一次失败恢复。
 
 058A–E 只运行当前增量直接相关目标和 `git diff --check`；058F 集中运行上述目标、`corepack pnpm exec tsc --noEmit`、一次 `corepack pnpm docs:build`、一次生产构建和一个浏览器流程。由于合同复用现有 Agent payload，本阶段不新增 Go 合同测试或运行 Agent 全量；只有 Agent capability/payload 实际变化时才增加对应聚焦 Go 目标。
+
+## 74. MAINT-013 快速配置目标端口别名与重复探测（2026-09-04）
+
+- 端口 operation 回归覆盖：普通探测仍拒绝 ACTIVE Xray 端口；携带服务端内部精确 alias 时，其他入口 host 的 TCP/UDP 创建和 Agent 成功结果可建立短期 reservation；目标 inbound、listenPort、runtimeTag、allocation owner/reference 任一变化后在创建、任务派发或结果接受阶段 fail closed，并验证 alias 所需 allocation/reference/inbound 由单条一致性查询确认。
+- 快速配置重检覆盖：上一轮规范编码的签名 probe token 的多 host TCP/UDP reservation 先全量校验再一起释放；同管理员同域名同目标可在 engine/线路/端口变化后继续，跨管理员、篡改、非规范等价编码、跨目标、重复或缺失 reservation 零释放。
+- UI reducer 覆盖成功 token 在返回修改 engine/入口/端口后仅保留于内存，新检测受理后清除，过期 token 不再提交；普通创建向导 `replaceReservationIds`、外部目标、改写端口与 AUTO 探测保持原行为。
+- 只运行上述服务端/前端聚焦目标、`corepack pnpm exec tsc --noEmit`、版本一致性、一次生产构建、文档构建和差异检查；不运行无关 DNSPod 写入、六引擎真实运行、Agent Go 全量或浏览器矩阵。

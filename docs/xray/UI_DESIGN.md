@@ -370,7 +370,7 @@ Dialog 使用受限高度 flex 布局，标题/步骤固定，内容 `min-h-0` �
 5. **预览**：显示最终 FQDN、统一端口、四线路 A/AAAA、默认线路、按 host 去重的正式 Realm 规则、将替换/保留的 DNS 记录和全部警告。修改默认线路只清除此 preview。页面必须明确“此时尚未创建规则或修改 DNS”。
 6. **执行状态**：点击最终确认后冻结表单，显示持久 operation 的真实 phase、逐 host 规则和逐 record 状态；刷新页面可通过非敏感 quickConfigId/operationId 恢复，但 token、secret 和 URI 不进入 URL。
 
-token、probe reservation 或 preview 过期时保留仍合法的上游草稿，禁用前进并在对应步骤提供“重新检查”，不强制从头填写。向前按钮只按当前依赖启用；已完成步骤始终可返回。关闭未提交向导只停止轮询，最长 60 秒的短期 reservation 由服务端自动到期；已提交 operation 不因关闭 Dialog 或浏览器断开而取消。
+token、probe reservation 或 preview 过期时保留仍合法的上游草稿，禁用前进并在对应步骤提供“重新检查”，不强制从头填写。向前按钮只按当前依赖启用；已完成步骤始终可返回。成功端口检测后返回更换 engine、入口选择或端口时，前端只在内存保留上一轮 `probeResultToken + expiresAt` 作为下一次检测的替换凭证；新检测被服务端受理后立即清除，不能把 reservation ID 暴露为表单字段或写入 URL/浏览器持久存储。关闭未提交向导只停止轮询，最长 60 秒的短期 reservation 由服务端自动到期；已提交 operation 不因关闭 Dialog 或浏览器断开而取消。
 
 ### 16.4 详情、编辑、删除与部分失败
 

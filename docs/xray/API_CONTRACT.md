@@ -746,7 +746,7 @@ type CarrierRoutesInput = Array<{
 
 四种 carrier 必须各出现一次且每项至少一个 endpoint；同一 carrier 内的重复 endpoint 拒绝，跨 carrier 的相同 endpoint 必须保留为不同 DNS route，只在物理 Realm rule 计划层按 host 去重。服务端从 host 数据读取对应公开地址，检查在线、Agent capability、Realm runtime 和动态 line 归属，不接受任意 IP。
 
-`xray.quickConfigs.portChecksCreate` 输入 `{ confirmedDomainToken, carrierRoutes, choice:{ mode:"TARGET_ORIGINAL" } | { mode:"MANUAL", port:number } | { mode:"RECOMMENDED", recommendationToken:string } }`。服务端先查 global ledger，再对最终去重的物理 `FORWARD` host 并行创建既有 TCP/UDP `PORT_PROBE` operation；浏览器不能提供候选数组。返回严格判别联合：
+`xray.quickConfigs.portChecksCreate` 输入 `{ confirmedDomainToken, carrierRoutes, engine, choice:{ mode:"TARGET_ORIGINAL" } | { mode:"MANUAL", port:number } | { mode:"RECOMMENDED", recommendationToken:string }, replaceProbeResultToken?:string }`。`replaceProbeResultToken` 只用于同一向导交回上一轮服务端签名的成功结果；服务端必须验证 token 未过期并绑定当前管理员、confirmed domain 和同一 target/version，再完整验证其中数量受限、互异的全部 `host + network + selectedPort` reservation，全部通过后一次性释放。engine、carrier routes 和新 choice 允许改变；篡改、跨管理员、跨域名、跨目标或任一 reservation 错配都返回 `QUICK_CONFIG_PREVIEW_INVALID` 且零释放。服务端随后先查 global ledger，再对最终去重的物理 `FORWARD` host 并行创建既有 TCP/UDP `PORT_PROBE` operation；浏览器不能提供候选数组或 reservation ID。返回严格判别联合：
 
 ```ts
 type PortCheckStart =
@@ -771,7 +771,7 @@ type PortCheckResult =
 
 只有全部预期 `FORWARD` host 的 TCP/UDP 结果都匹配 host/network/port 且未过期才成功；异步探测发现占用时也按目标类型进入唯一的 `MANUAL/RECOMMENDED` 分支。operation 可以创建最长 60 秒、绑定当前管理员/host/network/port 的短期 reservation，但不会创建 global allocation。关闭向导无需发送 cancel；前端停止轮询，reservation 自动到期，apply 必须复核 TTL。
 
-受管 Xray 使用目标原端口时，目标 inbound 所在 host/address family 规划为 `LANDING/DIRECT`，不创建 Realm 规则，也不对已由该 inbound 合法持有的 listener 做空闲探测；它只通过账本的非 owning target alias 与实际 Xray runtime READY 复核。其他入口 host 仍规划为 `FORWARD` 并做 TCP/UDP 空闲检查。端口改写时包括落地主机在内的每个入口都必须建立 `新端口 -> 原端口` Realm 规则并参与探测。外部目标没有受管 landing host，全部选择的入口都属于 `FORWARD`。
+受管 Xray 使用目标原端口时，目标 inbound 所在 host/address family 规划为 `LANDING/DIRECT`，不创建转发规则，也不对已由该 inbound 合法持有的 listener 做空闲探测；它只通过账本的非 owning target alias 与实际 Xray runtime READY 复核。其他入口 host 仍规划为 `FORWARD` 并做 TCP/UDP 空闲检查。面板为这些内部 probe 派生不可由 tRPC 输入构造的 target-alias 授权，只允许精确 MANUAL 原端口忽略目标 inbound 自身的 ACTIVE 全局 allocation；operation metadata 只保存 `inboundId + port`，Agent payload 不变，创建、派发和结果接受均以单次一致性查询验证稳定 owner、同主机公开 owning reference 和 inbound 状态。端口改写时包括落地主机在内的每个入口都必须建立 `新端口 -> 原端口` 规则并参与探测。外部目标没有受管 landing host，全部选择的入口都属于 `FORWARD`。
 
 Realm 继续监听既有 `[::]:port` 且 `ipv6_only=false`，同 host 的 IPv4/IPv6 route 共用一条规则。现有 `PORT_PROBE` 不接受任意 IPv6 bind 地址；最终 apply 必须等 Realm 的实际双栈 listener readiness 后才能写 DNS，双栈 bind 失败返回 `RULE_APPLY_FAILED` 并补偿。
 

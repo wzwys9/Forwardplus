@@ -232,6 +232,7 @@ const quickConfigPortCheckCreateInput = z.object({
   carrierRoutes: quickConfigCarrierRoutes,
   engine: quickConfigForwardEngine,
   choice: quickConfigPortChoice,
+  replaceProbeResultToken: quickConfigToken.optional(),
 }).strict();
 const quickConfigPreviewInput = z.object({
   confirmedDomainToken: quickConfigToken,

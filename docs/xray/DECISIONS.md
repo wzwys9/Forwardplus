@@ -118,6 +118,7 @@
 | `XRAY-ADR-111` | 已确认 | `xray.portProbes.create` 以可选 `replaceReservationIds` 受控替换同一创建向导的最多一项 TCP 与一项 UDP 短期预留；先完整校验 owner/host/共同端口/网络唯一性，再一起释放并重新探测 | 界面明确允许“重新探测”，但旧实现先丢弃浏览器 reservation ID，导致新请求把自己的短期 host reservation 错报为 `PORT_IN_USE`。显式交回 ID 能支持单/双网络刷新，同时不放宽其他用户、数据库监听或全局账本门禁。 |
 | `XRAY-ADR-112` | 已废弃 | 旧版脚本首跳升级的兼容恢复只在 `FORWARDX_XRAY_ENABLED` 完全缺失且持久 `FORWARDPLUS_MIGRATE_AGENTS=true` 时启用 Xray UI；新版 systemd/Docker 安装器在普通升级中把该恢复值持久化为 `1`。任何显式 Xray 值都优先，其中空值、非法值和关闭值继续 fail closed | Shell 进程在下载新版脚本后不会重新加载函数；因此旧 `write_env()` 可在启动新程序前删除后来新增的 Xray 开关。迁移标记是管理员显式执行来源迁移留下的持久证据，可跨越这一首跳缺口；仅对“字段缺失”回退可避免覆盖管理员主动关闭。由 `XRAY-ADR-113` 取代。 |
 | `XRAY-ADR-113` | 已确认 | 由版本化 `FORWARDPLUS_XRAY_UI_POLICY_VERSION=1` 取代迁移标记推断并默认开启管理员 Xray UI。策略标记缺失的旧部署首次升级时无条件把历史 `FORWARDX_XRAY_ENABLED` 规范为 `1`；写入策略标记后才把后续显式关闭视为管理员选择并长期保留。本决定取代 `XRAY-ADR-110` 和 `XRAY-ADR-112` 的默认关闭与迁移标记回退规则 | 生产实例证明早期原版迁移可能同时缺少迁移标记并被旧安装器自动写入 `0`，该状态与管理员手工关闭无法从现有 `.env` 区分，导致入口在每次升级后继续隐藏。一次性策略迁移是覆盖全部历史迁移路径且仍允许未来明确关闭的最小兼容边界；代价是策略标记出现前的手工关闭会被开启一次。 |
+| `XRAY-ADR-114` | 已确认 | 快速配置探测受管 Xray 原端口时使用仅服务端可派生、创建/派发/结果三阶段一致性重验的精确 target-alias 授权；重复检测以旧规范编码的签名 probe result token 原子替换全部短期 reservation，不向浏览器暴露裸 reservation 集合 | 全局端口账本必须继续登记真实 Xray listener，但通用 probe 若无上下文会把合法目标引用误判为抢占；选择 engine 或立即重检又会撞到本向导上一轮 60 秒 host reservation。最小内部授权与签名批量替换同时保留跨主机唯一性和重检体验，且不修改 Agent payload 或数据库 schema。 |
 
 ## 更新规则
 

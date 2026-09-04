@@ -225,7 +225,9 @@ iptables、nftables、Realm、socat、GOST、Nginx 六种本地转发引用只�
 
 - DNS 账号 upsert 在写库前使用候选凭据完成远端验证和 zone/line 同步；轮换时还确认全部在用 zone/recordId 仍可访问，失败不覆盖旧凭据。已保存账号每次成功验证有效 24 小时，zone/line catalog 最多缓存 6 小时；catalog 到期先自动做一次有界刷新，失败返回 stale 投影并阻止新操作。任一过期不撤销已有 DNS。
 - 域名 check 只实时读取 DNSPod 并签发 5 分钟 token；管理员 confirm 后签发最长 10 分钟 confirmed token。任一输入、目标/account revision 或远端 record set 变化都会失效。
-- port check 可以持久创建既有 Agent probe operation 和短期 host reservation，但不创建 global allocation、quick config、普通规则或 DNS。对最终需新建 Realm listener 的 `FORWARD` host 集合并行检查 TCP/UDP，全部结果齐全才成功；受管 Xray 原端口在落地主机上的 `LANDING/DIRECT` route 不探测自身已占用 listener，改为核对合法账本 alias 与 Xray runtime READY。
+- port check 可以持久创建既有 Agent probe operation 和短期 host reservation，但不创建 global allocation、quick config、普通规则或 DNS。对最终需新建 listener 的 `FORWARD` host 集合并行检查 TCP/UDP，全部结果齐全才成功；受管 Xray 原端口在落地主机上的 `LANDING/DIRECT` route 不探测自身已占用 listener，改为核对合法账本 alias 与 Xray runtime READY。其他入口主机仍执行真实 bind 探测，但面板只可用内部 `inboundId + port` target-alias 授权从全局不可用集合排除目标自身 allocation，并在 operation 创建、Agent 任务派发和结果接受时分别以单条关联查询重验 ACTIVE owner、同主机公开 owning reference 与 inbound；本机数据库监听和短期 reservation 始终不能被该授权绕过。
+
+快速配置成功探测留下的 TCP/UDP reservation 最长 60 秒。用户返回更换 engine 或立即重检时，新请求可交回上一轮签名 probe result token；服务端验证完整 token 和其中全部 reservation 后一次性释放再创建新 probe。创建新 probe 已受理后旧 token 不可继续复用；关闭向导或 token 已过期时继续依赖现有 TTL 自动释放。
 - preview 只消费 confirmed domain/probe token 并纯计算 immutable topology、去重规则、A/AAAA 和 default route；不创建 Agent task 或任何业务记录。preview token 最长 5 分钟。
 
 ### 16.2 Apply saga

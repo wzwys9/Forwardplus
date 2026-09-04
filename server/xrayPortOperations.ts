@@ -20,7 +20,12 @@ import { getHostById } from "./repositories/hostRepository";
 import { getUsedPortsOnHost } from "./repositories/tunnelRepository";
 import { getXrayRuntimeReport } from "./repositories/xrayRepository";
 import { pushAgentRefresh } from "./agentEvents";
-import { collectUnavailableGlobalPorts } from "./globalPortAllocationService";
+import {
+  assertActiveXrayInboundPortTargetAlias,
+  collectUnavailableGlobalPorts,
+  GlobalPortAllocationError,
+  type XrayInboundPortTargetAlias,
+} from "./globalPortAllocationService";
 
 const MIN_XRAY_PORT = 1000;
 const MAX_XRAY_PORT = 65535;
@@ -74,6 +79,7 @@ type PortProbeRequestMeta = {
   mode: PortProbeMode;
   network: XrayListenerNetwork;
   candidates: number[];
+  targetAlias?: XrayInboundPortTargetAlias;
 };
 
 type PortOperationRow = {
@@ -150,9 +156,39 @@ function parseRequestMeta(value: unknown): PortProbeRequestMeta | null {
     if (candidates.some((port: number) => !Number.isInteger(port) || port < MIN_XRAY_PORT || port > MAX_XRAY_PORT)) return null;
     if (new Set(candidates).size !== candidates.length) return null;
     if ((parsed.mode === "MANUAL" || network === "udp") && candidates.length !== 1) return null;
-    return { schemaVersion: 1, mode: parsed.mode, network, candidates };
+    const targetAlias = normalizedTargetAlias(parsed.targetAlias, parsed.mode, candidates[0]);
+    return { schemaVersion: 1, mode: parsed.mode, network, candidates, ...(targetAlias ? { targetAlias } : {}) };
   } catch {
     return null;
+  }
+}
+
+function normalizedTargetAlias(
+  value: unknown,
+  mode: unknown,
+  manualPort: number | undefined,
+): XrayInboundPortTargetAlias | null {
+  if (value === undefined) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).some((key) => key !== "inboundId" && key !== "port")) {
+    throw new XrayPortOperationError("OPERATION_CONFLICT");
+  }
+  const alias = value as Record<string, unknown>;
+  const inboundId = Number(alias.inboundId);
+  const port = Number(alias.port);
+  if (mode !== "MANUAL" || !Number.isSafeInteger(inboundId) || inboundId <= 0
+    || !Number.isSafeInteger(port) || port !== manualPort) {
+    throw new XrayPortOperationError("OPERATION_CONFLICT");
+  }
+  return { inboundId, port };
+}
+
+async function assertTargetAliasAvailable(alias: XrayInboundPortTargetAlias): Promise<void> {
+  try {
+    await assertActiveXrayInboundPortTargetAlias(alias);
+  } catch (error) {
+    if (error instanceof GlobalPortAllocationError) throw new XrayPortOperationError("PORT_IN_USE");
+    throw error;
   }
 }
 
@@ -216,6 +252,7 @@ export async function createXrayPortProbeOperation(input: {
   manualPort?: unknown;
   network?: unknown;
   replaceReservationIds?: unknown;
+  targetAlias?: XrayInboundPortTargetAlias;
 }): Promise<{ operationId: string }> {
   const hostId = positiveId(input.hostId, "HOST_NOT_FOUND");
   const userId = positiveId(input.userId, "OPERATION_CONFLICT");
@@ -258,6 +295,8 @@ export async function createXrayPortProbeOperation(input: {
     const manualPort = mode === "MANUAL" ? normalizedPort(input.manualPort) : undefined;
     if (manualPort !== undefined && !allowed(manualPort)) throw new XrayPortOperationError("PORT_OUT_OF_RANGE");
     if (mode === "AUTO" && input.manualPort !== undefined) throw new XrayPortOperationError("OPERATION_CONFLICT");
+    const targetAlias = normalizedTargetAlias(input.targetAlias, mode, manualPort);
+    if (targetAlias) await assertTargetAliasAvailable(targetAlias);
     releaseReplacementXrayReservations({
       reservationIds: input.replaceReservationIds,
       hostId,
@@ -265,6 +304,12 @@ export async function createXrayPortProbeOperation(input: {
       manualPort,
     });
     const used = await collectXrayUsedPorts(hostId, network);
+    if (targetAlias) {
+      const locallyUsed = await collectXrayDatabasePorts(hostId, network);
+      if (!locallyUsed.has(targetAlias.port) && !reservedHostPorts(hostId, network).includes(targetAlias.port)) {
+        used.delete(targetAlias.port);
+      }
+    }
     let candidates: number[];
     if (mode === "MANUAL") {
       if (used.has(manualPort!)) throw new XrayPortOperationError("PORT_IN_USE");
@@ -277,7 +322,13 @@ export async function createXrayPortProbeOperation(input: {
 
     const operationId = crypto.randomUUID();
     const expiresAt = new Date(createdAt.getTime() + XRAY_PORT_PROBE_TTL_MS);
-    const requestMeta: PortProbeRequestMeta = { schemaVersion: 1, mode, network, candidates };
+    const requestMeta: PortProbeRequestMeta = {
+      schemaVersion: 1,
+      mode,
+      network,
+      candidates,
+      ...(targetAlias ? { targetAlias } : {}),
+    };
     await insertAndGetId("xray_operations", {
       operationId,
       hostId,
@@ -353,6 +404,15 @@ export async function takeXrayPortProbeTasks(hostIdValue: unknown, requestedLimi
     if (meta.network === "udp" && !supportsUdp) {
       await markPortOperationFailed(row.operationId, "FAILED", "UDP_CAPABILITY_REQUIRED", now);
       continue;
+    }
+    if (meta.targetAlias) {
+      try {
+        await assertActiveXrayInboundPortTargetAlias(meta.targetAlias);
+      } catch (error) {
+        if (!(error instanceof GlobalPortAllocationError)) throw error;
+        await markPortOperationFailed(row.operationId, "FAILED", "PORT_IN_USE", now);
+        continue;
+      }
     }
     const task = XrayTaskSchema.parse({
       schemaVersion: 1,
@@ -462,6 +522,39 @@ export function releaseXrayPortProbeReservation(input: {
   return true;
 }
 
+export function releaseXrayPortProbeReservations(input: {
+  userId: unknown;
+  reservations: ReadonlyArray<Readonly<{
+    reservationId: unknown;
+    hostId: unknown;
+    port: unknown;
+    network: unknown;
+  }>>;
+}) {
+  const userId = positiveId(input.userId, "PORT_RESERVATION_MISMATCH");
+  if (!Array.isArray(input.reservations) || input.reservations.length < 1 || input.reservations.length > 128) {
+    throw new XrayPortOperationError("OPERATION_CONFLICT");
+  }
+  const reservationIds = input.reservations.map((reservation) => String(reservation.reservationId ?? ""));
+  const scopes = input.reservations.map((reservation) => `${Number(reservation.hostId)}:${String(reservation.network).toLowerCase()}`);
+  if (new Set(reservationIds).size !== reservationIds.length || new Set(scopes).size !== scopes.length) {
+    throw new XrayPortOperationError("OPERATION_CONFLICT");
+  }
+  const validated = input.reservations.map((reservation) => validateXrayPortReservation({
+    reservationId: reservation.reservationId,
+    hostId: reservation.hostId,
+    userId,
+    port: reservation.port,
+    network: reservation.network,
+  }));
+  for (const reservation of validated) {
+    const entry = xrayReservations.get(reservation.reservationId);
+    if (!entry) throw new XrayPortOperationError("PORT_RESERVATION_EXPIRED");
+    removeXrayReservation(entry);
+  }
+  return validated;
+}
+
 function registerXrayReservation(input: {
   hostId: number;
   userId: number;
@@ -530,6 +623,16 @@ export async function completeXrayPortProbeTask(hostIdValue: unknown, rawResult:
     let selected: { port: number; reservation: HostPortReservation } | null = null;
     const available = new Set(result.result.ports.filter((item) => item.available).map((item) => item.port));
     const globallyUnavailable = await collectUnavailableGlobalPorts();
+    if (meta.targetAlias) {
+      try {
+        await assertActiveXrayInboundPortTargetAlias(meta.targetAlias);
+        globallyUnavailable.delete(meta.targetAlias.port);
+      } catch (error) {
+        if (!(error instanceof GlobalPortAllocationError)) throw error;
+        await markPortOperationFailed(operation.operationId, "FAILED", "PORT_IN_USE", now);
+        return { accepted: true };
+      }
+    }
     for (const port of meta.candidates) {
       if (!available.has(port) || globallyUnavailable.has(port)) continue;
       const reservation = await reserveSpecificHostPort({

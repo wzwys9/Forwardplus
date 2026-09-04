@@ -19,6 +19,7 @@ import type { AppRouterOutputs } from "@/lib/trpc";
 import { trpc } from "@/lib/trpc";
 import { formatXrayEndpoint } from "./xrayInboundPresentation";
 import {
+  activeXrayQuickConfigReplacementProbeToken,
   initialXrayQuickConfigFlowState,
   reduceXrayQuickConfigFlow,
   XRAY_QUICK_CONFIG_CARRIERS,
@@ -663,11 +664,13 @@ export function XrayQuickConfigDialog(props: {
     setPortError(null);
     setPreviewError(null);
     try {
+      const replaceProbeResultToken = activeXrayQuickConfigReplacementProbeToken(state);
       const result = await portCheckCreate.mutateAsync({
         confirmedDomainToken: state.confirmedDomainToken,
         carrierRoutes,
         engine: state.engine,
         choice,
+        ...(replaceProbeResultToken ? { replaceProbeResultToken } : {}),
       });
       if (result.status === "RUNNING") dispatch({ type: "PORT_CHECK_STARTED", portCheckId: result.portCheckId });
       else dispatch({ type: "PORT_CHECK_FINISHED", result });

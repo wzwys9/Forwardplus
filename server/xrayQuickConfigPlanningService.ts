@@ -17,6 +17,7 @@ import {
 } from "./dbRuntime";
 import { ENV } from "./env";
 import {
+  assertActiveXrayInboundPortTargetAlias,
   assertGlobalPortAvailable,
   GlobalPortAllocationError,
   inspectGlobalPortAllocation,
@@ -41,6 +42,7 @@ import { listXrayQuickConfigForwardEngines } from "./xrayQuickConfigForwardEngin
 import {
   createXrayPortProbeOperation,
   getXrayPortProbeOperationResult,
+  releaseXrayPortProbeReservations,
   validateXrayPortReservation,
   XrayPortOperationError,
 } from "./xrayPortOperations";
@@ -390,7 +392,10 @@ function parseSignedToken(raw: string, kind: SignedPayload["kind"], options: Pla
   const unsigned = `${parts[0]}.${parts[1]}`;
   const expected = crypto.createHmac("sha256", tokenKey(options.tokenSecret)).update(unsigned, "utf8").digest();
   const actual = Buffer.from(parts[2], "base64url");
-  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) fail("QUICK_CONFIG_PREVIEW_INVALID");
+  if (actual.toString("base64url") !== parts[2]
+    || actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
+    fail("QUICK_CONFIG_PREVIEW_INVALID");
+  }
   let parsed: unknown;
   try { parsed = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")); } catch { fail("QUICK_CONFIG_PREVIEW_INVALID"); }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) fail("QUICK_CONFIG_PREVIEW_INVALID");
@@ -513,21 +518,6 @@ function forwardHostsFor(
   return [...byHost].map(([hostId, hostName]) => ({ hostId, hostName })).sort((a, b) => a.hostId - b.hostId);
 }
 
-async function xrayInboundRuntimeTag(target: Extract<QuickConfigTarget, { targetType: "XRAY_INBOUND" }>): Promise<string> {
-  const q = quoteIdentifier;
-  const rows = await queryRaw<Row>(
-    `SELECT ${q("runtimeTag")}, ${q("listenPort")}, ${q("hostId")} FROM ${q("xray_inbounds")} WHERE ${q("id")} = ? LIMIT 1`,
-    [target.targetId],
-  );
-  const row = rows[0];
-  const runtimeTag = String(row?.runtimeTag ?? "");
-  if (!row || Number(row.listenPort) !== target.endpoint.port || Number(row.hostId) !== target.host.id
-    || !runtimeTag || runtimeTag.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(runtimeTag)) {
-    fail("QUICK_CONFIG_TARGET_CHANGED");
-  }
-  return runtimeTag;
-}
-
 function conflictReason(error: unknown): GlobalConflictReason | null {
   if (!(error instanceof GlobalPortAllocationError)) return null;
   if (error.code === "GLOBAL_PORT_CONFLICT" || error.code === "GLOBAL_PORT_LEGACY_CONFLICT"
@@ -538,10 +528,7 @@ function conflictReason(error: unknown): GlobalConflictReason | null {
 async function checkLedger(target: QuickConfigTarget, selectedPort: number, rewritten: boolean): Promise<GlobalConflictReason | null> {
   try {
     if (!rewritten && target.targetType === "XRAY_INBOUND") {
-      const runtimeTag = await xrayInboundRuntimeTag(target);
-      const allocation = await inspectGlobalPortAllocation(selectedPort);
-      if (!allocation || allocation.status !== "ACTIVE" || allocation.primaryOwnerType !== "XRAY_INBOUND"
-        || allocation.primaryOwnerTag !== runtimeTag) return "GLOBAL_PORT_CONFLICT";
+      await assertActiveXrayInboundPortTargetAlias({ inboundId: target.targetId, port: selectedPort });
       return null;
     }
     await assertGlobalPortAvailable(selectedPort);
@@ -755,6 +742,40 @@ function validateRecommendation(input: {
   return portNumber(parsed.recommendedPort);
 }
 
+export function releaseQuickConfigProbeResultReservations(input: {
+  token: string;
+  userId: number;
+  confirmedDomainTokenHash: string;
+  target: QuickConfigTarget;
+}, options: PlanningOptions = {}): void {
+  const payload = parseSignedToken(input.token, "PROBE_RESULT", options) as ProbeResultTokenPayload;
+  if (payload.userId !== input.userId
+    || !hashEqual(payload.confirmedDomainTokenHash, input.confirmedDomainTokenHash)
+    || payload.targetType !== input.target.targetType || payload.targetId !== input.target.targetId
+    || !hashEqual(payload.targetVersion, input.target.targetVersion)
+    || !Array.isArray(payload.reservations) || payload.reservations.length > 128) {
+    fail("QUICK_CONFIG_PREVIEW_INVALID");
+  }
+  const selectedPort = portNumber(payload.selectedPort);
+  const reservations = payload.reservations.map((reservation) => {
+    if (!reservation || typeof reservation !== "object") fail("QUICK_CONFIG_PREVIEW_INVALID");
+    const hostId = positiveInteger(reservation.hostId);
+    const network = reservation.network;
+    const reservationId = String(reservation.reservationId ?? "");
+    if ((network !== "tcp" && network !== "udp")
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(reservationId)) {
+      fail("QUICK_CONFIG_PREVIEW_INVALID");
+    }
+    return { reservationId, hostId, port: selectedPort, network };
+  });
+  if (reservations.length === 0) return;
+  try {
+    releaseXrayPortProbeReservations({ userId: input.userId, reservations });
+  } catch {
+    fail("QUICK_CONFIG_PREVIEW_INVALID");
+  }
+}
+
 async function createProbeRun(input: {
   userId: number;
   port: number;
@@ -795,6 +816,7 @@ async function startHostProbes(input: {
   hosts: readonly { hostId: number }[];
   userId: number;
   port: number;
+  targetAlias?: Readonly<{ inboundId: number; port: number }>;
 }): Promise<{ probes: ProbeDescriptor[]; failure?: PortCheckTokenPayload["startFailureCode"] }> {
   const settled = await Promise.all(input.hosts.flatMap((host) => (["tcp", "udp"] as const).map(async (network) => {
     try {
@@ -804,6 +826,7 @@ async function startHostProbes(input: {
         mode: "MANUAL",
         manualPort: input.port,
         network,
+        ...(input.targetAlias ? { targetAlias: input.targetAlias } : {}),
       });
       return { ok: true as const, probe: { hostId: host.hostId, network, operationId: operation.operationId } };
     } catch (error) {
@@ -825,6 +848,7 @@ export async function createQuickConfigPortCheck(input: {
   engine: XrayQuickConfigForwardEngine;
   choice: QuickConfigPortChoice;
   userId: number;
+  replaceProbeResultToken?: string;
 }, options: PlanningOptions = {}): Promise<QuickConfigPortCheckStart> {
   try {
     const now = resolvedNow(options);
@@ -866,6 +890,14 @@ export async function createQuickConfigPortCheck(input: {
       if (!hashEqual(recommendation.hostSetHash, cohortHash)) fail("QUICK_CONFIG_PREVIEW_INVALID");
     }
     if (!await portAllowedForHosts(selectedPort, forwardHosts)) fail("QUICK_CONFIG_HOST_UNAVAILABLE");
+    if (input.replaceProbeResultToken) {
+      releaseQuickConfigProbeResultReservations({
+        token: input.replaceProbeResultToken,
+        userId,
+        confirmedDomainTokenHash,
+        target: domain.target,
+      }, options);
+    }
     const ledgerConflict = await editAwareLedgerConflict(domain, selectedPort, rewritten, editSnapshot);
     if (ledgerConflict) {
       return recommendationResponse({
@@ -884,7 +916,14 @@ export async function createQuickConfigPortCheck(input: {
     }
 
     const run = await createProbeRun({ userId, port: selectedPort, hostSetHash: cohortHash, hostCount: forwardHosts.length, now });
-    const started = await startHostProbes({ hosts: forwardHosts, userId, port: selectedPort });
+    const started = await startHostProbes({
+      hosts: forwardHosts,
+      userId,
+      port: selectedPort,
+      ...(!rewritten && domain.target.targetType === "XRAY_INBOUND"
+        ? { targetAlias: { inboundId: domain.target.targetId, port: selectedPort } }
+        : {}),
+    });
     const payload: PortCheckTokenPayload = {
       v: 1,
       kind: "PORT_CHECK",
