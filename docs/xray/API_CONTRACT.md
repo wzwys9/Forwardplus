@@ -234,10 +234,13 @@ type XrayHostOption = {
   mode: "AUTO" | "MANUAL";
   manualPort?: number;
   network?: "TCP" | "UDP";
+  replaceReservationIds?: string[];
 }
 ```
 
 `network` 省略时保持兼容并固定为 `TCP`。TCP AUTO 由面板从 `1000–65535` 生成最多 32 个候选；MANUAL 只探测指定端口。UDP 的 AUTO/MANUAL 每个 task 都只发送一个候选，失败后由管理员或有界服务流程重新发起，不能把端口范围交给 Agent。前端不能上传任意候选数组绕过端口策略。
+
+`replaceReservationIds` 是向后兼容的可选数组，只供同一创建向导重新探测时交回当前主/次 reservation，最多两项、必须是互异 UUID。仍有效的每项必须属于当前管理员和 `hostId`，最多各含一项 TCP/UDP，且全部端口相同；MANUAL 时还必须等于 `manualPort`。缺失或过期 ID 按已释放处理，其他错配返回 `PORT_RESERVATION_MISMATCH`，并且任何错配都不能部分释放。全部验证通过后，服务端先释放这些短期预留，再重新执行主机策略、数据库、全局账本和 Agent bind 探测；不携带该字段的既有调用保持原行为。
 
 UDP 请求要求主机最近一次有效 capability 同时明确 `supportsUdpPortProbe=true` 和 `supportsUdpListenerReadiness=true`，否则返回 `UDP_CAPABILITY_REQUIRED` 且不创建 operation。operation metadata、结果和 reservation 都返回规范化 `network`。
 

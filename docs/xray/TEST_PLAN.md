@@ -48,6 +48,7 @@ TASK057 端口资源归属补充只跑聚焦矩阵：一个 SQLite repository �
 - Agent bind 探测能区分可用、占用和权限错误，不返回进程信息。
 - 两个并发创建不会取得同一 reservation/端口。
 - reservation 过期、host 不匹配、管理员不匹配被拒绝。
+- 同一向导取得 MANUAL reservation 后立即重新探测同一端口可受控替换，不误报自己的旧预留；TCP+UDP 两项一起释放且新两项可重新取得。重复 ID、超过两项、其他管理员/主机/端口或同网络两项全部拒绝并保持原预留有效，替换期间新增的数据库/全局占用继续返回 `PORT_IN_USE`。
 - probe 成功后端口被抢占时，应用失败为 `PORT_IN_USE`，旧配置继续。
 
 ## 5. Reality 扫描

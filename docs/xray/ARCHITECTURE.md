@@ -95,6 +95,8 @@ Agent reports appliedGeneration/configHash/listeners
 8. Agent 切换配置，等待进程和监听器就绪，报告 applied state；面板随后把 allocation 转为 `ACTIVE`。
 9. 面板只有在 observed state 确认后显示“运行中”。
 
+创建向导重复探测不是一个独立 owner。浏览器必须把当前向导仍持有的主/次 reservation ID 显式交回；面板在同一 host 创建锁内先完整验证 owner、host、共同端口和网络唯一性，再一起释放有效旧预留并从第 2 步重新检查。不能仅从通用 `usedPorts` 集合删除旧端口，因为该集合也可能包含探测期间新增的数据库或全局账本占用。
+
 若第 5 步前主机离线或短期预留过期，不创建 inbound；已经取得但未消费的持久 allocation 转为 `PENDING_SCAN`，不能直接复用。第 5 步后失败则保留明确的期望状态、allocation 引用和失败操作，便于重试、补偿和审计。
 
 ## 6. 运行时托管

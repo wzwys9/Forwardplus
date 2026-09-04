@@ -27,6 +27,7 @@ import {
 } from "@/components/xray/xrayCreateDeployment";
 import {
   availableXrayCreateProfiles,
+  currentXrayPortReplacementIds,
   initialXrayCreateState,
   listenerNetworkForXrayProfile,
   listenerNetworksMatch,
@@ -204,8 +205,15 @@ export function XrayCreateDialog({ operationId, onClose, onOperationStarted, onS
     if (createProbe.isPending || !setup.hostId) return;
     if (!currentHost?.canCreateXrayInbound) return setupDispatch({ type: "PROBE_FAILED", errorCode: "HOST_OFFLINE" });
     setNow(Date.now());
+    const replaceReservationIds = currentXrayPortReplacementIds(setup);
     setupDispatch({ type: "RESET_PROBE" });
-    createProbe.mutate({ hostId: setup.hostId, mode: setup.portMode, network: listenerNetwork, ...(setup.portMode === "MANUAL" ? { manualPort: Number(setup.manualPort) } : {}) });
+    createProbe.mutate({
+      hostId: setup.hostId,
+      mode: setup.portMode,
+      network: listenerNetwork,
+      ...(setup.portMode === "MANUAL" ? { manualPort: Number(setup.manualPort) } : {}),
+      ...(replaceReservationIds.length > 0 ? { replaceReservationIds } : {}),
+    });
   };
   const scan = () => {
     if (createScan.isPending || !setup.hostId) return;

@@ -6,6 +6,7 @@ import { XrayHostPortSteps } from "./XrayHostPortSteps";
 import { XrayProfileSteps } from "./XrayProfileSteps";
 import {
   availableXrayCreateProfiles,
+  currentXrayPortReplacementIds,
   initialXrayCreateState,
   listenerNetworkForXrayProfile,
   listenerNetworksMatch,
@@ -126,6 +127,7 @@ test("Shadowsocks dual-network UI distinguishes TCP from same-port TCP plus UDP"
   assert.equal(portReservationsReady(state, dualProfile.listenerNetworks, Date.parse("2026-09-01T00:05:00Z")), false);
   state = reduceXrayCreateState(state, { type: "PROBE_RESERVED", slot: "SECONDARY", selectedPort: 24443, reservationId: "reservation-udp", expiresAt: "2026-09-01T00:09:00Z" });
   assert.equal(portReservationsReady(state, dualProfile.listenerNetworks, Date.parse("2026-09-01T00:05:00Z")), true);
+  assert.deepEqual(currentXrayPortReplacementIds(state), ["reservation-tcp", "reservation-udp"]);
 
   const portMarkup = renderToStaticMarkup(<XrayHostPortSteps
     state={state}
@@ -144,6 +146,7 @@ test("Shadowsocks dual-network UI distinguishes TCP from same-port TCP plus UDP"
   const reset = reduceXrayCreateState(state, { type: "RESET_PROBE" });
   assert.equal(reset.probe.phase, "IDLE");
   assert.equal(reset.secondaryProbe.phase, "IDLE");
+  assert.deepEqual(currentXrayPortReplacementIds(reset), []);
 });
 
 test("create flow preserves draft through offline failure and reservation expiry", () => {

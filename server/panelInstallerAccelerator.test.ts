@@ -329,7 +329,7 @@ test("both installers expose an explicit ForwardX migration action and persist a
 test("migrate-forwardx enables Xray only when no explicit setting exists", { skip: !bash }, () => {
   for (const installer of installers) {
     const endMarker = installer.name === "local" ? "install_panel() {" : "ensure_xray_master_key() {";
-    const writeCall = installer.name === "local" ? "write_env" : 'write_env "ghcr.io/wzwys9/forwardplus:v2.3.279"';
+    const writeCall = installer.name === "local" ? "write_env" : 'write_env "ghcr.io/wzwys9/forwardplus:v2.3.280"';
     const migrated = runHarness({
       installer,
       endMarker,
@@ -384,7 +384,7 @@ sed -n 's/^FORWARDX_XRAY_ENABLED=//p' "$APP_DIR/.env"
 test("new installs and ordinary upgrades default Xray off while upgrades preserve an enabled setting", { skip: !bash }, () => {
   for (const installer of installers) {
     const endMarker = installer.name === "local" ? "install_panel() {" : "ensure_xray_master_key() {";
-    const writeCall = installer.name === "local" ? "write_env" : 'write_env "ghcr.io/wzwys9/forwardplus:v2.3.279"';
+    const writeCall = installer.name === "local" ? "write_env" : 'write_env "ghcr.io/wzwys9/forwardplus:v2.3.280"';
     for (const action of ["install", "upgrade"]) {
       const defaulted = runHarness({
         installer,

@@ -262,15 +262,87 @@ test("Xray port operations exclude known ports and reserve one concurrent probe 
       }, async () => null), "PORT_RESERVATION_MISMATCH");
       assert.equal(operations.validateXrayPortReservation({ reservationId: dualTcp.reservationId, hostId: 10, userId: 1, port: 16004, network: "TCP" }).network, "tcp");
       assert.equal(operations.validateXrayPortReservation({ reservationId: dualUdp.reservationId, hostId: 10, userId: 1, port: 16004, network: "UDP" }).network, "udp");
+
+      const dualTcpReprobe = await caller.portProbes.create({
+        hostId: 10,
+        mode: "MANUAL",
+        manualPort: 16004,
+        network: "TCP",
+        replaceReservationIds: [dualTcp.reservationId, dualUdp.reservationId],
+      });
+      await expectCode(Promise.resolve().then(() => operations.validateXrayPortReservation({ reservationId: dualTcp.reservationId, hostId: 10, userId: 1, port: 16004, network: "TCP" })), "PORT_RESERVATION_EXPIRED");
+      await expectCode(Promise.resolve().then(() => operations.validateXrayPortReservation({ reservationId: dualUdp.reservationId, hostId: 10, userId: 1, port: 16004, network: "UDP" })), "PORT_RESERVATION_EXPIRED");
+      const [dualTcpReprobeTask] = await operations.takeXrayPortProbeTasks(10, 1);
+      await operations.completeXrayPortProbeTask(10, successfulResult(dualTcpReprobeTask));
+      const replacementTcp = await caller.portProbes.result({ operationId: dualTcpReprobe.operationId });
+      const replacementUdpProbe = await caller.portProbes.create({ hostId: 10, mode: "MANUAL", manualPort: 16004, network: "UDP" });
+      const [replacementUdpTask] = await operations.takeXrayPortProbeTasks(10, 1);
+      await operations.completeXrayPortProbeTask(10, successfulResult(replacementUdpTask));
+      const replacementUdp = await caller.portProbes.result({ operationId: replacementUdpProbe.operationId });
       assert.deepEqual(await operations.withConsumedXrayPortReservations({
-        tcpReservationId: dualTcp.reservationId,
-        udpReservationId: dualUdp.reservationId,
+        tcpReservationId: replacementTcp.reservationId,
+        udpReservationId: replacementUdp.reservationId,
         hostId: 10,
         userId: 1,
         port: 16004,
       }, async (dual) => [dual.tcp.network, dual.udp.network]), ["tcp", "udp"]);
-      await expectCode(Promise.resolve().then(() => operations.validateXrayPortReservation({ reservationId: dualTcp.reservationId, hostId: 10, userId: 1, port: 16004, network: "TCP" })), "PORT_RESERVATION_EXPIRED");
-      await expectCode(Promise.resolve().then(() => operations.validateXrayPortReservation({ reservationId: dualUdp.reservationId, hostId: 10, userId: 1, port: 16004, network: "UDP" })), "PORT_RESERVATION_EXPIRED");
+
+      const initialImmediateProbe = await operations.createXrayPortProbeOperation({ hostId: 10, userId: 1, mode: "MANUAL", manualPort: 16005 });
+      const [initialImmediateTask] = await operations.takeXrayPortProbeTasks(10, 1);
+      await operations.completeXrayPortProbeTask(10, successfulResult(initialImmediateTask));
+      const initialImmediate = await operations.getXrayPortProbeOperationResult(initialImmediateProbe.operationId, 1);
+      await expectCode(
+        operations.createXrayPortProbeOperation({ hostId: 10, userId: 1, mode: "MANUAL", manualPort: 16005 }),
+        "PORT_IN_USE",
+      );
+      await expectCode(
+        operations.createXrayPortProbeOperation({
+          hostId: 10, userId: 2, mode: "MANUAL", manualPort: 16005,
+          replaceReservationIds: [initialImmediate.reservationId],
+        }),
+        "PORT_RESERVATION_MISMATCH",
+      );
+      assert.equal(operations.validateXrayPortReservation({ reservationId: initialImmediate.reservationId, hostId: 10, userId: 1, port: 16005 }).port, 16005);
+      await expectCode(
+        operations.createXrayPortProbeOperation({
+          hostId: 10, userId: 1, mode: "MANUAL", manualPort: 16006,
+          replaceReservationIds: [initialImmediate.reservationId],
+        }),
+        "PORT_RESERVATION_MISMATCH",
+      );
+      await expectCode(
+        operations.createXrayPortProbeOperation({
+          hostId: 10, userId: 1, mode: "MANUAL", manualPort: 16005,
+          replaceReservationIds: [initialImmediate.reservationId, initialImmediate.reservationId],
+        }),
+        "OPERATION_CONFLICT",
+      );
+      assert.equal(operations.validateXrayPortReservation({ reservationId: initialImmediate.reservationId, hostId: 10, userId: 1, port: 16005 }).port, 16005);
+      const repeatedImmediateProbe = await operations.createXrayPortProbeOperation({
+        hostId: 10, userId: 1, mode: "MANUAL", manualPort: 16005,
+        replaceReservationIds: [initialImmediate.reservationId],
+      });
+      await expectCode(Promise.resolve().then(() => operations.validateXrayPortReservation({ reservationId: initialImmediate.reservationId, hostId: 10, userId: 1, port: 16005 })), "PORT_RESERVATION_EXPIRED");
+      const [repeatedImmediateTask] = await operations.takeXrayPortProbeTasks(10, 1);
+      await operations.completeXrayPortProbeTask(10, successfulResult(repeatedImmediateTask));
+      const repeatedImmediate = await operations.getXrayPortProbeOperationResult(repeatedImmediateProbe.operationId, 1);
+      assert.notEqual(repeatedImmediate.reservationId, initialImmediate.reservationId);
+      operations.consumeXrayPortReservation({ reservationId: repeatedImmediate.reservationId, hostId: 10, userId: 1, port: 16005 });
+
+      const occupiedDuringReprobe = await operations.createXrayPortProbeOperation({ hostId: 10, userId: 1, mode: "MANUAL", manualPort: 16006 });
+      const [occupiedDuringReprobeTask] = await operations.takeXrayPortProbeTasks(10, 1);
+      await operations.completeXrayPortProbeTask(10, successfulResult(occupiedDuringReprobeTask));
+      const occupiedDuringReprobeResult = await operations.getXrayPortProbeOperationResult(occupiedDuringReprobe.operationId, 1);
+      await runtime.executeRaw("INSERT INTO forward_rules (hostId, name, protocol, sourcePort, targetIp, targetPort, userId) VALUES (11, 'occupied-during-reprobe', 'tcp', 16006, '198.51.100.30', 443, 1)");
+      await backfill.backfillGlobalPortAllocations();
+      await expectCode(
+        operations.createXrayPortProbeOperation({
+          hostId: 10, userId: 1, mode: "MANUAL", manualPort: 16006,
+          replaceReservationIds: [occupiedDuringReprobeResult.reservationId],
+        }),
+        "PORT_IN_USE",
+      );
+      await expectCode(Promise.resolve().then(() => operations.validateXrayPortReservation({ reservationId: occupiedDuringReprobeResult.reservationId, hostId: 10, userId: 1, port: 16006 })), "PORT_RESERVATION_EXPIRED");
 
       operations.consumeXrayPortReservation({ reservationId: udpReserved.reservationId, hostId: 10, userId: 1, port: 16000, network: "UDP" });
       held.release();

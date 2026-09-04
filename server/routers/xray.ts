@@ -311,12 +311,16 @@ const portProbeCreateInput = z.object({
   mode: z.enum(["AUTO", "MANUAL"]),
   manualPort: z.number().int().min(1000).max(65535).optional(),
   network: z.enum(["TCP", "UDP"]).default("TCP"),
+  replaceReservationIds: z.array(z.string().uuid()).min(1).max(2).optional(),
 }).strict().superRefine((input, ctx) => {
   if (input.mode === "MANUAL" && input.manualPort === undefined) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["manualPort"], message: "Manual port is required" });
   }
   if (input.mode === "AUTO" && input.manualPort !== undefined) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["manualPort"], message: "Automatic probe does not accept a manual port" });
+  }
+  if (input.replaceReservationIds && new Set(input.replaceReservationIds).size !== input.replaceReservationIds.length) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["replaceReservationIds"], message: "Replacement reservations must be unique" });
   }
 });
 const realityScanCreateInput = z.object({

@@ -97,6 +97,12 @@ function resetProbes(state: XrayCreateState): XrayCreateState {
   return { ...state, probe: { phase: "IDLE" }, secondaryProbe: { phase: "IDLE" } };
 }
 
+export function currentXrayPortReplacementIds(state: XrayCreateState): string[] {
+  return [state.probe, state.secondaryProbe]
+    .filter((probe): probe is Extract<XrayPortProbeState, { phase: "RESERVED" }> => probe.phase === "RESERVED")
+    .map((probe) => probe.reservationId);
+}
+
 function replaceProbe(
   state: XrayCreateState,
   slot: "PRIMARY" | "SECONDARY" | undefined,

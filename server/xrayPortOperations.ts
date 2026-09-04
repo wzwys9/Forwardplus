@@ -215,6 +215,7 @@ export async function createXrayPortProbeOperation(input: {
   mode: unknown;
   manualPort?: unknown;
   network?: unknown;
+  replaceReservationIds?: unknown;
 }): Promise<{ operationId: string }> {
   const hostId = positiveId(input.hostId, "HOST_NOT_FOUND");
   const userId = positiveId(input.userId, "OPERATION_CONFLICT");
@@ -254,15 +255,21 @@ export async function createXrayPortProbeOperation(input: {
 
     const policy = portPolicyFrom(host);
     const allowed = (port: number) => isPortAllowedByPolicy(port, policy);
+    const manualPort = mode === "MANUAL" ? normalizedPort(input.manualPort) : undefined;
+    if (manualPort !== undefined && !allowed(manualPort)) throw new XrayPortOperationError("PORT_OUT_OF_RANGE");
+    if (mode === "AUTO" && input.manualPort !== undefined) throw new XrayPortOperationError("OPERATION_CONFLICT");
+    releaseReplacementXrayReservations({
+      reservationIds: input.replaceReservationIds,
+      hostId,
+      userId,
+      manualPort,
+    });
     const used = await collectXrayUsedPorts(hostId, network);
     let candidates: number[];
     if (mode === "MANUAL") {
-      const port = normalizedPort(input.manualPort);
-      if (!allowed(port)) throw new XrayPortOperationError("PORT_OUT_OF_RANGE");
-      if (used.has(port)) throw new XrayPortOperationError("PORT_IN_USE");
-      candidates = [port];
+      if (used.has(manualPort!)) throw new XrayPortOperationError("PORT_IN_USE");
+      candidates = [manualPort!];
     } else {
-      if (input.manualPort !== undefined) throw new XrayPortOperationError("OPERATION_CONFLICT");
       const candidateCount = network === "udp" ? 1 : XRAY_LIMITS.maxPortProbeCandidates;
       candidates = generateXrayPortCandidates(used, candidateCount, randomStart, allowed);
       if (candidates.length === 0) throw new XrayPortOperationError("PORT_OUT_OF_RANGE");
@@ -396,6 +403,48 @@ function removeXrayReservation(entry: XrayReservationEntry) {
   xrayReservations.delete(entry.reservationId);
   clearTimeout(entry.timer);
   entry.hostReservation.release();
+}
+
+function replacementReservationIds(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length < 1 || value.length > 2) {
+    throw new XrayPortOperationError("OPERATION_CONFLICT");
+  }
+  const ids = value.map((item) => String(item ?? ""));
+  if (new Set(ids).size !== ids.length || ids.some((id) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))) {
+    throw new XrayPortOperationError("OPERATION_CONFLICT");
+  }
+  return ids;
+}
+
+function releaseReplacementXrayReservations(input: {
+  reservationIds: unknown;
+  hostId: number;
+  userId: number;
+  manualPort?: number;
+}) {
+  const entries: XrayReservationEntry[] = [];
+  const expired: XrayReservationEntry[] = [];
+  const networks = new Set<XrayListenerNetwork>();
+  let commonPort: number | null = null;
+  const now = Date.now();
+  for (const reservationId of replacementReservationIds(input.reservationIds)) {
+    const entry = xrayReservations.get(reservationId);
+    if (!entry) continue;
+    if (entry.expiresAt <= now) {
+      expired.push(entry);
+      continue;
+    }
+    if (entry.hostId !== input.hostId || entry.userId !== input.userId
+      || (input.manualPort !== undefined && entry.port !== input.manualPort)
+      || (commonPort !== null && entry.port !== commonPort) || networks.has(entry.network)) {
+      throw new XrayPortOperationError("PORT_RESERVATION_MISMATCH");
+    }
+    commonPort = entry.port;
+    networks.add(entry.network);
+    entries.push(entry);
+  }
+  for (const entry of [...expired, ...entries]) removeXrayReservation(entry);
 }
 
 export function releaseXrayPortProbeReservation(input: {
