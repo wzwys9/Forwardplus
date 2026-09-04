@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { compileQuickConfigTopology } from "./xrayQuickConfigTopology";
 
 import { XRAY_QUICK_CONFIG_FORWARD_ENGINES, type XrayQuickConfigForwardEngine } from "../shared/xrayQuickConfigForwardEngines";
 import { pushAgentRefresh } from "./agentEvents";
@@ -182,19 +183,17 @@ async function loadConfig(quickConfigId: number, topologyId: number): Promise<Re
   };
 }
 
-async function forwardRouteHostIds(config: RetryConfig): Promise<number[]> {
+async function forwardRouteSegments(config: RetryConfig) {
   const rows = await queryRaw<Row>(
-    `SELECT ${q("hostId")}, ${q("state")} FROM ${q("xray_quick_config_routes")}
-      WHERE ${q("quickConfigId")} = ? AND ${q("topologyRevisionId")} = ? AND ${q("routeMode")} = 'FORWARD'
+    `SELECT ${q("hostId")}, ${q("routeMode")}, ${q("relayHopsJson")}, ${q("state")} FROM ${q("xray_quick_config_routes")}
+      WHERE ${q("quickConfigId")} = ? AND ${q("topologyRevisionId")} = ?
       ORDER BY ${q("sortOrder")} ASC, ${q("id")} ASC`,
     [config.id, config.topologyId],
   );
-  const ids = new Set<number>();
   for (const row of rows) {
     if (row.state !== "APPLYING" && row.state !== "RETIRED") fail("QUICK_CONFIG_OPERATION_CONFLICT");
-    ids.add(positiveInteger(row.hostId));
   }
-  return [...ids];
+  return compileQuickConfigTopology(rows.map(row => ({ hostId: row.hostId, routeMode: row.routeMode, relayHopsJson: row.relayHopsJson })), config);
 }
 
 async function currentAllocationVersion(config: RetryConfig): Promise<number> {
@@ -493,7 +492,8 @@ async function createApplyRetry(input: {
     if (source.status !== "FAILED") fail("QUICK_CONFIG_OPERATION_CONFLICT");
 
     const config = await loadConfig(quickConfigId, topologyId);
-    const hostIds = await forwardRouteHostIds(config);
+    const segments = await forwardRouteSegments(config);
+    const hostIds = segments.map(segment => segment.hostId);
     const dnsRecords = await managedDnsRecords(config);
     const backups = await rootBackups(rootOperationId, config);
     const pendingCleanup = await queryRaw<Row>(
@@ -580,10 +580,11 @@ async function createApplyRetry(input: {
         continue;
       }
       const hostId = positiveInteger(row.hostId);
+      const segment = segments.find(candidate => candidate.hostId === hostId);
       if (!expectedHosts.has(hostId) || reusableRules.has(hostId)
         || row.forwardType !== config.engine || row.protocol !== "tcp" || row.gostMode !== "direct"
-        || Number(row.sourcePort) !== config.publicPort || row.targetIp !== config.targetAddress
-        || Number(row.targetPort) !== config.targetPort || row.targetExternalProxyNodeId != null
+        || Number(row.sourcePort) !== config.publicPort || row.targetIp !== segment?.targetAddress
+        || Number(row.targetPort) !== segment?.targetPort || row.targetExternalProxyNodeId != null
         || Number(row.xrayQuickConfigId) !== config.id || !databaseBoolean(row.isEnabled)
         || databaseBoolean(row.disabledByTunnel) || databaseBoolean(row.disabledByGroup)
         || databaseBoolean(row.disabledByUser)) fail("QUICK_CONFIG_OPERATION_CONFLICT");
@@ -599,6 +600,7 @@ async function createApplyRetry(input: {
     let allocationVersion = await currentAllocationVersion(config);
     const ruleIds: Array<{ id: number; hostId: number }> = [];
     for (const [index, hostId] of hostIds.entries()) {
+      const segment = segments[index];
       let ruleId = reusableRules.get(hostId);
       if (!ruleId) {
         const portResource = await ensureQuickConfigPortResource({
@@ -613,8 +615,8 @@ async function createApplyRetry(input: {
           protocol: "tcp",
           gostMode: "direct",
           sourcePort: config.publicPort,
-          targetIp: config.targetAddress,
-          targetPort: config.targetPort,
+          targetIp: segment.targetAddress,
+          targetPort: segment.targetPort,
           targetExternalProxyNodeId: null,
           xrayQuickConfigId: config.id,
           portResourceGroupId: portResource.groupId,

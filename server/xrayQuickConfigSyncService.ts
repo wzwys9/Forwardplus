@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import { compileQuickConfigTopology } from "./xrayQuickConfigTopology";
+import { loadQuickConfigSegments } from "./xrayQuickConfigTopologyStore";
 
 import {
   DnsPodProviderClient,
@@ -338,13 +340,13 @@ export async function createXrayQuickConfigSync(input: {
   return withKeyedTaskLock(`xray-quick-config-sync:${quickConfigId}`, async () => withDatabaseTransaction(async () => {
     const config = await loadStartSnapshot(quickConfigId, expectedRevision);
     const routes = await queryRaw<Row>(
-      `SELECT ${q("hostId")}, ${q("routeMode")}, ${q("state")} FROM ${q("xray_quick_config_routes")}
+      `SELECT ${q("hostId")}, ${q("routeMode")}, ${q("relayHopsJson")}, ${q("state")} FROM ${q("xray_quick_config_routes")}
         WHERE ${q("quickConfigId")} = ? AND ${q("topologyRevisionId")} = ? ORDER BY ${q("sortOrder")} ASC, ${q("id")} ASC`,
       [config.id, config.topologyId],
     );
     if (routes.length < 1 || routes.some((row) => row.state !== "APPLIED")) fail("QUICK_CONFIG_SYNC_CONFLICT");
-    const expectedHosts = [...new Set(routes.filter((row) => row.routeMode === "FORWARD")
-      .map((row) => positiveInteger(row.hostId)))].sort((left, right) => left - right);
+    const segments = compileQuickConfigTopology(routes.map(row => ({ hostId: row.hostId, routeMode: row.routeMode, relayHopsJson: row.relayHopsJson })), config);
+    const expectedHosts = segments.map(segment => segment.hostId);
     const dnsRecords = await validateManagedDnsRows(config);
     const ownedRules = await queryRaw<Row>(
       `SELECT * FROM ${q("forward_rules")} WHERE ${q("xrayQuickConfigId")} = ? ORDER BY ${q("id")} ASC`,
@@ -373,6 +375,7 @@ export async function createXrayQuickConfigSync(input: {
     }
 
     for (const [index, hostId] of expectedHosts.entries()) {
+      const segment = segments[index];
       const candidates = ownedRules.filter((row) => Number(row.hostId) === hostId);
       if (candidates.length > 1) fail("QUICK_CONFIG_SYNC_CONFLICT");
       let row = candidates[0];
@@ -386,8 +389,8 @@ export async function createXrayQuickConfigSync(input: {
           protocol: "tcp",
           gostMode: "direct",
           sourcePort: config.publicPort,
-          targetIp: config.targetAddress,
-          targetPort: config.targetPort,
+          targetIp: segment.targetAddress,
+          targetPort: segment.targetPort,
           targetExternalProxyNodeId: null,
           xrayQuickConfigId: config.id,
           portResourceGroupId: portResource.groupId,
@@ -406,15 +409,15 @@ export async function createXrayQuickConfigSync(input: {
       } else {
         ruleId = positiveInteger(row.id);
         if (!isQuickConfigRuleSynchronized(row, { quickConfigId: config.id, userId: config.ownerUserId, hostId, engine: config.engine, publicPort: config.publicPort,
-          targetAddress: config.targetAddress, targetPort: config.targetPort })) {
+          targetAddress: segment.targetAddress, targetPort: segment.targetPort })) {
           await updateForwardRule(ruleId, {
             hostId,
             forwardType: config.engine,
             protocol: "tcp",
             gostMode: "direct",
             sourcePort: config.publicPort,
-            targetIp: config.targetAddress,
-            targetPort: config.targetPort,
+            targetIp: segment.targetAddress,
+            targetPort: segment.targetPort,
             targetExternalProxyNodeId: null,
             xrayQuickConfigId: config.id,
             userId: config.ownerUserId,
@@ -937,12 +940,8 @@ async function reconcileDns(fence: SyncFence, context: Awaited<ReturnType<typeof
 }
 
 async function reconcileRules(fence: SyncFence, context: Awaited<ReturnType<typeof loadRuntimeContext>>) {
-  const hostRows = await queryRaw<Row>(
-    `SELECT DISTINCT ${q("hostId")} FROM ${q("xray_quick_config_routes")}
-      WHERE ${q("quickConfigId")} = ? AND ${q("topologyRevisionId")} = ? AND ${q("routeMode")} = 'FORWARD'`,
-    [fence.quickConfigId, context.topologyId],
-  );
-  const hostIds = hostRows.map((row) => positiveInteger(row.hostId)).sort((left, right) => left - right);
+  const segments = await loadQuickConfigSegments(fence.quickConfigId, context.topologyId, context);
+  const hostIds = segments.map(segment => segment.hostId);
   const rules = await queryRaw<Row>(
     `SELECT fr.*, b.${q("id")} AS ${q("bindingId")}, b.${q("state")} AS ${q("bindingState")}
        FROM ${q("xray_quick_config_rule_bindings")} b
@@ -954,7 +953,7 @@ async function reconcileRules(fence: SyncFence, context: Awaited<ReturnType<type
   const ready = hostIds.length === rules.length && hostIds.every((hostId, index) => {
     const row = rules[index];
     return isQuickConfigRuleSynchronized(row, { quickConfigId: fence.quickConfigId, userId: context.ownerUserId, hostId, engine: context.engine,
-      publicPort: context.publicPort, targetAddress: context.targetAddress, targetPort: context.targetPort })
+      publicPort: context.publicPort, targetAddress: segments[index].targetAddress, targetPort: segments[index].targetPort })
       && databaseBoolean(row.isRunning);
   });
   if (!ready) {

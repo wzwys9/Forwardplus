@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import { quickConfigPathEngineCompatible } from "../shared/xrayQuickConfigForwardEngines";
+import { compileQuickConfigTopology, parseQuickConfigRelays, serializeQuickConfigRelays } from "./xrayQuickConfigTopology";
 
 import {
   XRAY_QUICK_CONFIG_FORWARD_ENGINES,
@@ -36,6 +38,7 @@ export const XRAY_QUICK_CONFIG_ENGINE_SWITCH_ERROR_CODES = [
   "UDP_CAPABILITY_REQUIRED",
   "QUICK_CONFIG_HOST_UNAVAILABLE",
   "QUICK_CONFIG_ADDRESS_UNAVAILABLE",
+  "QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED",
   "RULE_APPLY_FAILED",
   "RULE_CLEANUP_FAILED",
   "SENSITIVE_DATA_UNAVAILABLE",
@@ -57,6 +60,7 @@ type SwitchOptions = Readonly<{
 }>;
 
 type SwitchRoute = Readonly<{
+  relayHopsJson: string | null;
   id: number;
   lineCategory: string;
   providerLineId: string;
@@ -295,6 +299,7 @@ function snapshotProjection(input: Omit<SwitchSnapshot, "snapshotHash">) {
       addressFamily: route.addressFamily,
       address: route.address,
       routeMode: route.routeMode,
+      relayHopsJson: route.relayHopsJson,
       sortOrder: route.sortOrder,
     })),
     rules: input.rules.map((rule) => ({
@@ -331,7 +336,7 @@ async function loadSnapshot(quickConfigId: number, expectedRevision?: number): P
   const topologyId = positiveInteger(row.activeTopologyRevisionId, "QUICK_CONFIG_REVISION_CONFLICT");
   const routesRows = await queryRaw<Row>(
     `SELECT ${q("id")}, ${q("lineCategory")}, ${q("providerLineId")}, ${q("sourceType")}, ${q("hostId")},
-            ${q("addressFamily")}, ${q("address")}, ${q("routeMode")}, ${q("sortOrder")}
+            ${q("addressFamily")}, ${q("address")}, ${q("routeMode")}, ${q("relayHopsJson")}, ${q("sortOrder")}
        FROM ${q("xray_quick_config_routes")}
       WHERE ${q("quickConfigId")} = ? AND ${q("topologyRevisionId")} = ? AND ${q("state")} <> 'RETIRED'
       ORDER BY ${q("sortOrder")} ASC, ${q("id")} ASC`,
@@ -353,12 +358,14 @@ async function loadSnapshot(quickConfigId: number, expectedRevision?: number): P
       hostId,
       addressFamily,
       address: boundedText(route.address, 512),
+      relayHopsJson: serializeQuickConfigRelays(parseQuickConfigRelays(route.relayHopsJson)),
       routeMode,
       sortOrder: Number(route.sortOrder) || 0,
     };
   });
   const ruleRows = await queryRaw<Row>(
     `SELECT b.${q("id")} AS ${q("bindingId")}, b.${q("forwardRuleId")}, r.${q("hostId")},
+            r.${q("sourcePort")}, r.${q("targetIp")}, r.${q("targetPort")}, r.${q("protocol")}, r.${q("gostMode")},
             r.${q("forwardType")}, r.${q("isEnabled")}, r.${q("isRunning")}, r.${q("pendingDelete")},
             r.${q("xrayQuickConfigId")}, h.${q("name")} AS ${q("hostName")}
        FROM ${q("xray_quick_config_rule_bindings")} b
@@ -384,9 +391,13 @@ async function loadSnapshot(quickConfigId: number, expectedRevision?: number): P
       isRunning: databaseBoolean(rule.isRunning),
     };
   });
-  const routeHosts = new Set(routes.filter((route) => route.routeMode === "FORWARD").map((route) => route.hostId));
+  const segments = compileQuickConfigTopology(routes, { publicPort: port(row.publicPort), targetAddress: boundedText(row.targetAddress, 512), targetPort: port(row.targetPort) });
+  const routeHosts = new Set(segments.map(segment => segment.hostId));
   const ruleHosts = new Set(rules.map((rule) => rule.hostId));
-  if (routeHosts.size !== ruleHosts.size || [...routeHosts].some((hostId) => !ruleHosts.has(hostId!))) {
+  if (rules.length !== segments.length || routeHosts.size !== ruleHosts.size || [...routeHosts].some((hostId) => !ruleHosts.has(hostId!))
+    || segments.some(segment => !ruleRows.some(rule => Number(rule.hostId) === segment.hostId
+      && rule.protocol === "tcp" && rule.gostMode === "direct" && Number(rule.sourcePort) === Number(row.publicPort)
+      && rule.targetIp === segment.targetAddress && Number(rule.targetPort) === segment.targetPort))) {
     fail("QUICK_CONFIG_REVISION_CONFLICT");
   }
   const withoutHash: Omit<SwitchSnapshot, "snapshotHash"> = {
@@ -407,6 +418,8 @@ async function loadSnapshot(quickConfigId: number, expectedRevision?: number): P
 }
 
 async function assertEngineEligible(snapshot: SwitchSnapshot, toEngine: XrayQuickConfigForwardEngine) {
+  const paths = snapshot.routes.filter(route => route.routeMode === "FORWARD").map(route => [{ hostId: route.hostId!, addressFamily: route.addressFamily }, ...parseQuickConfigRelays(route.relayHopsJson)]);
+  if (!quickConfigPathEngineCompatible(toEngine, paths, snapshot.targetAddress)) fail("QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED");
   if (snapshot.routes.every((route) => route.routeMode === "DIRECT")) {
     const settings = await getForwardProtocolSettings();
     if (settings[toEngine] === false) fail("FORWARD_PROTOCOL_DISABLED");
@@ -415,10 +428,10 @@ async function assertEngineEligible(snapshot: SwitchSnapshot, toEngine: XrayQuic
   let catalog: Awaited<ReturnType<typeof listXrayQuickConfigForwardEngines>>;
   try {
     catalog = await listXrayQuickConfigForwardEngines({
-      entries: snapshot.routes.filter((route) => route.routeMode === "FORWARD").map((route) => ({
+      entries: [...new Map(snapshot.routes.filter((route) => route.routeMode === "FORWARD").flatMap((route) => [{
         hostId: route.hostId,
         addressFamily: route.addressFamily,
-      })),
+      }, ...parseQuickConfigRelays(route.relayHopsJson)]).map(hop => [`${hop.hostId}:${hop.addressFamily}`, hop])).values()],
     });
   } catch {
     fail("QUICK_CONFIG_HOST_UNAVAILABLE");
@@ -563,6 +576,7 @@ export async function applyXrayQuickConfigEngineSwitch(input: {
         hostId: route.hostId,
         addressFamily: route.addressFamily,
         address: route.address,
+        relayHopsJson: route.relayHopsJson,
         routeMode: route.routeMode,
         sortOrder: route.sortOrder,
         state: "APPLYING",

@@ -1,3 +1,4 @@
+import { loadQuickConfigSegments } from "./xrayQuickConfigTopologyStore";
 import {
   DnsPodProviderClient,
   DnsPodProviderError,
@@ -430,11 +431,7 @@ async function loadContext(operationId: number, expectedFence: QuickConfigDnsExe
 }
 
 async function assertRulesReady(context: Awaited<ReturnType<typeof loadContext>>): Promise<void> {
-  const forwardRoutes = await queryRaw<Row>(
-    `SELECT DISTINCT ${q("hostId")} FROM ${q("xray_quick_config_routes")}
-      WHERE ${q("quickConfigId")} = ? AND ${q("topologyRevisionId")} = ? AND ${q("routeMode")} = 'FORWARD'`,
-    [context.quickConfigId, context.topologyId],
-  );
+  const forwardRoutes = await loadQuickConfigSegments(context.quickConfigId, context.topologyId);
   for (const route of forwardRoutes) {
     const hostId = positiveInteger(route.hostId, "RULE_APPLY_FAILED");
     const [ready] = await queryRaw<Row>(
@@ -442,8 +439,9 @@ async function assertRulesReady(context: Awaited<ReturnType<typeof loadContext>>
          JOIN ${q("forward_rules")} fr ON fr.${q("id")} = b.${q("forwardRuleId")}
         WHERE b.${q("quickConfigId")} = ? AND b.${q("topologyRevisionId")} = ? AND b.${q("state")} = 'READY'
           AND fr.${q("xrayQuickConfigId")} = ? AND fr.${q("hostId")} = ? AND fr.${q("forwardType")} = ?
+          AND fr.${q("targetIp")} = ? AND fr.${q("targetPort")} = ? AND fr.${q("sourcePort")} = ?
           AND fr.${q("isEnabled")} = ? AND fr.${q("isRunning")} = ? AND fr.${q("pendingDelete")} = ? LIMIT 1`,
-      [context.quickConfigId, context.topologyId, context.quickConfigId, hostId, context.engine, true, true, false],
+      [context.quickConfigId, context.topologyId, context.quickConfigId, hostId, context.engine, route.targetAddress, route.targetPort, route.listenPort, true, true, false],
     );
     if (!ready) fail("RULE_APPLY_FAILED", context.quickConfigId);
   }
