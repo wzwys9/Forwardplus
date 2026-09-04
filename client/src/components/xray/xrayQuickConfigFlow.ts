@@ -40,6 +40,7 @@ export type XrayQuickConfigDomainCheck = {
   fqdn: string;
   conflicts: XrayQuickConfigDomainRecord[];
   preservedRecords: XrayQuickConfigDomainRecord[];
+  ownedRecordRefs?: string[];
   allowedActions: Array<"USE_UNUSED_NAME" | "REPLACE_CONFLICTING_RECORDS">;
   confirmationHash: string;
   domainCheckToken: string;
@@ -74,6 +75,8 @@ export type XrayQuickConfigEditDraft = Readonly<{
   expectedRevision: number;
   zoneId: number;
   relativeName: string;
+  fqdn?: string;
+  managedDnsRecords?: XrayQuickConfigDomainRecord[];
   carrierEndpoints: Record<XrayQuickConfigCarrier, string[]>;
   engine: XrayQuickConfigEngine;
   publicPort: number;
@@ -95,6 +98,7 @@ export function xrayQuickConfigEditIdentity(
 }
 
 export type XrayQuickConfigFlowState = {
+  editDomainMode: "KEEP" | "CHANGE" | null;
   step: XrayQuickConfigStep;
   furthestStepIndex: number;
   zoneId: number | null;
@@ -115,10 +119,10 @@ export type XrayQuickConfigFlowState = {
 };
 
 export type XrayQuickConfigFlowAction =
+  | { type: "SET_DOMAIN_MODE"; mode: "KEEP" | "CHANGE"; zoneId: number; relativeName: string }
   | { type: "SET_DOMAIN"; zoneId: number | null; relativeName: string }
   | { type: "DOMAIN_CHECKED"; result: XrayQuickConfigDomainCheck }
   | { type: "DOMAIN_CONFIRMED"; confirmedDomainToken: string; expiresAt: string }
-  | { type: "PREFILL_EDIT"; draft: XrayQuickConfigEditDraft }
   | { type: "TOGGLE_CARRIER_ENDPOINT"; carrier: XrayQuickConfigCarrier; endpointKey: string }
   | { type: "SET_ENGINE"; engine: XrayQuickConfigEngine | null }
   | { type: "SET_MANUAL_PORT"; value: string }
@@ -139,6 +143,7 @@ export const XRAY_QUICK_CONFIG_CARRIERS: readonly XrayQuickConfigCarrier[] = [
 
 export function initialXrayQuickConfigFlowState(draft?: XrayQuickConfigEditDraft): XrayQuickConfigFlowState {
   return {
+    editDomainMode: draft ? "KEEP" : null,
     step: "DOMAIN",
     furthestStepIndex: 0,
     zoneId: draft?.zoneId ?? null,
@@ -186,10 +191,16 @@ export function reduceXrayQuickConfigFlow(
   state: XrayQuickConfigFlowState,
   action: XrayQuickConfigFlowAction,
 ): XrayQuickConfigFlowState {
-  if (action.type === "SET_DOMAIN") {
-    if (state.zoneId === action.zoneId && state.relativeName === action.relativeName) return state;
+  if (action.type === "SET_DOMAIN" || action.type === "SET_DOMAIN_MODE") {
+    if (action.type === "SET_DOMAIN" && state.zoneId === action.zoneId && state.relativeName === action.relativeName) return state;
     return {
       ...initialXrayQuickConfigFlowState(),
+      ...(state.editDomainMode === null ? {} : {
+        editDomainMode: state.editDomainMode,
+        carrierEndpoints: state.carrierEndpoints, engine: state.engine, manualPort: state.manualPort,
+        editDefaultRoutes: state.editDefaultRoutes,
+      }),
+      ...(action.type === "SET_DOMAIN_MODE" ? { editDomainMode: action.mode } : {}),
       zoneId: action.zoneId,
       relativeName: action.relativeName,
     };
@@ -200,9 +211,9 @@ export function reduceXrayQuickConfigFlow(
       domainCheck: action.result,
       confirmedDomainToken: null,
       confirmedDomainExpiresAt: null,
-      carrierEndpoints: { TELECOM: [], UNICOM: [], MOBILE: [], EDUCATION: [] },
-      engine: null,
-      manualPort: "",
+      carrierEndpoints: state.editDomainMode === null ? { TELECOM: [], UNICOM: [], MOBILE: [], EDUCATION: [] } : state.carrierEndpoints,
+      engine: state.editDomainMode === null ? null : state.engine,
+      manualPort: state.editDomainMode === null ? "" : state.manualPort,
       portCheckId: null,
       portResult: null,
       replaceProbeResult: null,
@@ -218,22 +229,6 @@ export function reduceXrayQuickConfigFlow(
       confirmedDomainToken: action.confirmedDomainToken,
       confirmedDomainExpiresAt: action.expiresAt,
       furthestStepIndex: Math.max(state.furthestStepIndex, 1),
-    };
-  }
-  if (action.type === "PREFILL_EDIT") {
-    return {
-      ...state,
-      carrierEndpoints: action.draft.carrierEndpoints,
-      engine: action.draft.engine,
-      manualPort: String(action.draft.publicPort),
-      editDefaultRoutes: action.draft.defaultRoutes,
-      portCheckId: null,
-      portResult: null,
-      replaceProbeResult: null,
-      defaultCandidateIds: [],
-      preview: null,
-      applyResult: null,
-      furthestStepIndex: Math.max(state.furthestStepIndex, 2),
     };
   }
   if (action.type === "TOGGLE_CARRIER_ENDPOINT") {

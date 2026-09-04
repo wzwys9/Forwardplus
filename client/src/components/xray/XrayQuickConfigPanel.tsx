@@ -783,6 +783,13 @@ export function XrayQuickConfigPanel(props: {
         expectedRevision: detail.revision,
         zoneId: detail.zoneId,
         relativeName: detail.relativeName,
+        fqdn: detail.fqdn,
+        managedDnsRecords: detail.dnsRecords.filter((record) => record.status !== "REMOVED"
+          && active.routes.some((route) => route.routeId === record.routeId)).map((record) => ({
+          recordRef: record.recordRef, recordType: record.recordType,
+          providerLineId: record.providerLineId, value: record.value, ttl: record.ttl,
+          lineName: lineLabels[active.routes.find((route) => route.routeId === record.routeId)?.lineCategory ?? ""] ?? record.providerLineId,
+        })),
         carrierEndpoints,
         engine: currentEngine,
         publicPort: active.publicPort,

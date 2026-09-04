@@ -13,6 +13,7 @@ import {
 import { XrayObservedListenerSchema } from "../shared/xrayTypes";
 import { quoteIdentifier } from "./dbCompat";
 import { queryRaw } from "./dbRuntime";
+import { computeXrayQuickConfigDnsTupleHash } from "./xrayQuickConfigDnsTuple";
 import {
   DnsProviderAccountServiceError,
   getGlobalDnsProviderAccountService,
@@ -111,6 +112,7 @@ export type DomainCheckDto = Readonly<{
   fqdn: string;
   conflicts: DomainRecordProjection[];
   preservedRecords: DomainRecordProjection[];
+  ownedRecordRefs?: string[];
   allowedActions: Array<"USE_UNUSED_NAME" | "REPLACE_CONFLICTING_RECORDS">;
   confirmationHash: string;
   domainCheckToken: string;
@@ -647,6 +649,19 @@ function projectRecords(records: readonly DnsPodRecord[], accountId: number, zon
   };
 }
 
+export function isQuickConfigDnsRecordOwned(record: DnsPodRecord, stored: Row, zoneName: string): boolean {
+  if (record.recordType !== "A" && record.recordType !== "AAAA") return false;
+  const fqdn = `${record.subdomain.trim().toLowerCase()}.${zoneName}`;
+  return record.status === "ENABLE"
+    && String(stored.providerRecordId) === record.providerRecordId
+    && stored.fqdn === fqdn && stored.recordType === record.recordType
+    && stored.providerLineId === record.providerLineId && stored.value === record.value
+    && Number(stored.ttl) === record.ttl
+    && stored.remoteTupleHash === computeXrayQuickConfigDnsTupleHash({
+      fqdn, recordType: record.recordType, providerLineId: record.providerLineId, value: record.value, ttl: record.ttl,
+    });
+}
+
 function exactRecordSetHash(records: readonly DnsPodRecord[]): string {
   return sha256(stableJson(records.map((record) => ({
     providerRecordId: record.providerRecordId,
@@ -755,6 +770,24 @@ export async function createQuickConfigDomainCheck(input: {
     const records = await loadRemoteDomainRecords(context.credentials, context.zone, domain.relativeName, options);
     const key = tokenKey(options.tokenSecret);
     const projection = projectRecords(records, context.accountId, context.zoneId, key);
+    let ownedRecordRefs: string[] | undefined;
+    if (editIdentity) {
+      const q = quoteIdentifier;
+      const owned = await queryRaw<Row>(
+        `SELECT r.* FROM ${q("xray_quick_config_dns_records")} r
+          JOIN ${q("xray_quick_config_routes")} rt ON rt.${q("id")} = r.${q("routeId")}
+          JOIN ${q("xray_quick_configs")} qc ON qc.${q("id")} = r.${q("quickConfigId")}
+         WHERE qc.${q("id")} = ? AND r.${q("dnsAccountId")} = ? AND r.${q("zoneId")} = ?
+           AND r.${q("fqdn")} = ? AND r.${q("status")} <> 'REMOVED'
+           AND rt.${q("topologyRevisionId")} = qc.${q("activeTopologyRevisionId")}`,
+        [editIdentity.quickConfigId, context.accountId, context.zoneId, domain.fqdn],
+      );
+      const byId = new Map(owned.map((row) => [String(row.providerRecordId), row]));
+      ownedRecordRefs = records.filter((record) => {
+        const stored = byId.get(record.providerRecordId);
+        return stored && isQuickConfigDnsRecordOwned(record, stored, context.zone.name);
+      }).map((record) => recordRef(record, context.accountId, context.zoneId, key));
+    }
     const displayHash = confirmationHash(domain.fqdn, projection);
     const payload = newTokenPayload({
       kind: "DOMAIN_CHECK",
@@ -779,6 +812,7 @@ export async function createQuickConfigDomainCheck(input: {
       fqdn: domain.fqdn,
       conflicts: projection.conflicts,
       preservedRecords: projection.preservedRecords,
+      ...(ownedRecordRefs ? { ownedRecordRefs } : {}),
       allowedActions: projection.conflicts.length > 0 ? ["REPLACE_CONFLICTING_RECORDS"] : ["USE_UNUSED_NAME"],
       confirmationHash: displayHash,
       domainCheckToken: signDomainToken(payload, key),

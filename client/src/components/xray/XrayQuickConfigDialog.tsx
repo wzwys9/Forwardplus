@@ -181,27 +181,53 @@ function DomainStep(props: {
   state: ReturnType<typeof initialXrayQuickConfigFlowState>;
   confirmedValid: boolean;
   editIdentity?: Pick<XrayQuickConfigEditDraft, "quickConfigId" | "expectedRevision">;
+  editDraft?: XrayQuickConfigEditDraft;
+  onSetDomainMode: (mode: "KEEP" | "CHANGE") => void;
   onSetDomain: (zoneId: number | null, relativeName: string) => void;
   onChecked: (check: XrayQuickConfigDomainCheck) => void;
-  onConfirmed: (token: string, expiresAt: string) => void;
+  onConfirmed: (token: string, expiresAt: string, advance?: boolean) => void;
   onNext: () => void;
 }) {
   const [error, setError] = useState<string | null>(null);
+  const [acknowledged, setAcknowledged] = useState(props.confirmedValid);
+  const requestVersion = useRef(0);
+  useEffect(() => () => { requestVersion.current += 1; }, []);
   const createCheck = trpc.xray.quickConfigs.domainChecksCreate.useMutation({ gcTime: 0 });
   const confirmCheck = trpc.xray.quickConfigs.domainChecksConfirm.useMutation({ gcTime: 0 });
   const usableZones = props.zones.filter((zone) => zone.catalogUsable);
   const selectedZone = props.zones.find((zone) => zone.zoneId === props.state.zoneId);
   const relativeName = props.state.relativeName.trim();
   const pending = createCheck.isPending || confirmCheck.isPending;
+  const keeping = props.state.editDomainMode === "KEEP";
+  const changing = props.state.editDomainMode === "CHANGE";
+  const originalFqdn = props.editDraft?.fqdn;
+  const sameAsOriginal = changing && props.state.zoneId === props.editDraft?.zoneId
+    && relativeName.toLowerCase() === props.editDraft?.relativeName.toLowerCase();
+  const canUseName = (!changing || acknowledged) && !sameAsOriginal;
   const confirmationAction = props.state.domainCheck?.conflicts.length
     ? "REPLACE_CONFLICTING_RECORDS" as const
     : "USE_UNUSED_NAME" as const;
   const canConfirm = !!props.state.domainCheck
     && props.state.domainCheck.allowedActions.includes(confirmationAction)
-    && !pending;
+    && !pending && canUseName;
+
+  const setDomain = (zoneId: number | null, name: string) => {
+    requestVersion.current += 1;
+    setError(null);
+    setAcknowledged(false);
+    props.onSetDomain(zoneId, name);
+  };
+
+  const setMode = (mode: "KEEP" | "CHANGE") => {
+    requestVersion.current += 1;
+    setError(null);
+    setAcknowledged(false);
+    props.onSetDomainMode(mode);
+  };
 
   const checkDomain = async () => {
-    if (!props.state.zoneId || !relativeName) return;
+    if (!props.state.zoneId || !relativeName || pending || sameAsOriginal) return;
+    const version = ++requestVersion.current;
     setError(null);
     try {
       const result = await createCheck.mutateAsync({
@@ -215,27 +241,32 @@ function DomainStep(props: {
         relativeName,
         ...(props.editIdentity ? { editIdentity: props.editIdentity } : {}),
       });
+      if (version !== requestVersion.current) return;
       props.onChecked(result as XrayQuickConfigDomainCheck);
+      if (keeping && result.conflicts.every((record) => result.ownedRecordRefs?.includes(record.recordRef))) {
+        await confirmDomain(result, true);
+      }
     } catch (mutationError) {
-      setError(safeDomainError(mutationError));
+      if (version === requestVersion.current) setError(safeDomainError(mutationError));
     } finally {
       createCheck.reset();
     }
   };
 
-  const confirmDomain = async () => {
-    const check = props.state.domainCheck;
-    if (!check || !canConfirm) return;
+  const confirmDomain = async (check = props.state.domainCheck, advance = false) => {
+    const action = check?.conflicts.length ? "REPLACE_CONFLICTING_RECORDS" : "USE_UNUSED_NAME";
+    if (!check || !canUseName || !check.allowedActions.includes(action)) return;
+    const version = requestVersion.current;
     setError(null);
     try {
       const result = await confirmCheck.mutateAsync({
         domainCheckToken: check.domainCheckToken,
-        action: confirmationAction,
+        action,
         confirmationHash: check.confirmationHash,
       });
-      props.onConfirmed(result.confirmedDomainToken, result.expiresAt);
+      if (version === requestVersion.current) props.onConfirmed(result.confirmedDomainToken, result.expiresAt, advance);
     } catch (mutationError) {
-      setError(safeDomainError(mutationError));
+      if (version === requestVersion.current) setError(safeDomainError(mutationError));
     } finally {
       confirmCheck.reset();
     }
@@ -244,15 +275,25 @@ function DomainStep(props: {
   return (
     <div className="space-y-5">
       <div>
-        <h3 className="font-semibold">选择域名并完成实时检查</h3>
-        <p className="mt-1 text-sm text-muted-foreground">选择 DNSPod 中的主域名，只填写前缀。例如填写 dfd 与 cocbc.com 将生成 dfd.cocbc.com。</p>
+        <h3 className="font-semibold">{props.editDraft ? "选择保留原域名或更换域名" : "选择域名并完成实时检查"}</h3>
+        <p className="mt-1 text-sm text-muted-foreground">{keeping ? "保留当前连接域名，后续可继续调整运营商入口和端口。" : "选择 DNSPod 中的主域名，只填写前缀。例如填写 dfd 与 cocbc.com 将生成 dfd.cocbc.com。"}</p>
       </div>
-      <div className="grid gap-4 sm:grid-cols-2">
+      {props.editDraft && <div className="grid gap-3 sm:grid-cols-2" role="group" aria-label="域名使用方式">
+        <Button type="button" variant={keeping ? "default" : "outline"} aria-pressed={keeping} disabled={pending} onClick={() => !keeping && setMode("KEEP")}>使用原域名</Button>
+        <Button type="button" variant={changing ? "default" : "outline"} aria-pressed={changing} disabled={pending} onClick={() => !changing && setMode("CHANGE")}>更换域名</Button>
+      </div>}
+      {keeping && <div className="rounded-lg border bg-muted/20 p-4"><p className="text-sm text-muted-foreground">当前域名</p><p className="mt-1 break-all font-medium">{originalFqdn}</p></div>}
+      {changing && <Alert className="border-amber-500/40 bg-amber-500/5"><AlertTriangle className="h-4 w-4" /><AlertTitle>更换域名后将清理旧解析</AlertTitle><AlertDescription className="space-y-3">
+        <p>最终提交后，系统会先设置并验证新域名解析，再清理 <span className="break-all font-medium">{originalFqdn}</span> 下本快速配置生成的全部线路 IPv4/IPv6 解析。手动添加的其他记录保留，客户端需要换用新域名。</p>
+        <label className="flex cursor-pointer items-start gap-2"><input type="checkbox" className="mt-1 h-4 w-4 shrink-0 accent-primary" checked={acknowledged} disabled={pending} onChange={(event) => setAcknowledged(event.target.checked)} /><span>我已了解旧托管解析将被清理，并确认更换域名。</span></label>
+      </AlertDescription></Alert>}
+      {!keeping && <div className="grid gap-4 sm:grid-cols-2">
         <div className="space-y-1.5">
           <Label htmlFor="quick-config-zone">主域名</Label>
           <Select
             value={props.state.zoneId ? String(props.state.zoneId) : undefined}
-            onValueChange={(value) => { setError(null); props.onSetDomain(Number(value), props.state.relativeName); }}
+            disabled={pending}
+            onValueChange={(value) => setDomain(Number(value), props.state.relativeName)}
           >
             <SelectTrigger id="quick-config-zone"><SelectValue placeholder="选择 DNSPod 域名" /></SelectTrigger>
             <SelectContent>
@@ -265,20 +306,22 @@ function DomainStep(props: {
           <Input
             id="quick-config-relative-name"
             value={props.state.relativeName}
+            disabled={pending}
             maxLength={253}
             autoComplete="off"
             spellCheck={false}
             placeholder="例如：dfd 或 hk.dfd"
-            onChange={(event) => { setError(null); props.onSetDomain(props.state.zoneId, event.target.value); }}
+            onChange={(event) => setDomain(props.state.zoneId, event.target.value)}
           />
         </div>
-      </div>
-      {selectedZone && relativeName && <p className="rounded-lg border bg-muted/20 px-4 py-3 text-sm">将检查：<span className="break-all font-medium">{relativeName}.{selectedZone.name}</span></p>}
+      </div>}
+      {!keeping && selectedZone && relativeName && <p className="rounded-lg border bg-muted/20 px-4 py-3 text-sm">将检查：<span className="break-all font-medium">{relativeName}.{selectedZone.name}</span></p>}
+      {sameAsOriginal && <p className="text-sm text-amber-700 dark:text-amber-300">填写的仍是原域名，请选择“使用原域名”或填写不同的新名称。</p>}
       {usableZones.length === 0 && <Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>没有可用域名</AlertTitle><AlertDescription>请关闭向导，到系统设置重新验证 DNSPod 账号和线路目录。</AlertDescription></Alert>}
       <div className="flex justify-end">
-        <Button type="button" variant="outline" disabled={!props.state.zoneId || !relativeName || pending} onClick={checkDomain}>
+        <Button type="button" variant={keeping ? "default" : "outline"} disabled={!selectedZone?.catalogUsable || !relativeName || pending || sameAsOriginal} onClick={checkDomain}>
           {createCheck.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Network className="mr-2 h-4 w-4" />}
-          {props.state.domainCheck ? "重新检查域名" : "检查域名"}
+          {keeping ? "使用原域名并继续" : props.state.domainCheck ? "重新检查域名" : "检查域名"}
         </Button>
       </div>
       {error && <Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>域名检查失败</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
@@ -287,13 +330,13 @@ function DomainStep(props: {
           <Alert>
             <CheckCircle2 className="h-4 w-4" />
             <AlertTitle>检查完成：{props.state.domainCheck.fqdn}</AlertTitle>
-            <AlertDescription>{props.state.domainCheck.conflicts.length > 0 ? "发现会被替换的同名记录；确认前不会修改 DNSPod。" : "没有发现 A、AAAA 或 CNAME 冲突；仍需确认后才能继续。"}</AlertDescription>
+            <AlertDescription>{props.state.domainCheck.conflicts.length > 0 ? keeping ? "以下解析将随本次入口配置调整；无法确认归属或已变更的记录，需要你明确确认。" : "发现会被替换的同名记录；最终提交前不会修改 DNSPod。" : "没有发现 A、AAAA 或 CNAME 冲突；确认后才能继续。"}</AlertDescription>
           </Alert>
           <DomainRecordList title="确认后将替换的记录" records={props.state.domainCheck.conflicts} tone="warning" />
           <DomainRecordList title="保留、不删除的其他记录" records={props.state.domainCheck.preservedRecords} tone="neutral" />
           {!props.confirmedValid && (
             <div className="flex justify-end">
-              <Button type="button" disabled={!canConfirm} onClick={confirmDomain}>
+              <Button type="button" disabled={!canConfirm} onClick={() => { void confirmDomain(); }}>
                 {confirmCheck.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
                 {props.state.domainCheck.conflicts.length ? "确认替换这些解析" : "确认使用此域名"}
               </Button>
@@ -301,9 +344,9 @@ function DomainStep(props: {
           )}
         </div>
       )}
-      {props.confirmedValid && <Alert><CheckCircle2 className="h-4 w-4" /><AlertTitle>域名已确认</AlertTitle><AlertDescription>确认仅在当前向导内短期有效；修改域名会清除后续选择。</AlertDescription></Alert>}
+      {props.confirmedValid && <Alert><CheckCircle2 className="h-4 w-4" /><AlertTitle>域名已确认</AlertTitle><AlertDescription>确认短期有效；修改域名后需要重新检查，最终提交前不会修改解析。</AlertDescription></Alert>}
       {props.state.confirmedDomainToken && !props.confirmedValid && <Alert variant="destructive"><Clock3 className="h-4 w-4" /><AlertTitle>域名确认已过期</AlertTitle><AlertDescription>已保留输入，请重新检查并确认。</AlertDescription></Alert>}
-      <div className="flex justify-end"><Button type="button" disabled={!props.confirmedValid} onClick={props.onNext}>下一步：运营商入口</Button></div>
+      <div className="flex justify-end"><Button type="button" disabled={!props.confirmedValid || !canUseName || pending} onClick={props.onNext}>下一步：运营商入口</Button></div>
     </div>
   );
 }
@@ -509,12 +552,17 @@ function PreviewStep(props: {
   onBack: () => void;
   onApply: () => void;
   editing?: boolean;
+  editDraft?: XrayQuickConfigEditDraft;
 }) {
   const preview = props.preview;
   return (
     <div className="space-y-5">
       <Alert><Clock3 className="h-4 w-4" /><AlertTitle>目前只是预览</AlertTitle><AlertDescription>{props.editing ? "当前生效配置尚未改变。点击最终确认后，将先建立新规则并验证，再切换 DNS 和清理旧规则。" : "尚未创建转发规则，也没有修改 DNSPod。点击最终确认后才开始持久编排。"}</AlertDescription></Alert>
       <section className="rounded-lg border p-4"><h3 className="font-semibold">{preview.fqdn}:{preview.publicPort}</h3><p className="mt-1 break-all text-sm text-muted-foreground">落地：{preview.target.targetName} · {formatXrayEndpoint(preview.target.address, preview.target.port)}</p>{preview.allocation.rewritten && <Badge className="mt-3" variant="secondary">对外端口已改写</Badge>}</section>
+      {props.editDraft?.fqdn && props.editDraft.fqdn !== preview.fqdn && <section className="space-y-3">
+        <Alert className="border-amber-500/40"><AlertTriangle className="h-4 w-4" /><AlertTitle>确认域名切换</AlertTitle><AlertDescription><p className="break-all">{props.editDraft.fqdn} → {preview.fqdn}</p><p className="mt-2">新解析验证成功后，清理下列旧托管 A/AAAA 解析，保留其他手动记录。请更新客户端连接域名。</p></AlertDescription></Alert>
+        <DomainRecordList title="原域名下将清理的托管解析" records={props.editDraft.managedDnsRecords ?? []} tone="warning" />
+      </section>}
       <section className="space-y-3"><h3 className="font-semibold">转发规则（{preview.rules.length}）</h3>{preview.rules.length === 0 ? <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">全部流量在受管落地主机直达，不需要新建转发规则。</p> : <div className="space-y-2">{preview.rules.map((rule) => <div key={rule.ruleKey} className="rounded-lg border p-3 text-sm"><div className="flex flex-wrap items-center gap-2"><span className="font-medium">{rule.hostName}</span><Badge variant="outline">{rule.engine}</Badge><Badge variant="secondary">{rule.action === "REUSE" ? "复用" : "新建"}</Badge></div><p className="mt-1 break-all font-mono text-xs text-muted-foreground">:{rule.listenPort} → {formatXrayEndpoint(rule.targetAddress, rule.targetPort)}</p></div>)}</div>}</section>
       <section className="space-y-3"><h3 className="font-semibold">DNS 解析（{preview.dnsRecords.length}）</h3><div className="space-y-2">{preview.dnsRecords.map((record, index) => <div key={`${record.routeKind}:${record.providerLineId}:${record.recordType}:${record.value}:${index}`} className="flex min-w-0 flex-wrap items-center gap-2 rounded-lg border p-3 text-sm"><Badge variant="outline">{record.recordType}</Badge><Badge variant="secondary">{record.routeKind === "DEFAULT" ? "默认" : carrierLabels[record.carrier]}</Badge><span className="break-all font-mono text-xs">{record.value}</span><span className="ml-auto text-xs text-muted-foreground">{record.action === "REPLACE" ? "替换" : "新建"}</span></div>)}</div></section>
       <DomainRecordList title="将替换或删除的同名记录" records={preview.conflictingRecords} tone="warning" />
@@ -785,11 +833,18 @@ export function XrayQuickConfigDialog(props: {
             state={state}
             confirmedValid={confirmedValid}
             editIdentity={props.edit ? xrayQuickConfigEditIdentity(props.edit) : undefined}
+            editDraft={props.edit}
+            onSetDomainMode={(mode) => {
+              if (props.edit) dispatch({ type: "SET_DOMAIN_MODE", mode,
+                zoneId: mode === "KEEP" ? props.edit.zoneId : state.zoneId ?? props.edit.zoneId,
+                relativeName: mode === "KEEP" ? props.edit.relativeName : "",
+              });
+            }}
             onSetDomain={(zoneId, relativeName) => dispatch({ type: "SET_DOMAIN", zoneId, relativeName })}
             onChecked={(result) => dispatch({ type: "DOMAIN_CHECKED", result })}
-            onConfirmed={(confirmedDomainToken, expiresAt) => {
+            onConfirmed={(confirmedDomainToken, expiresAt, advance) => {
               dispatch({ type: "DOMAIN_CONFIRMED", confirmedDomainToken, expiresAt });
-              if (props.edit) dispatch({ type: "PREFILL_EDIT", draft: props.edit });
+              if (advance) dispatch({ type: "GO_TO_STEP", step: "CARRIERS" });
             }}
             onNext={goNext}
           /> : state.step === "CARRIERS" ? <CarrierStep
@@ -845,6 +900,7 @@ export function XrayQuickConfigDialog(props: {
             onBack={goBack}
             onApply={() => { void applyPreview(); }}
             editing={!!props.edit}
+            editDraft={props.edit}
           /> : state.step === "APPLY" && state.applyResult ? <ApplyStep
             operation={operationQuery.data}
             loading={operationQuery.isLoading}

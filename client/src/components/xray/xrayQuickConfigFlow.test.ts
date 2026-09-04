@@ -73,3 +73,23 @@ test("quick config domain checks send only the strict edit identity", () => {
     expectedRevision: 3,
   });
 });
+
+test("editing domain modes invalidate authorization and probes while preserving the user's route draft", () => {
+  const state = { ...successfulState(), editDomainMode: "KEEP" as const, manualPort: "5326" };
+  const changed = reduceXrayQuickConfigFlow(state, {
+    type: "SET_DOMAIN_MODE", mode: "CHANGE", zoneId: 4, relativeName: "new",
+  });
+  assert.equal(changed.editDomainMode, "CHANGE");
+  assert.equal(changed.confirmedDomainToken, null);
+  assert.equal(changed.portResult, null);
+  assert.equal(changed.preview, null);
+  assert.deepEqual(changed.carrierEndpoints, state.carrierEndpoints);
+  assert.equal(changed.engine, state.engine);
+  assert.equal(changed.manualPort, "5326");
+  const restored = reduceXrayQuickConfigFlow(changed, {
+    type: "SET_DOMAIN_MODE", mode: "KEEP", zoneId: 4, relativeName: "original",
+  });
+  assert.equal(restored.relativeName, "original");
+  assert.equal(restored.confirmedDomainToken, null);
+  assert.deepEqual(restored.carrierEndpoints, state.carrierEndpoints);
+});
