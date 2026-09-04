@@ -594,6 +594,7 @@ export const xrayQuickConfigRoutes = table("xray_quick_config_routes", {
   hostId: int("hostId"),
   addressFamily: varchar("addressFamily", { length: 16 }).notNull(),
   address: text("address").notNull(),
+  relayHopsJson: text("relayHopsJson"),
   routeMode: varchar("routeMode", { length: 16 }).notNull(),
   sortOrder: int("sortOrder").notNull().default(0),
   state: varchar("state", { length: 32 }).notNull(),

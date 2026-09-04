@@ -587,6 +587,7 @@ const tables: TableDef[] = [
       c("providerLineId", "varchar", { length: 128, notNull: true }),
       c("sourceType", "varchar", { length: 32, notNull: true }), c("hostId", "int"),
       c("addressFamily", "varchar", { length: 16, notNull: true }), c("address", "text", { notNull: true }),
+      c("relayHopsJson", "text"),
       c("routeMode", "varchar", { length: 16, notNull: true }), c("sortOrder", "int", { notNull: true, default: 0 }),
       c("state", "varchar", { length: 32, notNull: true }), c("createdAt", "epoch", { notNull: true, default: "now" }),
       c("updatedAt", "epoch", { notNull: true, default: "now" }),
