@@ -753,6 +753,8 @@ type DomainCheckDto = {
 
 ### 19.3 线路与端口检查
 
+MAINT-027：carrier endpoint 增加可选 `relays: Array<{hostId:number,addressFamily:"IPV4"|"IPV6"}>`（最多 8，省略为空）。服务端读取所有 IP，整个有序路径参与 token/hash/版本复验；同一入口不能提交不同路径。总入口/实际转发 host 各最多 64。端口/引擎检查包含中转；preview.rules 显示逐段目标；detail.routes 返回安全 `relays` 快照用于编辑预填。原接口无 relays 保持兼容。同 host/port 下一跳变化的编辑返回 `GLOBAL_PORT_CONFLICT` 并要求换统一端口。
+
 四运营商输入固定为：
 
 ```ts

@@ -263,6 +263,8 @@ Tunnel 目标是管理员授予受管 Xray 的持久出站连接能力。输入�
 
 ## 17. 六引擎快速配置安全边界（TASK058）
 
+- MAINT-027：中转只接受受管 hostId/addressFamily，由服务端解析公开 IP；不接受任意下一跳地址、端口或配置。全路径纳入签名，并限制入口/中转/唯一 host 数。relay JSON 严格校验和备份 hostId 映射；损坏或冲突必须拒绝，不能回退直连。仅缺失旧字段表示零中转。全部转发 host 进入在线/能力、双网络端口、正式规则和清理引用集合。
+
 - **能力交集：** engine 只来自共享 `FORWARD_TYPES` 六项 allowlist。服务端在目录、port check、preview 和 apply/edit 消费点都按全部 `hostId + addressFamily` 重算系统开关、公开地址和 Agent 版本/capability；旧 Agent 或缺字段取 false。浏览器不能提交 capability、命令、配置文本、二进制路径、运行时探测结果或“可用”布尔值。
 - **最小披露：** 目录只返回 engine、固定 label、默认标记、eligible 和稳定禁用码；不返回 Agent 版本、原始 capability、主机内部地址、安装路径、服务状态原文或探测输出。缺能力和未知 host 不得产生可用于枚举运行时细节的差异错误。
 - **固定规则面：** 六种 engine 都只能创建普通 TCP `forward_rules`，目标由服务端从已绑定落地资源解析，PROXY Protocol 双向固定关闭。iptables/nftables 不接受任意规则片段，进程型 engine 不接受任意 argv/unit/config；Agent 继续只执行现有受控生成路径。
