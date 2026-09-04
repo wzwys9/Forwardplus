@@ -26,6 +26,7 @@ export const XRAY_QUICK_CONFIG_FORWARD_ENGINE_DISABLED_REASON_CODES = [
   "UDP_CAPABILITY_REQUIRED",
   "QUICK_CONFIG_HOST_UNAVAILABLE",
   "QUICK_CONFIG_ADDRESS_UNAVAILABLE",
+  "QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED",
 ] as const;
 
 export type XrayQuickConfigForwardEngineDisabledReasonCode =
@@ -41,4 +42,20 @@ export type XrayQuickConfigForwardEngineCatalogItem = Readonly<{
 
 export function xrayQuickConfigForwardEngineLabel(engine: XrayQuickConfigForwardEngine): string {
   return FORWARD_TYPE_LABELS[engine];
+}
+
+export function quickConfigPathEngineCompatible(engine: XrayQuickConfigForwardEngine,
+  paths: readonly (readonly { hostId: number; addressFamily: "IPV4" | "IPV6" }[])[],
+  targetAddress: string, directLandingHostId?: number): boolean {
+  if (engine !== "iptables" && engine !== "nftables") return true;
+  const targetFamily = targetAddress.includes(":") ? "IPV6" : /^\d+\.\d+\.\d+\.\d+$/.test(targetAddress) ? "IPV4" : null;
+  return paths.every(hops => hops.length === 1 && hops[0].hostId === directLandingHostId
+    || !!targetFamily && hops.every((hop, index) => hop.addressFamily === (hops[index + 1]?.addressFamily ?? targetFamily)));
+}
+
+export function filterQuickConfigPathEngines(catalog: { defaultEngine: "realm"; items: XrayQuickConfigForwardEngineCatalogItem[] } | undefined,
+  paths: Parameters<typeof quickConfigPathEngineCompatible>[1], targetAddress: string, directLandingHostId?: number) {
+  if (!catalog) return undefined;
+  return { ...catalog, items: catalog.items.map(item => quickConfigPathEngineCompatible(item.engine, paths, targetAddress, directLandingHostId)
+    ? item : { ...item, eligible: false, disabledReasonCode: "QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED" as const }) };
 }

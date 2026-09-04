@@ -1,6 +1,6 @@
 # Xray 面板 API 契约
 
-状态：第一版契约已实施；多协议 additive 契约已批准并按任务增量落地；DNSPod 快速配置、同步与通用记录管理契约已批准。与 `SPEC.md` 0.26 配套。ForwardX 使用 tRPC，本文件描述 procedure、输入输出和错误语义；实现以共享 Zod schema 和类型测试固化。
+状态：第一版契约已实施；多协议 additive 契约已批准并按任务增量落地；DNSPod 快速配置、多跳路径、同步与通用记录管理契约已批准。与 `SPEC.md` 0.27 配套。ForwardX 使用 tRPC，本文件描述 procedure、输入输出和错误语义；实现以共享 Zod schema 和类型测试固化。
 
 主机列表、状态摘要和 Agent 升级接口将真实 `agentVersion` 与可空 `agentDistribution`、`agentBuildId` 分开返回。升级候选定义为“来源不是 `forwardplus` 或版本低于面板目标”；单台/批量升级请求写入 `targetDistribution=forwardplus`，只有后续报告同时满足来源和版本才返回完成。来源未知的旧 Agent 不能因为版本较高而绕过 Forwardplus 专有功能门控。
 
@@ -918,11 +918,14 @@ type QuickConfigForwardEngineCatalog = {
       | "UDP_CAPABILITY_REQUIRED"
       | "QUICK_CONFIG_HOST_UNAVAILABLE"
       | "QUICK_CONFIG_ADDRESS_UNAVAILABLE"
+      | "QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED"
       | null;
   }>;
 };
 ```
 
 候选顺序固定与共享 `FORWARD_TYPES` 一致；`defaultEngine="realm"` 只表示默认推荐，不会在 Realm 不可用时静默改选其他引擎。目录按全部已选 `hostId + addressFamily` 对共享引擎矩阵取交集，并叠加系统 `forwardProtocols` 全局开关、在线/公开地址、现有 TCP/UDP probe 与 UDP listener readiness capability，以及每项固定最低 Agent 版本。旧 Agent、缺失 capability、任一 host/address family 不兼容或全局关闭时返回禁用项，不猜测可用。响应不返回主机地址、Agent 版本、原始 capability、二进制路径或探测原文。
+
+完整路径额外按共享策略禁用不支持跨地址族/域名目标的内核引擎，使用 `QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED`。端口检测、preview/apply 与引擎切换同样返回该稳定错误；只有原端口的受管本机 DIRECT 路径豁免，改写端口后按真实转发段检查。
 
 TASK058 起 `xray.quickConfigs.portChecksCreate` 输入增加必填 `engine`；服务端把 engine 与规范 host/address-family cohort 一并绑定到 probe token 和 preview token。`preview`、`createApply`、`editPreview`、`editApply` 在各自消费点重新计算共同可用目录；浏览器提交的 `eligible`、label 或 capability 一律忽略。创建和修改始终生成正式 `forward_rules`，固定 `protocol=tcp`、`proxyProtocolReceive=false`、`proxyProtocolSend=false`。不支持或被关闭的 engine 返回 `FORWARD_PROTOCOL_DISABLED` 或上述主机稳定错误，不回退 Realm，也不按 host 拆成混合 engine。
