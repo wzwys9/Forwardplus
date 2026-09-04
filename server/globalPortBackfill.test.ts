@@ -94,6 +94,10 @@ test("legacy logical listeners backfill atomically, merge same owners, and prese
       assert.equal(byPort.get(24000).primaryOwnerTag, 'forward-rule:20');
       assert.equal(byPort.get(26000).primaryOwnerTag, 'tunnel:40');
       assert.equal(byPort.get(27000).primaryOwnerTag, 'tunnel:40');
+      assert.deepEqual(
+        [23000, 24000, 26000, 27000, 28000, 29000].map((port) => byPort.get(port)?.status),
+        ['ACTIVE', 'ACTIVE', 'ACTIVE', 'ACTIVE', 'ACTIVE', 'ACTIVE'],
+      );
 
       const refs = await runtime.queryRaw('SELECT * FROM global_port_allocation_references ORDER BY referenceKey');
       const refsFor = (port) => refs.filter((row) => Number(row.allocationId) === Number(byPort.get(port).id));

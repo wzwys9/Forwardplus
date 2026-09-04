@@ -15,6 +15,7 @@ test("Xray port operations exclude known ports and reserve one concurrent probe 
     const moduleUrl = (file) => pathToFileURL(path.join(process.cwd(), file)).href;
     const runtime = await import(moduleUrl("server/dbRuntime.ts"));
     const schema = await import(moduleUrl("server/dbSchema.ts"));
+    const backfill = await import(moduleUrl("server/globalPortBackfill.ts"));
     const reservations = await import(moduleUrl("server/portReservations.ts"));
     const operations = await import(moduleUrl("server/xrayPortOperations.ts"));
     const { xrayRouter } = await import(moduleUrl("server/routers/xray.ts"));
@@ -43,10 +44,46 @@ test("Xray port operations exclude known ports and reserve one concurrent probe 
       await runtime.executeRaw("INSERT INTO hosts (id, name, ip, isOnline, lastHeartbeat, userId) VALUES (10, 'edge-a', '192.0.2.10', 1, ?, 1), (11, 'edge-b', '192.0.2.11', 1, ?, 1)", [heartbeat, heartbeat]);
       await runtime.executeRaw("INSERT INTO xray_runtime_reports (hostId, capabilitySchemaVersion, supportsPortProbe) VALUES (10, 1, 1), (11, 1, 1)");
       await runtime.executeRaw("INSERT INTO forward_rules (hostId, name, protocol, sourcePort, targetIp, targetPort, userId) VALUES (10, 'known-forward', 'tcp', 12000, '198.51.100.10', 443, 1)");
+      await runtime.executeRaw("INSERT INTO forward_rules (hostId, name, protocol, sourcePort, targetIp, targetPort, forwardType, userId) VALUES (10, 'legacy-realm', 'tcp', 28255, '198.51.100.20', 443, 'realm', 1)");
       await runtime.executeRaw("INSERT INTO tunnels (name, entryHostId, exitHostId, listenPort, userId) VALUES ('known-tunnel', 11, 10, 13000, 1)");
       await runtime.executeRaw("INSERT INTO xray_inbounds (hostId, name, runtimeTag, publicAddress, listenPort, realityTargetHost, realityServerName, realityPublicKey, realityPrivateKeyEncrypted, createdByUserId) VALUES (10, 'known-xray', 'xray-known', '203.0.113.10', 14000, 'example.com', 'example.com', 'public', 'encrypted-private', 1)");
       const held = reservations.tryReserveHostPort(10, 15000, "tcp");
       assert.ok(held);
+      await backfill.backfillGlobalPortAllocations();
+
+      const usedOnOtherHost = await operations.collectXrayUsedPorts(11);
+      assert.equal(usedOnOtherHost.has(28255), true);
+      assert.equal(usedOnOtherHost.has(13000), true);
+      await expectCode(
+        operations.createXrayPortProbeOperation({ hostId: 11, userId: 1, mode: "MANUAL", manualPort: 28255 }),
+        "PORT_IN_USE",
+      );
+
+      await runtime.executeRaw("UPDATE hosts SET portRangeStart = 13000, portRangeEnd = 13001 WHERE id = 11");
+      const crossHostAutomatic = await operations.createXrayPortProbeOperation({ hostId: 11, userId: 1, mode: "AUTO" });
+      const [crossHostAutomaticTask] = await operations.takeXrayPortProbeTasks(11, 1);
+      assert.deepEqual(crossHostAutomaticTask.payload.ports, [13001]);
+      await operations.completeXrayPortProbeTask(11, successfulResult(crossHostAutomaticTask));
+      const crossHostAutomaticResult = await operations.getXrayPortProbeOperationResult(crossHostAutomatic.operationId, 1);
+      operations.consumeXrayPortReservation({
+        reservationId: crossHostAutomaticResult.reservationId,
+        hostId: 11,
+        userId: 1,
+        port: 13001,
+      });
+      await runtime.executeRaw("UPDATE hosts SET portRangeStart = NULL, portRangeEnd = NULL WHERE id = 11");
+
+      const crossHostRace = await operations.createXrayPortProbeOperation({
+        hostId: 11, userId: 1, mode: "MANUAL", manualPort: 28256,
+      });
+      const [crossHostRaceTask] = await operations.takeXrayPortProbeTasks(11, 1);
+      await runtime.executeRaw("INSERT INTO forward_rules (hostId, name, protocol, sourcePort, targetIp, targetPort, userId) VALUES (10, 'probe-race', 'tcp', 28256, '198.51.100.21', 443, 1)");
+      await backfill.backfillGlobalPortAllocations();
+      await operations.completeXrayPortProbeTask(11, successfulResult(crossHostRaceTask));
+      const crossHostRaceResult = await operations.getXrayPortProbeOperationResult(crossHostRace.operationId, 1);
+      assert.equal(crossHostRaceResult.status, "FAILED");
+      assert.equal(crossHostRaceResult.errorCode, "PORT_IN_USE");
+      await runtime.executeRaw("DELETE FROM xray_operations");
 
       assert.deepEqual(
         operations.generateXrayPortCandidates(new Set([1000, 1002]), 3, (() => {
@@ -60,7 +97,7 @@ test("Xray port operations exclude known ports and reserve one concurrent probe 
       const used = await operations.collectXrayUsedPorts(10);
       assert.deepEqual([12000, 13000, 14000, 15000].map((port) => used.has(port)), [true, true, true, true]);
       const udpUsed = await operations.collectXrayUsedPorts(10, "UDP");
-      assert.deepEqual([14000, 15000].map((port) => udpUsed.has(port)), [false, false]);
+      assert.deepEqual([14000, 15000].map((port) => udpUsed.has(port)), [true, false]);
       for (const manualPort of [12000, 13000, 14000, 15000]) {
         await expectCode(operations.createXrayPortProbeOperation({ hostId: 10, userId: 1, mode: "MANUAL", manualPort }), "PORT_IN_USE");
       }

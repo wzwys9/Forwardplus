@@ -287,6 +287,19 @@ export async function inspectGlobalPortAllocation(portValue: unknown): Promise<G
   return row ? allocationDto(row) : null;
 }
 
+export async function collectUnavailableGlobalPorts(): Promise<Set<number>> {
+  const q = quoteIdentifier;
+  const rows = await queryRaw<Row>(
+    `SELECT ${q("port")}, ${q("status")} FROM ${q("global_port_allocations")} WHERE ${q("status")} <> ?`,
+    ["FREE"],
+  );
+  const ports = new Set<number>();
+  for (const row of rows) {
+    if (allocationStatus(row.status) !== "FREE") ports.add(storedListenerPort(row.port));
+  }
+  return ports;
+}
+
 export async function inspectGlobalPortReferenceAllocation(
   reference: GlobalPortReferenceInput,
 ): Promise<GlobalPortAllocationDto | null> {

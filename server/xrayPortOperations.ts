@@ -20,6 +20,7 @@ import { getHostById } from "./repositories/hostRepository";
 import { getUsedPortsOnHost } from "./repositories/tunnelRepository";
 import { getXrayRuntimeReport } from "./repositories/xrayRepository";
 import { pushAgentRefresh } from "./agentEvents";
+import { collectUnavailableGlobalPorts } from "./globalPortAllocationService";
 
 const MIN_XRAY_PORT = 1000;
 const MAX_XRAY_PORT = 65535;
@@ -199,7 +200,11 @@ async function collectXrayDatabasePorts(hostId: number, network: XrayListenerNet
 export async function collectXrayUsedPorts(hostIdValue: unknown, networkValue?: unknown): Promise<Set<number>> {
   const hostId = positiveId(hostIdValue, "HOST_NOT_FOUND");
   const network = normalizedNetwork(networkValue);
-  const used = await collectXrayDatabasePorts(hostId, network);
+  const [used, globallyUnavailable] = await Promise.all([
+    collectXrayDatabasePorts(hostId, network),
+    collectUnavailableGlobalPorts(),
+  ]);
+  for (const port of globallyUnavailable) used.add(port);
   for (const port of reservedHostPorts(hostId, network)) used.add(port);
   return used;
 }
@@ -475,8 +480,9 @@ export async function completeXrayPortProbeTask(hostIdValue: unknown, rawResult:
 
     let selected: { port: number; reservation: HostPortReservation } | null = null;
     const available = new Set(result.result.ports.filter((item) => item.available).map((item) => item.port));
+    const globallyUnavailable = await collectUnavailableGlobalPorts();
     for (const port of meta.candidates) {
-      if (!available.has(port)) continue;
+      if (!available.has(port) || globallyUnavailable.has(port)) continue;
       const reservation = await reserveSpecificHostPort({
         hostId,
         port,
