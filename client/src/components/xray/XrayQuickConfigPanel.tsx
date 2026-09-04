@@ -18,6 +18,7 @@ import { copyTextToClipboard } from "@/lib/clipboard";
 import type { AppRouterOutputs } from "@/lib/trpc";
 import { trpc } from "@/lib/trpc";
 import { XrayQuickConfigDialog } from "./XrayQuickConfigDialog";
+import { XrayQuickConfigPathPreview } from "./XrayQuickConfigPathPreview";
 import { formatXrayEndpoint } from "./xrayInboundPresentation";
 import { xrayQuickConfigEndpointKey, type XrayQuickConfigEditDraft, type XrayQuickConfigEngine, type XrayQuickConfigTarget } from "./xrayQuickConfigFlow";
 
@@ -117,6 +118,7 @@ function gateMessage(account: DnsAccount, zones: readonly DnsZone[]) {
 function TargetCard(props: {
   target: XrayQuickConfigTarget;
   onConfigure: (trigger: HTMLButtonElement) => void;
+  onDesignPath: (trigger: HTMLButtonElement) => void;
 }) {
   const target = props.target;
   const reason = target.disabledReasonCode
@@ -141,14 +143,18 @@ function TargetCard(props: {
             {reason && <p className="mt-2 text-xs text-destructive">{reason}</p>}
           </div>
         </div>
-        <Button
-          type="button"
-          className="w-full shrink-0 sm:w-auto"
-          disabled={!target.eligible}
-          onClick={(event) => props.onConfigure(event.currentTarget)}
-        >
-          配置
-        </Button>
+        <div className="flex w-full shrink-0 flex-col gap-2 sm:w-auto">
+          <Button type="button" variant="outline" className="h-11" disabled={!target.eligible}
+            onClick={(event) => props.onDesignPath(event.currentTarget)}><Route className="mr-2 h-4 w-4" />路径设计（预览）</Button>
+          <Button
+            type="button"
+            className="h-11 w-full shrink-0 sm:w-auto"
+            disabled={!target.eligible}
+            onClick={(event) => props.onConfigure(event.currentTarget)}
+          >
+            配置
+          </Button>
+        </div>
       </CardContent>
     </Card>
   );
@@ -720,6 +726,7 @@ export function XrayQuickConfigPanel(props: {
   const [search, setSearch] = useState("");
   const [targetType, setTargetType] = useState<TargetType | "ALL">("ALL");
   const [selectedTarget, setSelectedTarget] = useState<XrayQuickConfigTarget | null>(null);
+  const [pathTarget, setPathTarget] = useState<XrayQuickConfigTarget | null>(null);
   const [editSession, setEditSession] = useState<Readonly<{ target: XrayQuickConfigTarget; draft: XrayQuickConfigEditDraft }> | null>(null);
   const [selectedConfigId, setSelectedConfigId] = useState<number | null>(null);
   const dialogTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -747,6 +754,7 @@ export function XrayQuickConfigPanel(props: {
     const trigger = dialogTriggerRef.current;
     dialogTriggerRef.current = null;
     setSelectedTarget(null);
+    setPathTarget(null);
     setEditSession(null);
     window.requestAnimationFrame(() => trigger?.focus());
   };
@@ -893,11 +901,14 @@ export function XrayQuickConfigPanel(props: {
         <Card><CardContent className="flex min-h-44 flex-col items-center justify-center p-6 text-center"><Route className="h-7 w-7 text-muted-foreground" aria-hidden="true" /><h2 className="mt-3 font-medium">没有匹配的落地节点</h2><p className="mt-1 text-sm text-muted-foreground">可先创建受管 Xray TCP 节点或导入外部 VLESS、SS、SOCKS5 出口。</p></CardContent></Card>
       ) : (
         <div className="space-y-3" aria-live="polite">
-          {targets.map((target) => <TargetCard key={`${target.targetType}:${target.targetId}`} target={target} onConfigure={(trigger) => { dialogTriggerRef.current = trigger; setSelectedTarget(target); }} />)}
+          {targets.map((target) => <TargetCard key={`${target.targetType}:${target.targetId}`} target={target}
+            onConfigure={(trigger) => { dialogTriggerRef.current = trigger; setSelectedTarget(target); }}
+            onDesignPath={(trigger) => { dialogTriggerRef.current = trigger; setPathTarget(target); }} />)}
           {(targetsQuery.data?.total ?? 0) > targets.length && <p className="text-center text-xs text-muted-foreground">当前显示前 {targets.length} 个结果，请使用搜索缩小范围。</p>}
         </div>
       )}
 
+      {pathTarget && <XrayQuickConfigPathPreview target={pathTarget} onClose={closeDialog} />}
       {selectedTarget && <XrayQuickConfigDialog
         key={`${selectedTarget.targetType}:${selectedTarget.targetId}`}
         target={selectedTarget}
