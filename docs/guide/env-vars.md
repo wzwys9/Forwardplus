@@ -111,7 +111,7 @@ AI API Key 不建议写入 Docker `.env`。后台保存后会做脱敏展示，�
 | --- | --- | --- |
 | `FORWARDX_IMAGE` | `ghcr.io/wzwys9/forwardplus:latest` | Docker 部署使用的镜像。 |
 | `FORWARDX_IMAGE_REPO` | `ghcr.io/wzwys9/forwardplus` | Docker 一键脚本解析版本镜像时使用的镜像仓库。 |
-| `FORWARDPLUS_GITHUB_TOKEN` | 空 | 私有仓库更新检查和 Release 下载使用的只读 Token；只配置在服务端，建议限定为本仓库 `Contents: read`。 |
+| `FORWARDPLUS_GITHUB_TOKEN` | 空 | 可选的 GitHub 只读 Token，用于提高更新检查和 Release 下载的 API 限额；只配置在服务端，建议限定为本仓库 `Contents: read`。 |
 | `FORWARDX_GITHUB_ACCELERATOR_URL` | 空 | 面板安装或升级使用的 GitHub 加速站，例如 `https://mirror.example.com`。一键脚本通过 `--github-accelerator` 接收后会写入部署 `.env`。 |
 | `FORWARDX_TARGET_VERSION` | 空 | 本地部署可指定安装或升级到某个版本，例如 `v2.3.222`。Docker 脚本也会用它校验目标镜像是否已经构建完成。 |
 | `FORWARDX_UPGRADE_COMMAND` | 空 | 后台一键升级命令。为空时只能检查更新，不能在后台直接执行升级。 |

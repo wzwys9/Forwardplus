@@ -81,7 +81,7 @@ curl -fsSL http://你的面板地址:9810/api/agent/install.sh | bash -s -- upgr
 卸载命令可在 Token 管理的安装命令弹窗中获取，通用卸载命令如下：
 
 ```bash
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-agent.sh?ref=main" | bash -s -- uninstall
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-agent.sh" | bash -s -- uninstall'
 ```
 
 ---

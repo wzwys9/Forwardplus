@@ -6,10 +6,10 @@
 
 推荐使用 Docker 一键安装：
 
-Forwardplus 是私有仓库。先安装 `gh`、执行 `gh auth login`，并导出仅有本仓库 `Contents: read` 权限的 `FORWARDPLUS_GITHUB_TOKEN`；Docker 镜像还需要提前登录私有 GHCR。
+Forwardplus 是公开仓库，安装脚本可以匿名读取。首次发布 Docker 镜像后，请确认 GitHub Packages 中的镜像包也已设置为 Public。
 
 ```bash
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-docker.sh?ref=main" | bash -s -- install
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh" | bash -s -- install'
 ```
 
 安装完成后访问面板：

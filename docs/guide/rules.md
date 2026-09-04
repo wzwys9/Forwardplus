@@ -96,7 +96,7 @@ mimic 只用于 ForwardX 隧道，且规则协议需要包含 UDP：
 参与链路的 Agent 主机需要安装 `mimic`/`mimic-dkms`。Agent 安装脚本提供可选安装，默认不安装；也可以手动执行：
 
 ```bash
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-mimic.sh?ref=main" | sudo bash
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-mimic.sh" | sudo bash'
 ```
 
 ForwardX 安装器默认安装或升级到 `mimic v0.7.1`。该版本仍要求 Linux 6.1+、XDP 入站和 TC 出站 eBPF 钩子；Agent 会在 XDP `native` 与 `skb` 模式之间自动回退。发行版没有对应二进制包时，上游安装器会尝试源码构建。

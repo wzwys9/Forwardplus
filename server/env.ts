@@ -77,8 +77,8 @@ export const ENV = {
   // 管理后台一键升级命令。为空时只允许检查更新，不执行升级。
   // 执行时会注入 FORWARDX_TARGET_VERSION / FORWARDX_CURRENT_VERSION / FORWARDX_REPO_URL。
   upgradeCommand: process.env.FORWARDX_UPGRADE_COMMAND ?? "",
-  // Optional read-only token used by the server for this private GitHub
-  // repository's update checks and release assets. It is never returned by an API.
+  // Optional read-only token used to raise GitHub API limits for update checks
+  // and release assets. It is never returned by an API.
   githubToken: process.env.FORWARDPLUS_GITHUB_TOKEN ?? process.env.FORWARDX_GITHUB_TOKEN ?? "",
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? "",
   telegramBotPolling: process.env.TELEGRAM_BOT_POLLING !== "false",

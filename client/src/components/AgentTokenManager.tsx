@@ -668,9 +668,8 @@ export default function AgentTokenManager({
       ? `${githubAcceleratorUrl}/https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-agent.sh`
       : "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-agent.sh";
     const githubCommand = withPipefail(`curl -fsSL ${curlScriptArgs} "${githubScriptUrl}" | PANEL_URL=${shellQuote(installPanelUrl)} ${bashPrefix} -s -- ${args}`);
-    // Forwardplus is private, so an unauthenticated raw.githubusercontent.com
-    // bootstrap may be unavailable. The authenticated panel endpoint is always
-    // the reliable first source; GitHub remains a best-effort fallback.
+    // Prefer the current panel so the bootstrap follows its deployed version;
+    // the public repository remains a fallback if the panel route is unavailable.
     return `${panelCommand} || ${githubCommand}`;
   };
 

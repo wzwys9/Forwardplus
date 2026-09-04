@@ -41,7 +41,11 @@ ENV NODE_ENV=production \
     SQLITE_PATH=/data/forwardx.db \
     MYSQL_CONFIG_PATH=/data/mysql.json \
     FORWARDX_IMAGE_VERSION=$FORWARDX_VERSION
-LABEL org.opencontainers.image.version=$FORWARDX_VERSION \
+LABEL org.opencontainers.image.title="Forwardplus" \
+      org.opencontainers.image.description="Forwardplus port forwarding and Xray management panel" \
+      org.opencontainers.image.source="https://github.com/wzwys9/Forwardplus" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.version=$FORWARDX_VERSION \
       org.forwardx.version=$FORWARDX_VERSION
 
 RUN apk add --no-cache tini git curl openssl docker-cli docker-cli-compose && mkdir -p /data

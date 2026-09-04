@@ -43,7 +43,7 @@ Options:
 
 Environment:
   FORWARDX_GITHUB_ACCELERATOR_URL   Same as --github-accelerator; an explicit empty value disables it.
-  FORWARDPLUS_GITHUB_TOKEN          Optional read-only token for the private Forwardplus repository.
+  FORWARDPLUS_GITHUB_TOKEN          Optional read-only token that raises GitHub API rate limits.
 EOF
 }
 

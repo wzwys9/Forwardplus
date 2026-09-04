@@ -52,13 +52,13 @@ chmod 600 ./forwardx-xray-master.key.bak
 ### Docker 部署
 
 ```bash
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-docker.sh?ref=main" | bash -s -- upgrade
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh" | bash -s -- upgrade'
 ```
 
 指定版本升级：
 
 ```bash
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-docker.sh?ref=main" | sudo env FORWARDX_TARGET_VERSION=vX.Y.Z bash -s -- upgrade
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh" | sudo env FORWARDX_TARGET_VERSION=vX.Y.Z bash -s -- upgrade'
 ```
 
 升级会保留 `.env`、部署目录数据和 Docker 数据卷。如果 `latest` 镜像尚未构建到目标版本，脚本会提示稍后重试并保留旧容器运行。
@@ -75,13 +75,13 @@ docker exec forwardx-panel node -p "require('./package.json').version"
 ### 本地 systemd 部署
 
 ```bash
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-local.sh?ref=main" | bash -s -- upgrade
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | bash -s -- upgrade'
 ```
 
 指定版本升级：
 
 ```bash
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-local.sh?ref=main" | sudo env FORWARDX_TARGET_VERSION=vX.Y.Z bash -s -- upgrade
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | sudo env FORWARDX_TARGET_VERSION=vX.Y.Z bash -s -- upgrade'
 ```
 
 本地 systemd 部署升级会保留 `.env`、`data` 目录、数据库配置和已有数据。如果面板程序包尚未上传到 GitHub Release，脚本会提示等待 GitHub Actions 构建完成。
@@ -92,12 +92,10 @@ set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: applica
 
 ```bash
 # Docker
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-docker.sh?ref=main" \
-  | bash -s -- upgrade --github-accelerator "https://mirror.example.com"
+bash -o pipefail -c 'curl -fsSL "https://mirror.example.com/https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh" | bash -s -- upgrade --github-accelerator "https://mirror.example.com"'
 
 # 本地 systemd
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-local.sh?ref=main" \
-  | bash -s -- upgrade --github-accelerator "https://mirror.example.com"
+bash -o pipefail -c 'curl -fsSL "https://mirror.example.com/https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | bash -s -- upgrade --github-accelerator "https://mirror.example.com"'
 ```
 
 脚本会把加速地址保存到部署 `.env`，后续升级可继续使用。加速请求失败会自动回退直连 GitHub，不需要手动切换命令。
@@ -178,8 +176,8 @@ sudo systemctl start forwardx-panel
 在安装过插件的 Agent 主机先预检，再确认执行：
 
 ~~~bash
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/migrate-agent-legacy.sh?ref=main" | bash
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/migrate-agent-legacy.sh?ref=main" | bash -s -- --apply
+bash -o pipefail -c 'curl -fsSL "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/migrate-agent-legacy.sh" | bash'
+bash -o pipefail -c 'curl -fsSL "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/migrate-agent-legacy.sh" | bash -s -- --apply'
 ~~~
 
 该脚本不会升级或重启 Agent。迁移后仍需把 Agent 升级到 2.2.151 或更高版本，并在插件管理中重新同步 Agent；损坏或完全缺少版本的清单必须通过重新同步恢复。

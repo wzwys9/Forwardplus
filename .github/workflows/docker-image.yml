@@ -74,8 +74,10 @@ jobs:
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           labels: |
-            org.opencontainers.image.title=ForwardX
-            org.opencontainers.image.description=ForwardX port forwarding panel
+            org.opencontainers.image.title=Forwardplus
+            org.opencontainers.image.description=Forwardplus port forwarding and Xray management panel
+            org.opencontainers.image.source=https://github.com/wzwys9/Forwardplus
+            org.opencontainers.image.licenses=AGPL-3.0-only
             org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
             org.forwardx.version=${{ needs.prepare.outputs.version }}
           build-args: |

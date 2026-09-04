@@ -2,8 +2,8 @@
 
 ForwardX 面板支持 Docker 部署和本地 systemd 部署。普通用户优先推荐 Docker 部署；如果你希望面板直接运行在宿主机上，可以选择本地 systemd 部署。
 
-::: warning 私有仓库认证
-以下命令通过已登录的 GitHub CLI 读取安装脚本。请先执行 `gh auth login`，并导出仅有 `wzwys9/Forwardplus` 仓库 `Contents: read` 权限的 `FORWARDPLUS_GITHUB_TOKEN`，供安装器检查版本和下载 Release 资产。私有 GHCR 镜像还需要使用带 `read:packages` 权限的 classic PAT 登录。
+::: tip 公开分发
+安装脚本和 Release 可匿名访问，不需要先安装 GitHub CLI。`FORWARDPLUS_GITHUB_TOKEN` 仅用于提高 GitHub API 限额，可按需配置在服务端。首次发布容器镜像后，还需在 GitHub Packages 中确认镜像包已设置为 Public。
 :::
 
 ## Docker 一键部署
@@ -11,7 +11,7 @@ ForwardX 面板支持 Docker 部署和本地 systemd 部署。普通用户优先
 以 root 用户执行：
 
 ```bash
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-docker.sh?ref=main" | bash -s -- install
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh" | bash -s -- install'
 ```
 
 安装完成后访问：
@@ -35,10 +35,10 @@ Docker 部署的特点：
 
 ```bash
 # 升级面板
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-docker.sh?ref=main" | bash -s -- upgrade
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh" | bash -s -- upgrade'
 
 # 卸载面板
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-docker.sh?ref=main" | bash -s -- uninstall
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh" | bash -s -- uninstall'
 
 # 查看容器日志
 docker logs -n 300 forwardx-panel
@@ -112,7 +112,7 @@ COMPOSE_PROJECT_NAME=forwardx
 FORWARDX_CONTAINER_NAME=forwardx-panel
 FORWARDX_IMAGE=ghcr.io/wzwys9/forwardplus:latest
 JWT_SECRET=请替换为上一步生成的随机字符串
-FORWARDPLUS_GITHUB_TOKEN=请填写仅有本仓库Contents读取权限的Token
+# FORWARDPLUS_GITHUB_TOKEN=可选的本仓库Contents只读Token
 
 # 可选：如果要通过环境变量指定 PostgreSQL，取消注释并填写
 # DATABASE_TYPE=postgresql
@@ -240,7 +240,7 @@ docker image ls --no-trunc --format '{{.Repository}} {{.Tag}} {{.ID}}' ghcr.io/w
 如果你不想使用 Docker，可以使用本地部署：
 
 ```bash
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-local.sh?ref=main" | bash -s -- install
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | bash -s -- install'
 ```
 
 安装完成后访问：
@@ -253,10 +253,10 @@ http://服务器IP:9810
 
 ```bash
 # 升级面板
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-local.sh?ref=main" | bash -s -- upgrade
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | bash -s -- upgrade'
 
 # 卸载面板
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-local.sh?ref=main" | bash -s -- uninstall
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | bash -s -- uninstall'
 
 # 查看面板日志
 journalctl -u forwardx-panel -n 300 --no-pager
@@ -280,37 +280,32 @@ GitHub 访问不稳定时，Docker 和本地 systemd 一键脚本都支持：
 
 加速站需要支持 `加速站地址/原始 GitHub URL` 格式。参数会保存到部署目录的 `.env`，后续升级即使不重复传参也会继续使用。加速请求失败时，脚本会自动回退到原始 GitHub 地址。
 
-`--github-accelerator` 只影响安装脚本启动后的 GitHub API 和 Release 请求；安装脚本本身始终由已认证的 `gh api` 获取，仓库 Token 不会发送给加速站。
+`--github-accelerator` 会作用于安装脚本的 Raw 启动地址及后续 GitHub API、Release 请求。可选的仓库 Token 只会发送给 GitHub 官方 HTTPS 域名，不会发送给加速站。
 
 ### Docker 示例
 
 ```bash
-# 安装；脚本由 gh api 获取，后续 Release 请求可使用加速站
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-docker.sh?ref=main" \
-  | bash -s -- install --github-accelerator "https://mirror.example.com"
+# 安装
+bash -o pipefail -c 'curl -fsSL "https://mirror.example.com/https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh" | bash -s -- install --github-accelerator "https://mirror.example.com"'
 
 # 升级；已保存地址时可省略 --github-accelerator
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-docker.sh?ref=main" \
-  | bash -s -- upgrade --github-accelerator "https://mirror.example.com"
+bash -o pipefail -c 'curl -fsSL "https://mirror.example.com/https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh" | bash -s -- upgrade --github-accelerator "https://mirror.example.com"'
 ```
 
 ### 本地 systemd 示例
 
 ```bash
-# 安装；脚本由 gh api 获取，后续 Release 请求可使用加速站
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-local.sh?ref=main" \
-  | bash -s -- install --github-accelerator "https://mirror.example.com"
+# 安装
+bash -o pipefail -c 'curl -fsSL "https://mirror.example.com/https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | bash -s -- install --github-accelerator "https://mirror.example.com"'
 
 # 升级；已保存地址时可省略 --github-accelerator
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-local.sh?ref=main" \
-  | bash -s -- upgrade --github-accelerator "https://mirror.example.com"
+bash -o pipefail -c 'curl -fsSL "https://mirror.example.com/https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | bash -s -- upgrade --github-accelerator "https://mirror.example.com"'
 ```
 
 也可以用环境变量传入相同配置：
 
 ```bash
-set -o pipefail; GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/vnd.github.raw+json" "repos/wzwys9/Forwardplus/contents/scripts/install-panel-local.sh?ref=main" \
-  | sudo env FORWARDX_GITHUB_ACCELERATOR_URL="https://mirror.example.com" bash -s -- install
+bash -o pipefail -c 'curl -fsSL "https://mirror.example.com/https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | sudo env FORWARDX_GITHUB_ACCELERATOR_URL="https://mirror.example.com" bash -s -- install'
 ```
 
 ::: warning Docker 镜像不经过此加速站
@@ -347,9 +342,8 @@ VERSION=v2.3.266
 APP_DIR=/opt/forwardx-panel
 
 mkdir -p "$APP_DIR"
-ASSET_ID="$(GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api "repos/wzwys9/Forwardplus/releases/tags/${VERSION}" --jq ".assets[] | select(.name == \"forwardx-panel-${VERSION}.tar.gz\") | .id" | head -n 1)"
-test -n "$ASSET_ID"
-GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/octet-stream" "repos/wzwys9/Forwardplus/releases/assets/${ASSET_ID}" > /tmp/forwardx-panel.tar.gz
+curl -fL --retry 3 -o /tmp/forwardx-panel.tar.gz \
+  "https://github.com/wzwys9/Forwardplus/releases/download/${VERSION}/forwardx-panel-${VERSION}.tar.gz"
 tar -xzf /tmp/forwardx-panel.tar.gz -C "$APP_DIR"
 cd "$APP_DIR"
 pnpm install --prod --frozen-lockfile
@@ -378,7 +372,7 @@ MYSQL_CONFIG_PATH=/opt/forwardx-panel/data/mysql.json
 JWT_SECRET=请替换为随机字符串
 FORWARDX_PORT_CONFIG_PATH=/opt/forwardx-panel/.env
 FORWARDX_PORT_MANAGEMENT=local
-FORWARDPLUS_GITHUB_TOKEN=请填写仅有本仓库Contents读取权限的Token
+# FORWARDPLUS_GITHUB_TOKEN=可选的本仓库Contents只读Token
 EOF
 chmod 600 /opt/forwardx-panel/.env
 ```
@@ -430,9 +424,8 @@ systemctl stop forwardx-panel
 cd "$APP_DIR"
 rm -rf dist client drizzle scripts
 rm -f package.json pnpm-lock.yaml pnpm-workspace.yaml
-ASSET_ID="$(GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api "repos/wzwys9/Forwardplus/releases/tags/${VERSION}" --jq ".assets[] | select(.name == \"forwardx-panel-${VERSION}.tar.gz\") | .id" | head -n 1)"
-test -n "$ASSET_ID"
-GH_TOKEN="$FORWARDPLUS_GITHUB_TOKEN" gh api -H "Accept: application/octet-stream" "repos/wzwys9/Forwardplus/releases/assets/${ASSET_ID}" > /tmp/forwardx-panel.tar.gz
+curl -fL --retry 3 -o /tmp/forwardx-panel.tar.gz \
+  "https://github.com/wzwys9/Forwardplus/releases/download/${VERSION}/forwardx-panel-${VERSION}.tar.gz"
 tar -xzf /tmp/forwardx-panel.tar.gz -C "$APP_DIR"
 pnpm install --prod --frozen-lockfile
 systemctl start forwardx-panel

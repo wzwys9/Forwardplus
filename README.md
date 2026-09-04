@@ -2,7 +2,7 @@
 
 Forwardplus 是基于 [ForwardX](https://github.com/poouo/Forwardx) 二次开发的多主机端口转发、隧道和 Xray 节点管理面板。项目包含 React 管理界面、Express/tRPC 服务端、Go Agent，以及 Go FXP 隧道运行时。
 
-本仓库为私有仓库：GitHub Raw、Releases 和 GHCR 镜像默认都不能匿名访问。生产部署应配置最小权限的 GitHub Token，Agent 安装则优先使用面板自带的安装接口。
+本仓库公开发布，安装脚本和 Release 可匿名访问。Agent 安装仍优先使用面板自带接口，以便安装来源与当前面板版本保持一致。
 
 ## 主要功能
 
@@ -22,11 +22,10 @@ Forwardplus 是基于 [ForwardX](https://github.com/poouo/Forwardx) 二次开发
 
 ## 获取代码
 
-先安装并登录 GitHub CLI，然后克隆私有仓库：
+直接克隆公开仓库：
 
 ```bash
-gh auth login
-gh repo clone wzwys9/Forwardplus
+git clone https://github.com/wzwys9/Forwardplus.git
 cd Forwardplus
 ```
 
@@ -51,38 +50,29 @@ openssl rand -hex 32
 
 ### 使用本地安装脚本
 
-创建 GitHub Release 并上传面板构建产物后，可使用仅有本仓库 `Contents: read` 权限的 [fine-grained token](https://docs.github.com/rest/releases/assets#get-a-release-asset) 安装：
+发布版本及面板构建产物后，可直接运行公开安装脚本：
 
 ```bash
-export FORWARDPLUS_GITHUB_TOKEN="YOUR_FINE_GRAINED_CONTENTS_READ_TOKEN"
-sudo --preserve-env=FORWARDPLUS_GITHUB_TOKEN \
-  bash scripts/install-panel-local.sh install
-unset FORWARDPLUS_GITHUB_TOKEN
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | sudo bash -s -- install'
 ```
 
 升级和卸载：
 
 ```bash
-export FORWARDPLUS_GITHUB_TOKEN="YOUR_FINE_GRAINED_CONTENTS_READ_TOKEN"
-sudo --preserve-env=FORWARDPLUS_GITHUB_TOKEN bash scripts/install-panel-local.sh upgrade
-unset FORWARDPLUS_GITHUB_TOKEN
-sudo bash scripts/install-panel-local.sh uninstall
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | sudo bash -s -- upgrade'
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | sudo bash -s -- uninstall'
 ```
 
 ### Docker
 
-私有 GHCR 镜像需要先使用带 `read:packages` 权限的 [classic personal access token](https://docs.github.com/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-to-the-container-registry) 登录：
+当 `ghcr.io/wzwys9/forwardplus` 包设置为 Public 后，可以匿名拉取：
 
 ```bash
-export GHCR_TOKEN="YOUR_CLASSIC_PAT_WITH_READ_PACKAGES"
-echo "$GHCR_TOKEN" | docker login ghcr.io -u wzwys9 --password-stdin
-unset GHCR_TOKEN
-
 cp .env.example .env
 docker compose up -d
 ```
 
-默认镜像为 `ghcr.io/wzwys9/forwardplus:latest`。请在 `.env` 中设置随机 `JWT_SECRET`；若需要面板检查私有仓库更新，再设置 `FORWARDPLUS_GITHUB_TOKEN`。
+默认镜像为 `ghcr.io/wzwys9/forwardplus:latest`。首次发布镜像后，还需在 GitHub Packages 中确认该包的可见性为 Public。请在 `.env` 中设置随机 `JWT_SECRET`。
 
 ## 添加主机 Agent
 
@@ -100,17 +90,17 @@ bash -c 'set -o pipefail; curl -fsSL --connect-timeout 15 --speed-limit 1024 --s
 https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-agent.sh
 ```
 
-由于 `Forwardplus` 是私有仓库，该 Raw 地址不能匿名访问，所以它只作为备用来源。正常安装应优先使用面板的 `/api/agent/install.sh`。
+该 Raw 地址可匿名访问，但正常安装仍优先使用面板的 `/api/agent/install.sh`，Raw 地址作为面板安装接口不可用时的备用来源。
 
-## 私有仓库更新检查
+## 更新检查
 
-面板的仓库地址、Release、Tag、主分支版本检查和默认镜像已切换到 `wzwys9/Forwardplus`。在生产面板的 `.env` 中配置：
+面板的仓库地址、Release、Tag、主分支版本检查和默认镜像已切换到 `wzwys9/Forwardplus`。公开仓库无需 Token；如检查频率较高，可在生产面板的 `.env` 中配置只读 Token，以提高 GitHub API 限额：
 
 ```bash
 FORWARDPLUS_GITHUB_TOKEN=github_pat_replace_me
 ```
 
-建议创建仅允许访问 `wzwys9/Forwardplus`、且只有 `Contents: read` 权限的 fine-grained token。修改 `.env` 后重启面板。没有 Token 时，私有仓库的更新检查和 Release 资产回退下载会失败，但面板与现有 Agent 数据面不会因此停止。
+Token 只配置在服务端，建议限制到 `wzwys9/Forwardplus` 且仅授予 `Contents: read`。修改 `.env` 后重启面板。未配置 Token 时，面板使用 GitHub 匿名 API 限额，现有 Agent 数据面不受影响。
 
 每次发布新版本时应同步更新版本常量、创建 `vX.Y.Z` Release，并由 GitHub Actions 构建面板、Agent、FXP、Android 和 Docker 资产。
 
@@ -134,7 +124,7 @@ corepack pnpm test:server
 
 - `.env`、`vps*.txt`、数据库、日志、API Key、私钥和签名文件均不应提交。
 - Android Release 必须通过 GitHub Secrets 注入签名材料；仓库不提供签名私钥兜底。
-- `FORWARDPLUS_GITHUB_TOKEN` 只应配置在服务端，并使用最小只读权限。
+- 可选的 `FORWARDPLUS_GITHUB_TOKEN` 只应配置在服务端，并使用最小只读权限。
 - 推送前建议检查 `git status`，并执行一次敏感信息扫描。
 
 ## 许可证与来源
