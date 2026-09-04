@@ -24,6 +24,7 @@ services:
       POSTGRES_SSL: ${POSTGRES_SSL:-false}
       JWT_SECRET: ${JWT_SECRET:-change-me-to-a-random-string}
       FORWARDPLUS_GITHUB_TOKEN: ${FORWARDPLUS_GITHUB_TOKEN:-}
+      FORWARDPLUS_MIGRATE_AGENTS: ${FORWARDPLUS_MIGRATE_AGENTS:-false}
     volumes:
       - forwardx-data:/data
     logging:

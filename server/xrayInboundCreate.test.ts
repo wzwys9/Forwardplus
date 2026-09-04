@@ -89,7 +89,7 @@ test("Xray inbound create is atomic, secret-safe, and coordinates install before
       await runtime.executeRaw("INSERT INTO users (id, username, password, role) VALUES (1, 'admin', 'hash', 'admin')");
       await runtime.executeRaw("INSERT INTO users (id, username, password, role) VALUES (2, 'member', 'hash', 'user')");
       for (const hostId of [1, 2, 3]) {
-        await runtime.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, userId) VALUES (?, ?, '8.8.8.8', '8.8.8.8', 1, ?, '2.3.1', 1)", [hostId, 'edge-' + hostId, now]);
+        await runtime.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, agentDistribution, userId) VALUES (?, ?, '8.8.8.8', '8.8.8.8', 1, ?, '2.3.1', 'forwardplus', 1)", [hostId, 'edge-' + hostId, now]);
         await runtime.executeRaw("INSERT INTO xray_runtime_reports (hostId, capabilitySchemaVersion, supportedOS, supportedArch, supportsArtifactInstall, supportsPortProbe, supportsRealityScan) VALUES (?, 1, 'linux', 'amd64', 1, 1, 1)", [hostId]);
         await approveReality(hostId);
       }

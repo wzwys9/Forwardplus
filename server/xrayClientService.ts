@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { AGENT_VERSION } from "../shared/versions";
-import { isAgentVersionAtLeast } from "./agentRouteUtils";
+import { isForwardplusAgentVersionAtLeast } from "./agentRouteUtils";
 
 import { buildXrayVlessRealityUri } from "../shared/xrayShare";
 import { resolveStoredXrayInboundDefinition } from "../shared/xrayProfiles";
@@ -142,7 +142,7 @@ async function requireWritableHost(hostId: number) {
   if (!host) throw new XrayClientServiceError("HOST_NOT_FOUND");
   if (!host.isOnline) throw new XrayClientServiceError("HOST_OFFLINE");
   const runtime = await getXrayRuntimeReport(hostId);
-  if (!isAgentVersionAtLeast(host.agentVersion, AGENT_VERSION) || !runtime || runtime.capabilitySchemaVersion !== 1
+  if (!isForwardplusAgentVersionAtLeast(host.agentVersion, host.agentDistribution, AGENT_VERSION) || !runtime || runtime.capabilitySchemaVersion !== 1
     || runtime.supportedOS !== "linux" || (runtime.supportedArch !== "amd64" && runtime.supportedArch !== "arm64")
     || !runtime.supportsArtifactInstall || !runtime.supportsPortProbe || !runtime.supportsRealityScan) {
     throw new XrayClientServiceError("AGENT_CAPABILITY_MISSING");

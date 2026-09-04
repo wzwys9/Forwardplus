@@ -80,6 +80,9 @@ export const ENV = {
   // Optional read-only token used to raise GitHub API limits for update checks
   // and release assets. It is never returned by an API.
   githubToken: process.env.FORWARDPLUS_GITHUB_TOKEN ?? process.env.FORWARDX_GITHUB_TOKEN ?? "",
+  // Set only by the explicit migrate-forwardx installer action. Mismatched
+  // Agent distributions are then upgraded as they reconnect.
+  migrateForwardxAgents: /^(1|true|yes|on)$/i.test(process.env.FORWARDPLUS_MIGRATE_AGENTS ?? ""),
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? "",
   telegramBotPolling: process.env.TELEGRAM_BOT_POLLING !== "false",
   isProduction: process.env.NODE_ENV === "production",

@@ -315,6 +315,16 @@ printf 'UPGRADE=%s\\n' "$FORWARDX_UPGRADE_COMMAND"
   assert.doesNotMatch(result.stdout, /SCRIPT|DIRECT_URL|mktemp/);
 });
 
+test("both installers expose an explicit ForwardX migration action and persist automatic Agent migration", () => {
+  for (const installer of installers) {
+    assert.match(installer.source, /install\|upgrade\|update\|migrate-forwardx\|uninstall/);
+    assert.match(installer.source, /upgrade\|update\|migrate-forwardx\) upgrade_panel/);
+    assert.match(installer.source, /FORWARDPLUS_MIGRATE_AGENTS=\$MIGRATE_FORWARDX_AGENTS/);
+    assert.match(installer.source, /Detected existing panel/);
+  }
+  assert.match(dockerSource, /FORWARDPLUS_MIGRATE_AGENTS: \$\{MIGRATE_FORWARDX_AGENTS\}/);
+});
+
 test("the local installer validates the complete archive before removing the current panel", () => {
   const downloader = section(localSource, "download_github_archive() {", "read_install_port() {");
   const installBundle = section(localSource, "download_panel_bundle() {", "install_runtime_dependencies() {");

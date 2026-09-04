@@ -33,7 +33,7 @@ test("Xray inbound deletion stays pending until exact apply and the last inbound
       secrets.createXrayMasterKeyFile({ path: process.env.XRAY_MASTER_KEY_PATH });
       const keyring = secrets.loadXrayMasterKeyFile({ path: process.env.XRAY_MASTER_KEY_PATH });
       await db.executeRaw("INSERT INTO users (id, username, password, role) VALUES (1, 'admin', 'hash', 'admin'), (2, 'member', 'hash', 'user')");
-      await db.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, userId) VALUES (1, 'edge-delete', '8.8.8.8', '8.8.8.8', 1, ?, '2.3.278', 1)", [now]);
+      await db.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, agentDistribution, userId) VALUES (1, 'edge-delete', '8.8.8.8', '8.8.8.8', 1, ?, '2.3.278', 'forwardplus', 1)", [now]);
       await db.executeRaw("INSERT INTO xray_runtime_reports (hostId, capabilitySchemaVersion, supportedOS, supportedArch, supportsArtifactInstall, supportsPortProbe, supportsRealityScan, isInstalled, installedVersion, runningVersion, serviceStatus, processId, appliedGeneration, binarySha256, listenersJson, reportedAt) VALUES (1, 1, 'linux', 'amd64', 1, 1, 1, 1, ?, ?, 'RUNNING', 4242, 1, ?, '[]', ?)", [artifacts.XRAY_DEFAULT_VERSION, artifacts.XRAY_DEFAULT_VERSION, "b".repeat(64), now]);
       const addInbound = async (id, name, port) => {
         const runtimeTag = "forwardx-inbound-delete-" + id;

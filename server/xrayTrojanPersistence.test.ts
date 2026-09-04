@@ -34,7 +34,7 @@ test("Trojan Reality stays generic-only through config, CRUD, share, and tombsto
       await runtime.connectDatabase({ type: "sqlite", sqlite: { path: process.env.FORWARDX_TEST_DB } });
       await schema.ensureDatabaseSchema();
       await runtime.executeRaw("INSERT INTO users (id, username, password, role) VALUES (1, 'admin', 'hash', 'admin')");
-      await runtime.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, userId) VALUES (10, 'edge', '192.0.2.10', '192.0.2.10', 1, ?, ?, 1)", [Math.floor(Date.now() / 1000), versions.AGENT_VERSION]);
+      await runtime.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, agentDistribution, userId) VALUES (10, 'edge', '192.0.2.10', '192.0.2.10', 1, ?, ?, 'forwardplus', 1)", [Math.floor(Date.now() / 1000), versions.AGENT_VERSION]);
       await runtime.executeRaw("INSERT INTO xray_runtime_reports (hostId, capabilitySchemaVersion, supportedOS, supportedArch, supportsArtifactInstall, supportsPortProbe, supportsRealityScan) VALUES (10, 1, 'linux', 'amd64', 1, 1, 1)");
       const runtimeTag = "forwardx-inbound-trojan-db";
       const statsKey = "forwardx-access-trojan-db";

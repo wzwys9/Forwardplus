@@ -91,7 +91,7 @@ test("Trojan RAW TLS persistence and host snapshots stay password-only and host-
       await schema.ensureDatabaseSchema();
       await runtime.executeRaw("INSERT INTO users (id, username, password, role) VALUES (1, 'admin', 'hash', 'admin')");
       const now = Math.floor(Date.now() / 1000);
-      await runtime.executeRaw("INSERT INTO hosts (id, name, ip, isOnline, lastHeartbeat, agentVersion, userId) VALUES (10, 'edge-a', '127.0.0.1', 1, ?, ?, 1), (20, 'edge-b', '127.0.0.2', 1, ?, ?, 1)", [now, versions.AGENT_VERSION, now, versions.AGENT_VERSION]);
+      await runtime.executeRaw("INSERT INTO hosts (id, name, ip, isOnline, lastHeartbeat, agentVersion, agentDistribution, userId) VALUES (10, 'edge-a', '127.0.0.1', 1, ?, ?, 'forwardplus', 1), (20, 'edge-b', '127.0.0.2', 1, ?, ?, 'forwardplus', 1)", [now, versions.AGENT_VERSION, now, versions.AGENT_VERSION]);
       await runtime.executeRaw("INSERT INTO xray_runtime_reports (hostId, capabilitySchemaVersion, supportedOS, supportedArch, supportsArtifactInstall, supportsPortProbe, supportsRealityScan) VALUES (10, 1, 'linux', 'amd64', 1, 1, 1)");
       const sameHostCertificate = await certificateRepository.createXrayTlsCertificate({
         hostId: 10, name: "Edge TLS", certificatePem, privateKeyPem, createdByUserId: 1,

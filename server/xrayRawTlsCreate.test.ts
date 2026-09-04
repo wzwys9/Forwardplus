@@ -76,7 +76,7 @@ test("createV2 is profile-gated, certificate-bound, and secret-safe", () => {
       await runtime.executeRaw("INSERT INTO users (id, username, password, role) VALUES (1, 'admin', 'hash', 'admin')");
       for (const hostId of [10, 20]) {
         await runtime.executeRaw(
-          "INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, userId) VALUES (?, ?, '8.8.8.8', '8.8.8.8', 1, ?, ?, 1)",
+          "INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, agentDistribution, userId) VALUES (?, ?, '8.8.8.8', '8.8.8.8', 1, ?, ?, 'forwardplus', 1)",
           [hostId, 'edge-' + hostId, now, versions.AGENT_VERSION],
         );
         await runtime.executeRaw(

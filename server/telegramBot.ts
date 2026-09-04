@@ -8,7 +8,8 @@ import { addMonthsClamped } from "./repositories/repositoryUtils";
 import { clearMobileTelegramLoginChallenge, hasMobileTelegramLoginChallenge } from "./telegramMobileLogin";
 import { createTelegramWebAppLoginChallenge } from "./telegramWebAppLogin";
 import { formatForwardRuleProtocol } from "../shared/forwardTypes";
-import { isAgentVersionAtLeast } from "./agentRouteUtils";
+import { isAgentUpgradeRequired } from "./agentRouteUtils";
+import { FORWARDPLUS_AGENT_DISTRIBUTION, normalizeAgentDistribution } from "../shared/agentIdentity";
 import { APP_VERSION, AGENT_VERSION } from "../shared/versions";
 import { checkPanelUpdateTask, startPanelUpgradeTask } from "./_core/systemRouter";
 import { forwardxAiClient } from "./ai/client";
@@ -3779,6 +3780,8 @@ function hostSearchValues(host: any) {
     host.tunnelEntryIp,
     host.networkInterface,
     host.agentVersion,
+    host.agentDistribution,
+    host.agentBuildId,
     host.remark,
     host.remarks,
     host.description,
@@ -4270,6 +4273,7 @@ async function aiHostsText(user: any, keyword?: string) {
       host.entryIp ? `入口：${aiCode(host.entryIp)}` : "",
       host.tunnelEntryIp ? `内网入口：${aiCode(host.tunnelEntryIp)}` : "",
       host.agentVersion ? `Agent：${aiCode(host.agentVersion)}` : "",
+      host.agentVersion ? `Agent 来源：${aiCode(normalizeAgentDistribution(host.agentDistribution) || "unknown")}` : "",
       host.lastHeartbeat ? `心跳：${escapeHtml(formatDateTime(host.lastHeartbeat))}` : "",
     ].filter(Boolean).join("\n");
   });
@@ -4748,7 +4752,7 @@ async function handleUpdateAgent(message: TelegramMessage, user: any) {
   const outdated = hosts.filter((host) => {
     const current = String(host?.agentVersion || "").trim();
     if (!current) return true;
-    return !isAgentVersionAtLeast(current, targetVersion);
+    return isAgentUpgradeRequired(current, host?.agentDistribution, targetVersion);
   });
   if (outdated.length === 0) {
     await sendMessage(
@@ -4770,7 +4774,8 @@ async function handleUpdateAgent(message: TelegramMessage, user: any) {
     const hostId = Number(host?.id || 0);
     const hostName = shortText(host?.name || host?.ip || host?.entryIp || `主机${hostId}`, 20);
     const current = String(host?.agentVersion || "").trim() || "未知";
-    return `- #${hostId} ${escapeHtml(hostName)} · v${escapeHtml(current)} -> v${escapeHtml(targetVersion)}`;
+    const distribution = normalizeAgentDistribution(host?.agentDistribution) || "unknown";
+    return `- #${hostId} ${escapeHtml(hostName)} · ${escapeHtml(distribution)}/v${escapeHtml(current)} -> ${FORWARDPLUS_AGENT_DISTRIBUTION}/v${escapeHtml(targetVersion)}`;
   });
   if (outdated.length > UPDATE_AGENT_PREVIEW_LIMIT) {
     preview.push(`- 其余 ${outdated.length - UPDATE_AGENT_PREVIEW_LIMIT} 台主机将一并下发升级`);
@@ -4838,7 +4843,7 @@ async function executePendingUpdateAction(pending: PendingUpdateAction) {
       continue;
     }
     const currentVersion = String((host as any)?.agentVersion || "").trim();
-    if (currentVersion && isAgentVersionAtLeast(currentVersion, targetVersion)) {
+    if (!isAgentUpgradeRequired(currentVersion, (host as any)?.agentDistribution, targetVersion)) {
       skippedLatest += 1;
       continue;
     }
@@ -5488,4 +5493,3 @@ export function resetTelegramBotPolling() {
   updateOffset = 0;
   activeTokenKey = "";
 }
-

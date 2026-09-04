@@ -7,7 +7,7 @@ import {
   type XrayQuickConfigForwardEngineCatalogItem,
   type XrayQuickConfigForwardEngineDisabledReasonCode,
 } from "../shared/xrayQuickConfigForwardEngines";
-import { isAgentVersionAtLeast } from "./agentRouteUtils";
+import { isForwardplusAgentVersionAtLeast } from "./agentRouteUtils";
 import { inList, quoteIdentifier } from "./dbCompat";
 import { queryRaw } from "./dbRuntime";
 import { getForwardProtocolSettings } from "./forwardProtocolSettings";
@@ -82,12 +82,15 @@ export async function listXrayQuickConfigForwardEngines(input: {
     listXrayQuickConfigEntryHosts(),
     getForwardProtocolSettings(),
     queryRaw<Row>(
-      `SELECT ${q("id")}, ${q("agentVersion")} FROM ${q("hosts")} WHERE ${q("id")} IN ${ids.sql}`,
+      `SELECT ${q("id")}, ${q("agentVersion")}, ${q("agentDistribution")} FROM ${q("hosts")} WHERE ${q("id")} IN ${ids.sql}`,
       ids.params,
     ),
   ]);
   const entryHosts = new Map(entryHostCatalog.items.map((host) => [host.hostId, host]));
-  const agentVersions = new Map(versionRows.map((row) => [Number(row.id), String(row.agentVersion ?? "")]));
+  const agentIdentities = new Map(versionRows.map((row) => [Number(row.id), {
+    version: String(row.agentVersion ?? ""),
+    distribution: String(row.agentDistribution ?? ""),
+  }]));
 
   const sharedHostReasons: XrayQuickConfigForwardEngineDisabledReasonCode[] = [];
   for (const selection of selections) {
@@ -100,8 +103,10 @@ export async function listXrayQuickConfigForwardEngines(input: {
       && host.endpoints.length > 0)) {
       sharedHostReasons.push(host.disabledReasonCode);
     }
-    if (!isAgentVersionAtLeast(
-      agentVersions.get(selection.hostId),
+    const identity = agentIdentities.get(selection.hostId);
+    if (!isForwardplusAgentVersionAtLeast(
+      identity?.version,
+      identity?.distribution,
       XRAY_QUICK_CONFIG_FORWARD_ENGINE_MIN_AGENT_VERSION,
     )) {
       sharedHostReasons.push("AGENT_CAPABILITY_MISSING");

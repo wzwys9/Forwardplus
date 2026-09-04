@@ -72,10 +72,17 @@ export function pushAgentRefresh(hostId: number, reason: string, options: AgentR
   });
 }
 
-export function pushAgentUpgrade(hostId: number, targetVersion: string | null, panelUrl: string, releaseVersion?: string | null) {
+export function pushAgentUpgrade(
+  hostId: number,
+  targetVersion: string | null,
+  panelUrl: string,
+  releaseVersion?: string | null,
+  targetDistribution = "forwardplus",
+) {
   invalidateAgentStableHeartbeatPlan(hostId);
   return sendAgentEvent(hostId, "agent-upgrade", {
     targetVersion: targetVersion || AGENT_VERSION,
+    targetDistribution,
     panelUrl,
     releaseVersion: releaseVersion || null,
   });

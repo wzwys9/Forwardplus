@@ -1,3 +1,5 @@
+import { doesAgentNeedUpgrade, normalizeAgentDistribution } from "@shared/agentIdentity";
+
 const AGENT_UPGRADE_TIMEOUT_MS = 10 * 60 * 1000;
 const HOST_METRICS_CACHE_PREFIX = "forwardx.hosts.metrics.";
 
@@ -74,6 +76,22 @@ export function compareVersions(a: string | null | undefined, b: string | null |
 export function isAgentVersionBehind(version: string | null | undefined, target: string | null | undefined) {
   if (!version || !target) return false;
   return compareVersions(version, target) < 0;
+}
+
+export function isAgentUpgradeNeeded(host: any, targetVersion: string | null | undefined) {
+  if (!host?.agentVersion || !targetVersion) return false;
+  return doesAgentNeedUpgrade({
+    version: host.agentVersion,
+    distribution: host.agentDistribution,
+    targetVersion,
+  });
+}
+
+export function agentDistributionLabel(distribution: unknown) {
+  const normalized = normalizeAgentDistribution(distribution);
+  if (normalized === "forwardplus") return "Forwardplus";
+  if (normalized === "forwardx") return "ForwardX";
+  return "来源未确认";
 }
 
 export function isAgentUpgradeTimedOut(host: any) {

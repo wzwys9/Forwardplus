@@ -37,8 +37,9 @@ import {
   formatUptime,
   HostRegionBadge,
   hostPrimaryAddressText,
+  agentDistributionLabel,
+  isAgentUpgradeNeeded,
   isAgentUpgradeTimedOut,
-  isAgentVersionBehind,
   metricUsageProgressClass,
   readCachedHostMetrics,
   writeCachedHostMetrics,
@@ -388,7 +389,7 @@ export default function HostCard({
     : remainingTimeLabel === "不足1天"
       ? "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400"
       : "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400";
-  const agentNeedsUpdate = isAgentVersionBehind(host.agentVersion, latestAgentVersion);
+  const agentNeedsUpdate = isAgentUpgradeNeeded(host, latestAgentVersion);
   const agentUpgradeTimedOut = isAgentUpgradeTimedOut(host);
   const isOnline = !!host.isOnline;
   const trafficUsageProgressClass = trafficLimit > 0
@@ -528,6 +529,11 @@ export default function HostCard({
                 >
                   {host.agentVersion ? `v${host.agentVersion}` : "未上报"}
                 </span>
+                {host.agentVersion && (
+                  <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[10px] text-muted-foreground">
+                    {agentDistributionLabel(host.agentDistribution)}
+                  </Badge>
+                )}
                 {agentNeedsUpdate && (
                   <Badge variant="outline" className="shrink-0 border-amber-500/30 px-1.5 py-0 text-[10px] text-amber-500">
                     新版
@@ -560,6 +566,11 @@ export default function HostCard({
                 >
                   {host.agentVersion ? `v${host.agentVersion}` : "未上报"}
                 </span>
+                {host.agentVersion && (
+                  <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[10px] text-muted-foreground">
+                    {agentDistributionLabel(host.agentDistribution)}
+                  </Badge>
+                )}
                 {agentNeedsUpdate && (
                   <Badge variant="outline" className="shrink-0 border-amber-500/30 px-1.5 py-0 text-[10px] text-amber-500">
                     新版

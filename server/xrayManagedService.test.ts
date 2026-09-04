@@ -75,7 +75,7 @@ test("managed MTProto and AmneziaWG create, secrets, share, generation, and clea
       const now = Math.floor(Date.now() / 1000);
       await runtime.executeRaw("INSERT INTO users (id, username, password, role) VALUES (1, 'admin', 'hash', 'admin')");
       await runtime.executeRaw(
-        "INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, userId) VALUES (10, 'edge', '8.8.8.8', '8.8.8.8', 1, ?, '2.10.0', 1)",
+        "INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, agentDistribution, userId) VALUES (10, 'edge', '8.8.8.8', '8.8.8.8', 1, ?, '2.10.0', 'forwardplus', 1)",
         [now],
       );
       await runtime.executeRaw(
@@ -112,6 +112,17 @@ test("managed MTProto and AmneziaWG create, secrets, share, generation, and clea
         authSession: null,
         authFailureReason: null,
       });
+      await runtime.executeRaw("UPDATE hosts SET agentDistribution = NULL WHERE id = 10");
+      const [unknownSourceHost] = await services.listXrayManagedServiceHostOptions();
+      assert.equal(unknownSourceHost.canCreateMtproto, false);
+      assert.equal(unknownSourceHost.canCreateAmneziawg, false);
+      const unknownSourceReservation = await reservePort(24442, "TCP");
+      await expectCode(caller.managedServices.createMtproto({
+        hostId: 10, name: "Rejected edge", publicAddress: "MT.EXAMPLE.COM", listenPort: 24442,
+        portReservationId: unknownSourceReservation.reservationId, fakeTlsDomain: "EXAMPLE.COM",
+        initialAccounts: [{ name: "primary" }],
+      }), "PRECONDITION_FAILED");
+      await runtime.executeRaw("UPDATE hosts SET agentDistribution = 'forwardplus' WHERE id = 10");
       const reservation = await reservePort(24443, "TCP");
       const createInput = {
         hostId: 10,

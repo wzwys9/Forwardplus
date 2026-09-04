@@ -8,7 +8,8 @@ import { markHostMetricsWatching, pushAgentRefresh, pushAgentUpgrade } from "../
 import { AGENT_ASSET_NAMES, getMissingBundledAgentAssets } from "../agentAssets";
 import { pushTunnelEndpointRefresh, requireHostAccess } from "./helpers";
 import { AGENT_VERSION, APP_VERSION, REPO_URL } from "../_core/systemRouter";
-import { isAgentUpgradeTargetSatisfied, isAgentVersionAtLeast } from "../agentRouteUtils";
+import { isAgentUpgradeRequired, isAgentUpgradeTargetSatisfied, isAgentVersionAtLeast } from "../agentRouteUtils";
+import { FORWARDPLUS_AGENT_DISTRIBUTION } from "../../shared/agentIdentity";
 import { scheduleHostGeoRefresh } from "../hostGeo";
 import { refreshHostAddressRuntime } from "../hostAddressRuntime";
 import { scheduleHostDdnsUpdate } from "../hostDdns";
@@ -351,12 +352,20 @@ async function clearCompletedHostAgentUpgradeRequests<T extends any[]>(hostRows:
   const completedIds: number[] = [];
   const cleanedRows = hostRows.map((host: any) => {
     const targetVersion = host.agentUpgradeTargetVersion || AGENT_VERSION;
-    if (host.agentUpgradeRequested && host.agentVersion && isAgentUpgradeTargetSatisfied(host.agentVersion, targetVersion, AGENT_VERSION)) {
+    const targetDistribution = host.agentUpgradeTargetDistribution || FORWARDPLUS_AGENT_DISTRIBUTION;
+    if (host.agentUpgradeRequested && isAgentUpgradeTargetSatisfied(
+      host.agentVersion,
+      targetVersion,
+      AGENT_VERSION,
+      host.agentDistribution,
+      targetDistribution,
+    )) {
       completedIds.push(Number(host.id));
       return {
         ...host,
         agentUpgradeRequested: false,
         agentUpgradeTargetVersion: null,
+        agentUpgradeTargetDistribution: null,
         agentUpgradeReleaseVersion: null,
       };
     }
@@ -422,6 +431,8 @@ function hostMatchesListSearch(host: any, search: string) {
     host?.osInfo,
     host?.cpuInfo,
     host?.agentVersion,
+    host?.agentDistribution,
+    host?.agentBuildId,
     host?.hostType,
   ].map((value) => String(value || "").toLowerCase()).join(" ");
   return tokens.every((token) => text.includes(token));
@@ -465,8 +476,11 @@ function compactHostStatus(host: any) {
     isOnline: !!host?.isOnline,
     lastHeartbeat: host?.lastHeartbeat || null,
     agentVersion: host?.agentVersion || null,
+    agentDistribution: host?.agentDistribution || null,
+    agentBuildId: host?.agentBuildId || null,
     agentUpgradeRequested: !!host?.agentUpgradeRequested,
     agentUpgradeTargetVersion: host?.agentUpgradeTargetVersion || null,
+    agentUpgradeTargetDistribution: host?.agentUpgradeTargetDistribution || null,
     agentUpgradeRequestedAt: host?.agentUpgradeRequestedAt || null,
     updatedAt: host?.updatedAt || null,
   };
@@ -755,7 +769,7 @@ export const hostsRouter = router({
         let onlineOutdatedItems = 0;
         let offlineUpgradeableItems = 0;
         for (const row of pageData.versionCounts as any[]) {
-          if (!row?.agentVersion || isAgentVersionAtLeast(row.agentVersion, AGENT_VERSION)) continue;
+          if (!row?.agentVersion || !isAgentUpgradeRequired(row.agentVersion, row.agentDistribution, AGENT_VERSION)) continue;
           const count = Math.max(0, Number(row.count || 0));
           outdatedItems += count;
           if (row.online) onlineOutdatedItems += count;
@@ -785,7 +799,7 @@ export const hostsRouter = router({
         scheduleStaleHostUpgradeCleanup();
         const hosts = await db.getHostUpgradeCandidates(input) as any[];
         const outdated = hosts.filter((host: any) => (
-          !!host.agentVersion && !isAgentVersionAtLeast(host.agentVersion, AGENT_VERSION)
+          !!host.agentVersion && isAgentUpgradeRequired(host.agentVersion, host.agentDistribution, AGENT_VERSION)
         ));
         const candidates = outdated.filter((host: any) => {
           if (!host.isOnline) return false;
@@ -828,6 +842,8 @@ export const hostsRouter = router({
           isOnline: !!host.isOnline,
           osInfo: host.osInfo || null,
           agentVersion: host.agentVersion || null,
+          agentDistribution: host.agentDistribution || null,
+          agentBuildId: host.agentBuildId || null,
           geoCountryCode: host.geoCountryCode || null,
           geoCountryName: host.geoCountryName || null,
           geoRegion: host.geoRegion || null,
@@ -1374,10 +1390,10 @@ export const hostsRouter = router({
         }
         const targetVersion = normalizeVersion(input.targetVersion || AGENT_VERSION);
         const currentVersion = normalizeVersion((host as any).agentVersion);
-        if (currentVersion && isAgentVersionAtLeast(currentVersion, targetVersion)) {
+        if (!isAgentUpgradeRequired(currentVersion, (host as any).agentDistribution, targetVersion)) {
           return { success: true, pushed: false, alreadyLatest: true };
         }
-        appendPanelLog("info", `[AgentUpgrade] request host=${host.id} name=${host.name} current=${currentVersion || "-"} target=${targetVersion}`);
+        appendPanelLog("info", `[AgentUpgrade] request host=${host.id} name=${host.name} current=${currentVersion || "-"} distribution=${(host as any).agentDistribution || "unknown"} target=${targetVersion}/${FORWARDPLUS_AGENT_DISTRIBUTION}`);
         await assertAgentReleaseAssetsReady(targetVersion);
         await db.requestHostAgentUpgrade(input.hostId, targetVersion);
         const configuredPanelUrl = (await db.getSetting("panelPublicUrl")) || "";
@@ -1416,7 +1432,7 @@ export const hostsRouter = router({
         }
         const upgradeHosts = onlineHosts.filter((host) => {
           const currentVersion = normalizeVersion((host as any).agentVersion);
-          if (currentVersion && isAgentVersionAtLeast(currentVersion, targetVersion)) {
+          if (!isAgentUpgradeRequired(currentVersion, (host as any).agentDistribution, targetVersion)) {
             skippedLatest += 1;
             return false;
           }

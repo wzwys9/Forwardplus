@@ -29,7 +29,7 @@ test("Xray runtime operations enforce version, host, task, and observed-state bo
       await schema.ensureDatabaseSchema();
       await db.executeRaw("INSERT INTO users (id, username, password, role) VALUES (1, 'admin', 'hash', 'admin'), (2, 'member', 'hash', 'user')");
       for (const [id, name, online] of [[1, "sync-host", 1], [2, "upgrade-host", 1], [3, "newer-host", 1], [4, "offline-host", 0], [5, "install-host", 1], [6, "restart-host", 1], [7, "rollback-host", 1]]) {
-        await db.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, userId) VALUES (?, ?, '8.8.8.8', '8.8.8.8', ?, ?, '2.3.278', 1)", [id, name, online, now]);
+        await db.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, agentDistribution, userId) VALUES (?, ?, '8.8.8.8', '8.8.8.8', ?, ?, '2.3.278', 'forwardplus', 1)", [id, name, online, now]);
         await db.executeRaw("INSERT INTO xray_runtime_reports (hostId, capabilitySchemaVersion, supportedOS, supportedArch, supportsArtifactInstall, supportsPortProbe, supportsRealityScan, isInstalled, installedVersion, runningVersion, serviceStatus, appliedGeneration, reportedAt) VALUES (?, 1, 'linux', 'amd64', 1, 1, 1, ?, ?, ?, ?, ?, ?)", [
           id,
           id === 5 ? 0 : 1,

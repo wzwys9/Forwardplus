@@ -11,6 +11,7 @@ import path from "path";
 import { clearPanelLogs, formatPanelLogsForExport, getPanelLogPage } from "./panelLogger";
 import { approveMigrationRequest, createMigrationCode, getCurrentMigrationCode, rejectMigrationRequest } from "../migrationCodes";
 import { PANEL_MIGRATION_SCOPES } from "../../shared/panelMigration";
+import { isForwardplusAgent } from "../../shared/agentIdentity";
 import {
   decryptPanelBackup,
   encryptMigrationSnapshot,
@@ -2900,7 +2901,7 @@ export const systemRouter = router({
         const hostId = Number(host?.id);
         if (!Number.isInteger(hostId) || hostId <= 0) continue;
         const currentAgentVersion = normalizeVersion(host.agentVersion);
-        if (currentAgentVersion && currentAgentVersion === target.agentVersion) {
+        if (currentAgentVersion === target.agentVersion && isForwardplusAgent(host.agentDistribution)) {
           skippedSame += 1;
           continue;
         }

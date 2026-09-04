@@ -13,7 +13,7 @@ import {
 import { parseStoredXrayAccessSettings } from "../shared/xrayAccess";
 import { resolveStoredXrayInboundDefinition } from "../shared/xrayProfiles";
 import { AGENT_VERSION } from "../shared/versions";
-import { isAgentVersionAtLeast } from "./agentRouteUtils";
+import { isForwardplusAgentVersionAtLeast } from "./agentRouteUtils";
 import { pushAgentRefresh } from "./agentEvents";
 import { boolLiteral, quoteIdentifier } from "./dbCompat";
 import { queryRaw } from "./dbRuntime";
@@ -210,7 +210,7 @@ async function requireWritableHost(hostId: number, profileId: SupportedGenericAc
   if (!host) throw new XrayAccessServiceError("HOST_NOT_FOUND");
   if (!host.isOnline) throw new XrayAccessServiceError("HOST_OFFLINE");
   const runtime = await getXrayRuntimeReport(hostId);
-  if (!isAgentVersionAtLeast(host.agentVersion, AGENT_VERSION) || !runtime || runtime.capabilitySchemaVersion !== 1
+  if (!isForwardplusAgentVersionAtLeast(host.agentVersion, host.agentDistribution, AGENT_VERSION) || !runtime || runtime.capabilitySchemaVersion !== 1
     || runtime.supportedOS !== "linux" || (runtime.supportedArch !== "amd64" && runtime.supportedArch !== "arm64")
     || !runtime.supportsArtifactInstall || !runtime.supportsPortProbe || !runtime.supportsRealityScan) {
     throw new XrayAccessServiceError("AGENT_CAPABILITY_MISSING");

@@ -1,5 +1,11 @@
 import crypto from "crypto";
 import { isSelfTestMeta, type SelfTestMeta } from "../shared/agentDtos";
+import {
+  FORWARDPLUS_AGENT_DISTRIBUTION,
+  doesAgentNeedUpgrade,
+  isAgentUpgradeSatisfied,
+  isForwardplusAgent,
+} from "../shared/agentIdentity";
 import { linkProbeMethodForRule, normalizeLinkProbeMethod } from "../shared/latencyProbe";
 
 export const AGENT_PLUGIN_TASK_VERSION = "2.2.151";
@@ -29,15 +35,32 @@ export function isAgentUpgradeTargetSatisfied(
   version: string | null | undefined,
   target: string | null | undefined,
   currentSupportedVersion?: string | null,
+  distribution?: string | null,
+  targetDistribution = FORWARDPLUS_AGENT_DISTRIBUTION,
 ) {
-  if (!version || !target) return false;
-  const normalizedVersion = normalizeVersion(version);
-  const normalizedTarget = normalizeVersion(target);
-  if (!normalizedVersion || !normalizedTarget) return false;
-  if (currentSupportedVersion && compareVersions(normalizedTarget, currentSupportedVersion) < 0) {
-    return normalizedVersion === normalizedTarget;
-  }
-  return compareVersions(normalizedVersion, normalizedTarget) >= 0;
+  return isAgentUpgradeSatisfied({
+    version,
+    distribution,
+    targetVersion: target,
+    targetDistribution,
+    currentSupportedVersion,
+  });
+}
+
+export function isAgentUpgradeRequired(
+  version: string | null | undefined,
+  distribution: string | null | undefined,
+  target: string | null | undefined,
+) {
+  return doesAgentNeedUpgrade({ version, distribution, targetVersion: target });
+}
+
+export function isForwardplusAgentVersionAtLeast(
+  version: string | null | undefined,
+  distribution: string | null | undefined,
+  target: string | null | undefined,
+) {
+  return isForwardplusAgent(distribution) && isAgentVersionAtLeast(version, target);
 }
 
 export function isAgentVersionBehind(version: string | null | undefined, target: string | null | undefined) {

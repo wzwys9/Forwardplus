@@ -13,15 +13,15 @@ import HostProbeServiceManager, { type HostProbeServiceViewMode } from "@/compon
 import HostProbeServiceLatencyDialog from "@/components/hosts/HostProbeServiceLatencyDialog";
 import {
   agentDetectedIpText,
-  compareVersions,
+  agentDistributionLabel,
   formatBytes,
   formatUptime,
   hostAddressText,
   hostPrimaryAddressText,
   HostRegionBadge,
   hostRegionText,
+  isAgentUpgradeNeeded,
   isAgentUpgradeTimedOut,
-  isAgentVersionBehind,
   metricUsageProgressClass,
 } from "@/components/hosts/hostDisplay";
 import { PersistentPagination, usePersistentPageRequest, useServerPagination } from "@/components/PersistentPagination";
@@ -2199,7 +2199,7 @@ function HostsContent() {
   };
   const isAgentLatest = (host: any) => {
     if (!latestAgentVersion || !host?.agentVersion) return false;
-    return compareVersions(host.agentVersion, latestAgentVersion) >= 0;
+    return !isAgentUpgradeNeeded(host, latestAgentVersion);
   };
   const requestAgentUpgrade = (host: any) => {
     if (!host?.isOnline) {
@@ -2255,7 +2255,7 @@ function HostsContent() {
       const latestHosts = await utils.hosts.list.fetch();
       const latestSettings = await utils.system.getSettings.fetch();
       const agentVersion = latestSettings?.agentVersion || "";
-      const count = latestHosts.filter((host: any) => isAgentVersionBehind(host.agentVersion, agentVersion)).length;
+      const count = latestHosts.filter((host: any) => isAgentUpgradeNeeded(host, agentVersion)).length;
       toast.success(count > 0 ? `发现 ${count} 台 Agent 有新版本` : "Agent 版本检查完成，暂无新版本");
     } catch (err: any) {
       toast.error(err?.message || "检查 Agent 更新失败");
@@ -2690,7 +2690,7 @@ function HostsContent() {
                       const traffic = hostTrafficById.get(host.id);
                       const latestMetric = hostLatestMetricById.get(host.id);
                       const agentUpgradeTimedOut = isAgentUpgradeTimedOut(host);
-                      const agentNeedsUpdate = isAgentVersionBehind(host.agentVersion, latestAgentVersion);
+                      const agentNeedsUpdate = isAgentUpgradeNeeded(host, latestAgentVersion);
                       const remainingDays = formatHostRemainingDays(host.purchasedAt, host.stoppedAt);
                       const primaryAddressText = hostPrimaryAddressText(host);
                       const uptimeText = latestMetric?.uptime == null ? "--" : formatUptime(latestMetric.uptime);
@@ -2739,6 +2739,11 @@ function HostsContent() {
                                   <span className="shrink-0 rounded border border-border/50 bg-muted/35 px-1.5 py-0.5 font-mono text-[10px] leading-none text-muted-foreground">
                                     v{host.agentVersion}
                                   </span>
+                                )}
+                                {host.agentVersion && (
+                                  <Badge variant="outline" className="h-4 shrink-0 px-1 py-0 text-[9px] leading-none text-muted-foreground">
+                                    {agentDistributionLabel(host.agentDistribution)}
+                                  </Badge>
                                 )}
                                 {agentNeedsUpdate && (
                                   <Badge variant="outline" className="h-4 shrink-0 border-amber-500/30 px-1 py-0 text-[9px] leading-none text-amber-500">
@@ -3051,8 +3056,12 @@ function HostsContent() {
                 <span className="font-mono">{upgradeHost.agentVersion ? `v${upgradeHost.agentVersion}` : "未上报"}</span>
               </div>
               <div className="flex items-center justify-between gap-3">
-                <span className="text-muted-foreground">目标版本</span>
-                <span className="font-mono">v{latestAgentVersion || "-"}</span>
+                <span className="text-muted-foreground">当前来源</span>
+                <span>{agentDistributionLabel(upgradeHost.agentDistribution)}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">目标 Agent</span>
+                <span><span className="font-mono">v{latestAgentVersion || "-"}</span> · Forwardplus</span>
               </div>
             </div>
           )}

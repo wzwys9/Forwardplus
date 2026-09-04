@@ -10,6 +10,7 @@ import {
   type XrayManagedServicesDesiredState,
   type XrayManagedServicesObservedState,
 } from "../shared/xrayTypes";
+import { isForwardplusAgent } from "../shared/agentIdentity";
 import { boolLiteral, quoteIdentifier } from "./dbCompat";
 import {
   executeRaw,
@@ -306,7 +307,7 @@ function supportsKind(capability: XrayManagedServicesCapability | null, kind: Ma
 async function hostRow(hostId: number): Promise<Row> {
   const q = quoteIdentifier;
   const row = (await queryRaw<Row>(
-    `SELECT ${["id", "name", "ip", "ipv4", "isOnline", "lastHeartbeat"].map(q).join(", ")}
+    `SELECT ${["id", "name", "ip", "ipv4", "isOnline", "lastHeartbeat", "agentDistribution"].map(q).join(", ")}
        FROM ${q("hosts")} WHERE ${q("id")} = ? LIMIT 1`, [hostId],
   ))[0];
   if (!row) throw new XrayManagedServiceError("HOST_NOT_FOUND");
@@ -321,6 +322,9 @@ function hostIsOnline(row: Row): boolean {
 async function requireOnlineCapability(hostId: number, kind: ManagedKind = MTPROTO_MANAGED_SERVICE_KIND) {
   const host = await hostRow(hostId);
   if (!hostIsOnline(host)) throw new XrayManagedServiceError("HOST_OFFLINE");
+  if (!isForwardplusAgent(host.agentDistribution)) {
+    throw new XrayManagedServiceError("MANAGED_SERVICE_CAPABILITY_MISSING");
+  }
   const capability = parsedCapability(await runtimeReport(hostId));
   if (!capability || !supportsKind(capability, kind)) {
     throw new XrayManagedServiceError("MANAGED_SERVICE_CAPABILITY_MISSING");
@@ -624,7 +628,9 @@ async function safeProjection(row: Row) {
     appliedConfigHash: observed?.appliedConfigHash ?? null,
     observed: serviceObserved,
     isHostOnline: hostIsOnline(row),
-    capabilityAvailable: supportsKind(capability, kind) && (kind === AMNEZIAWG_MANAGED_SERVICE_KIND || artifactAvailable),
+    capabilityAvailable: isForwardplusAgent(row.agentDistribution)
+      && supportsKind(capability, kind)
+      && (kind === AMNEZIAWG_MANAGED_SERVICE_KIND || artifactAvailable),
     artifactAvailable,
     accounts: accounts.filter((account) => !databaseBoolean(account.pendingDelete)).map((account) => ({
       id: Number(account.id), name: String(account.name), accountTag: String(account.accountTag),
@@ -652,7 +658,7 @@ async function safeProjection(row: Row) {
 async function serviceWithHost(serviceId: number) {
   const q = quoteIdentifier;
   const row = (await queryRaw<Row>(
-    `SELECT s.*, h.${q("name")} AS ${q("hostName")}, h.${q("isOnline")}, h.${q("lastHeartbeat")}
+    `SELECT s.*, h.${q("name")} AS ${q("hostName")}, h.${q("isOnline")}, h.${q("lastHeartbeat")}, h.${q("agentDistribution")}
        FROM ${q("xray_managed_services")} s JOIN ${q("hosts")} h ON h.${q("id")} = s.${q("hostId")}
       WHERE s.${q("id")} = ? LIMIT 1`, [serviceId],
   ))[0];
@@ -671,21 +677,22 @@ export function getXrayManagedServiceCatalog() {
 export async function listXrayManagedServiceHostOptions() {
   const q = quoteIdentifier;
   const hosts = await queryRaw<Row>(
-    `SELECT ${["id", "name", "ip", "ipv4", "isOnline", "lastHeartbeat"].map(q).join(", ")} FROM ${q("hosts")} ORDER BY ${q("name")} ASC`,
+    `SELECT ${["id", "name", "ip", "ipv4", "isOnline", "lastHeartbeat", "agentDistribution"].map(q).join(", ")} FROM ${q("hosts")} ORDER BY ${q("name")} ASC`,
   );
   return Promise.all(hosts.map(async (host) => {
     const report = await runtimeReport(Number(host.id));
     const capability = parsedCapability(report);
     const artifact = capability ? await findVerifiedMtprotoArtifact(capability.supportedOS, capability.supportedArch).catch(() => null) : null;
     const online = hostIsOnline(host);
-    const supported = supportsMtprotoCapability(capability);
+    const isForwardplus = isForwardplusAgent(host.agentDistribution);
+    const supported = isForwardplus && supportsMtprotoCapability(capability);
     return {
       id: Number(host.id), name: String(host.name), isOnline: online, lastHeartbeat: dateValue(host.lastHeartbeat),
       publicAddress: String(host.ipv4 || host.ip || ""), os: capability?.supportedOS ?? null, arch: capability?.supportedArch ?? null,
       canCreateMtproto: online && supported && !!artifact,
-      canCreateAmneziawg: online && supportsAmneziaWgCapability(capability),
+      canCreateAmneziawg: online && isForwardplus && supportsAmneziaWgCapability(capability),
       amneziawgUnavailableReasonCode: !online ? "HOST_OFFLINE" as const
-        : !supportsAmneziaWgCapability(capability) ? "MANAGED_SERVICE_CAPABILITY_MISSING" as const : null,
+        : !isForwardplus || !supportsAmneziaWgCapability(capability) ? "MANAGED_SERVICE_CAPABILITY_MISSING" as const : null,
       unavailableReasonCode: !online ? "HOST_OFFLINE" as const
         : !supported ? "MANAGED_SERVICE_CAPABILITY_MISSING" as const
           : !artifact ? "MANAGED_SERVICE_ARTIFACT_UNAVAILABLE" as const : null,

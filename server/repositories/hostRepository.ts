@@ -190,6 +190,8 @@ function hostListCondition(input: Omit<HostListQuery, keyof PageRequest>) {
       hosts.osInfo,
       hosts.cpuInfo,
       hosts.agentVersion,
+      hosts.agentDistribution,
+      hosts.agentBuildId,
       hosts.hostType,
     ].map((column) => sql`LOWER(COALESCE(${column}, '')) LIKE ${pattern} ESCAPE '!'`);
     const numericId = /^\d+$/.test(token) ? Number(token) : 0;
@@ -291,20 +293,21 @@ export async function getHostsPage(input: HostListQuery) {
   const versionQuery = db
     .select({
       agentVersion: hosts.agentVersion,
+      agentDistribution: hosts.agentDistribution,
       count: sql<number>`COUNT(*)`,
       onlineCount: sql<number>`COALESCE(SUM(${onlineExpression}), 0)`,
     })
     .from(hosts);
   const versionRows = condition
-    ? await versionQuery.where(condition).groupBy(hosts.agentVersion)
-    : await versionQuery.groupBy(hosts.agentVersion);
+    ? await versionQuery.where(condition).groupBy(hosts.agentVersion, hosts.agentDistribution)
+    : await versionQuery.groupBy(hosts.agentVersion, hosts.agentDistribution);
   const versionCounts = versionRows.flatMap((row: any) => {
     const count = Math.max(0, Number(row.count || 0));
     const onlineCount = Math.min(count, Math.max(0, Number(row.onlineCount || 0)));
     const offlineCount = count - onlineCount;
     return [
-      ...(onlineCount > 0 ? [{ agentVersion: row.agentVersion || null, online: true, count: onlineCount }] : []),
-      ...(offlineCount > 0 ? [{ agentVersion: row.agentVersion || null, online: false, count: offlineCount }] : []),
+      ...(onlineCount > 0 ? [{ agentVersion: row.agentVersion || null, agentDistribution: row.agentDistribution || null, online: true, count: onlineCount }] : []),
+      ...(offlineCount > 0 ? [{ agentVersion: row.agentVersion || null, agentDistribution: row.agentDistribution || null, online: false, count: offlineCount }] : []),
     ];
   });
   return {
@@ -357,8 +360,11 @@ export async function getHostStatusRows(input: Omit<HostListQuery, keyof PageReq
       isOnline: hosts.isOnline,
       lastHeartbeat: hosts.lastHeartbeat,
       agentVersion: hosts.agentVersion,
+      agentDistribution: hosts.agentDistribution,
+      agentBuildId: hosts.agentBuildId,
       agentUpgradeRequested: hosts.agentUpgradeRequested,
       agentUpgradeTargetVersion: hosts.agentUpgradeTargetVersion,
+      agentUpgradeTargetDistribution: hosts.agentUpgradeTargetDistribution,
       agentUpgradeRequestedAt: hosts.agentUpgradeRequestedAt,
       updatedAt: hosts.updatedAt,
     })
@@ -377,8 +383,11 @@ export async function getHostUpgradeCandidates(input: Omit<HostListQuery, keyof 
       isOnline: hosts.isOnline,
       lastHeartbeat: hosts.lastHeartbeat,
       agentVersion: hosts.agentVersion,
+      agentDistribution: hosts.agentDistribution,
+      agentBuildId: hosts.agentBuildId,
       agentUpgradeRequested: hosts.agentUpgradeRequested,
       agentUpgradeTargetVersion: hosts.agentUpgradeTargetVersion,
+      agentUpgradeTargetDistribution: hosts.agentUpgradeTargetDistribution,
       agentUpgradeRequestedAt: hosts.agentUpgradeRequestedAt,
     })
     .from(hosts);
@@ -400,6 +409,8 @@ function compactHostOption(host: any) {
     isOnline: host?.isOnline,
     lastHeartbeat: host?.lastHeartbeat,
     agentVersion: host?.agentVersion,
+    agentDistribution: host?.agentDistribution,
+    agentBuildId: host?.agentBuildId,
     ddnsEnabled: host?.ddnsEnabled,
     ddnsDomain: host?.ddnsDomain,
     portRangeStart: host?.portRangeStart,
@@ -460,6 +471,8 @@ export async function getHostOptions(ownerUserId?: number, allowedHostIds?: numb
         isOnline: hosts.isOnline,
         lastHeartbeat: hosts.lastHeartbeat,
         agentVersion: hosts.agentVersion,
+        agentDistribution: hosts.agentDistribution,
+        agentBuildId: hosts.agentBuildId,
         ddnsEnabled: hosts.ddnsEnabled,
         ddnsDomain: hosts.ddnsDomain,
         portRangeStart: hosts.portRangeStart,
@@ -825,12 +838,14 @@ export async function requestHostAgentUpgrade(
   targetVersion: string | null,
   releaseVersion?: string | null,
   requestedAt?: Date | null,
+  targetDistribution = "forwardplus",
 ) {
   const db = await getDb();
   if (!db) return;
   await db.update(hosts).set({
     agentUpgradeRequested: true,
     agentUpgradeTargetVersion: targetVersion,
+    agentUpgradeTargetDistribution: targetDistribution,
     agentUpgradeReleaseVersion: releaseVersion || null,
     agentUpgradeRequestedAt: requestedAt || nowDate(),
     updatedAt: nowDate(),
@@ -843,6 +858,7 @@ export async function clearHostAgentUpgradeRequest(hostId: number) {
   await db.update(hosts).set({
     agentUpgradeRequested: false,
     agentUpgradeTargetVersion: null,
+    agentUpgradeTargetDistribution: null,
     agentUpgradeReleaseVersion: null,
     updatedAt: nowDate(),
   }).where(eq(hosts.id, hostId));
@@ -857,6 +873,7 @@ export async function clearStaleHostAgentUpgradeRequests(timeoutMs = 10 * 60 * 1
     `UPDATE ${quoteIdentifier("hosts")}
      SET ${quoteIdentifier("agentUpgradeRequested")} = ?,
          ${quoteIdentifier("agentUpgradeTargetVersion")} = NULL,
+         ${quoteIdentifier("agentUpgradeTargetDistribution")} = NULL,
          ${quoteIdentifier("agentUpgradeReleaseVersion")} = NULL,
          ${quoteIdentifier("updatedAt")} = ?
      WHERE ${quoteIdentifier("agentUpgradeRequested")} = ?

@@ -17,6 +17,7 @@ test("Xray inbound external proxy binding is atomic, visible, and fail-closed", 
     const secrets = await load("server/xraySecretCrypto.ts");
     const accessMigration = await load("server/xrayAccessMigration.ts");
     const artifacts = await load("server/xrayArtifacts.ts");
+    const versions = await load("shared/versions.ts");
     const generator = await load("server/xrayConfigGenerator.ts");
     const external = await load("server/xrayExternalProxyService.ts");
     const inboundService = await load("server/xrayInboundService.ts");
@@ -32,7 +33,7 @@ test("Xray inbound external proxy binding is atomic, visible, and fail-closed", 
       await schema.ensureDatabaseSchema();
       const keyring = secrets.createXrayMasterKeyFile({ path: process.env.XRAY_MASTER_KEY_PATH });
       await db.executeRaw("INSERT INTO users (id, username, password, role) VALUES (1, 'admin', 'hash', 'admin'), (2, 'member', 'hash', 'user')");
-      await db.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, userId) VALUES (1, 'edge', '8.8.8.8', '8.8.8.8', 1, ?, '2.2.192', 1)", [now]);
+      await db.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, agentDistribution, userId) VALUES (1, 'edge', '8.8.8.8', '8.8.8.8', 1, ?, ?, 'forwardplus', 1)", [now, versions.AGENT_VERSION]);
       await db.executeRaw("INSERT INTO xray_runtime_reports (hostId, capabilitySchemaVersion, supportedOS, supportedArch, supportsArtifactInstall, supportsPortProbe, supportsRealityScan, isInstalled, installedVersion, runningVersion, serviceStatus, processId, appliedGeneration, binarySha256, listenersJson, reportedAt) VALUES (1, 1, 'linux', 'amd64', 1, 1, 1, 1, ?, ?, 'RUNNING', 4242, 1, ?, '[]', ?)", [artifacts.XRAY_DEFAULT_VERSION, artifacts.XRAY_DEFAULT_VERSION, "b".repeat(64), now]);
 
       const runtimeTag = "forwardx-inbound-external-binding";

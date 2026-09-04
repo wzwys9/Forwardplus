@@ -68,6 +68,20 @@ bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-
 
 Docker 默认拉取 `ghcr.io/wzwys9/forwardplus:latest`。数据库配置和 SQLite 数据保存在数据卷中；升级会保留 `.env`、数据卷和业务数据，卸载只有在用户明确确认后才会清理持久数据。
 
+### 从原版 ForwardX 迁移
+
+原版 ForwardX 已经安装并保留现有数据库时，执行专用迁移动作；脚本会先显示检测到的原面板镜像/版本，再切换到 Forwardplus，并在旧 Agent 后续心跳时自动下发 Forwardplus Agent：
+
+```bash
+# Docker Compose
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-docker.sh" | bash -s -- migrate-forwardx'
+
+# 本地 systemd
+bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 "https://raw.githubusercontent.com/wzwys9/Forwardplus/main/scripts/install-panel-local.sh" | sudo bash -s -- migrate-forwardx'
+```
+
+迁移不伪造版本号：面板和主机页仍显示 Agent 的真实版本，并额外显示发行来源。来源不是 `Forwardplus` 的 Agent 即使版本更高也会被识别为待迁移；完成迁移后，面板、Agent 安装脚本、Release 和容器镜像均只使用 `wzwys9/Forwardplus` 更新源。迁移前仍建议备份数据库和 Xray 主密钥。
+
 ### 本地 systemd
 
 安装：
@@ -161,6 +175,7 @@ Forwardplus 支持 SQLite、MySQL 和 PostgreSQL：
 | `TELEGRAM_BOT_TOKEN` | 空 | Telegram 机器人 Token |
 | `FORWARDX_IMAGE` | `ghcr.io/wzwys9/forwardplus:latest` | Docker 镜像 |
 | `FORWARDPLUS_GITHUB_TOKEN` | 空 | 可选，只读 GitHub Token |
+| `FORWARDPLUS_MIGRATE_AGENTS` | `false` | 仅由 `migrate-forwardx` 写入；让来源不匹配的 Agent 重连后自动迁移 |
 
 更多变量见[环境变量文档](https://wzwys9.github.io/Forwardplus/guide/env-vars.html)。
 

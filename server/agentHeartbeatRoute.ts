@@ -34,6 +34,8 @@ import { hasQueuedPluginAgentTasks, takePluginAgentTasks } from "./pluginAgentTa
 import { getAgentPluginInventory, updateAgentPluginInventory } from "./agentPluginInventory";
 import { getAgentHostFromRequest, getAgentPresenceHostFromRequest, getResolvedAgentToken } from "./agentAuth";
 import { normalizeAgentText, normalizeNetworkInterface } from "./agentInputValidation";
+import { isForwardplusAgent, normalizeAgentBuildId, normalizeAgentDistribution } from "../shared/agentIdentity";
+import { ENV } from "./env";
 import { pruneMapEntries, setBoundedMapValue } from "./boundedCache";
 import { mergeAgentReportedAddress } from "./agentAddressState";
 import {
@@ -1338,24 +1340,65 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
     observePresenceCapableHostActivity(host.id);
     logHostId = Number((host as any).id || 0);
     logHostName = String((host as any).name || "").trim();
+    const reportedAgentDistribution = normalizeAgentDistribution(req.body?.agentDistribution);
+    const reportedAgentBuildId = normalizeAgentBuildId(req.body?.agentBuildId);
+    const reportedAgentVersionForMigration = normalizeAgentText(req.body?.agentVersion, 64)
+      || String((host as any).agentVersion || "");
+    // Every current Forwardplus Agent reports identity on every heartbeat. Do
+    // not inherit a previously stored distribution when an older binary takes
+    // over the same token: a missing/invalid declaration is deliberately
+    // treated as unknown and must fail closed for Forwardplus-only features.
+    const effectiveAgentDistribution = reportedAgentDistribution;
+    const acceptsForwardplusCapabilities = isForwardplusAgent(effectiveAgentDistribution);
+    if (ENV.migrateForwardxAgents
+      && reportedAgentVersionForMigration
+      && !acceptsForwardplusCapabilities
+      && !(host as any).agentUpgradeRequested) {
+      await db.requestHostAgentUpgrade(logHostId, AGENT_VERSION);
+      Object.assign(host as any, {
+        agentUpgradeRequested: true,
+        agentUpgradeTargetVersion: AGENT_VERSION,
+        agentUpgradeTargetDistribution: "forwardplus",
+        agentUpgradeRequestedAt: new Date(),
+      });
+      appendPanelLog(
+        "info",
+        `[AgentMigration] queued host=${logHostId} version=${reportedAgentVersionForMigration} distribution=${effectiveAgentDistribution || "unknown"} target=${AGENT_VERSION}/forwardplus`,
+      );
+    }
     updateAgentPluginInventory(logHostId, req.body?.pluginVersions, req.body?.pluginSyncSignatures);
-    const acceptedXrayTaskResults = [
+    const acceptedXrayTaskResults = acceptsForwardplusCapabilities ? [
       ...await acceptXrayTaskResults(logHostId, req.body?.xrayTaskResults),
       ...await acceptXrayRealityTaskResults(logHostId, req.body?.xrayTaskResults),
       ...await acceptXrayRuntimeTaskResults(logHostId, req.body?.xrayTaskResults),
-    ];
-    const xrayHeartbeatReport = await processXrayHeartbeatReport({
-      hostId: logHostId,
-      xrayCapability: req.body?.xrayCapability,
-      xrayStateSignature: req.body?.xrayStateSignature,
-      xrayState: req.body?.xrayState,
-    });
-    const managedServicesHeartbeatReport = await processXrayManagedServicesHeartbeatReport({
-      hostId: logHostId,
-      managedServicesCapability: req.body?.managedServicesCapability,
-      managedServicesStateSignature: req.body?.managedServicesStateSignature,
-      managedServicesState: req.body?.managedServicesState,
-    });
+    ] : [];
+    const xrayHeartbeatReport = acceptsForwardplusCapabilities
+      ? await processXrayHeartbeatReport({
+        hostId: logHostId,
+        xrayCapability: req.body?.xrayCapability,
+        xrayStateSignature: req.body?.xrayStateSignature,
+        xrayState: req.body?.xrayState,
+      })
+      : {
+        compatible: false,
+        capabilityChanged: false,
+        requestXrayState: false,
+        xrayStateSignature: "",
+        observedState: null,
+      };
+    const managedServicesHeartbeatReport = acceptsForwardplusCapabilities
+      ? await processXrayManagedServicesHeartbeatReport({
+        hostId: logHostId,
+        managedServicesCapability: req.body?.managedServicesCapability,
+        managedServicesStateSignature: req.body?.managedServicesStateSignature,
+        managedServicesState: req.body?.managedServicesState,
+      })
+      : {
+        compatible: false,
+        requestManagedServicesState: false,
+        managedServicesStateSignature: "",
+        observedState: null,
+      };
 
     const compactMetrics = Array.isArray(req.body?.m) ? req.body.m : [];
     const busyHeartbeat = req.body?.busy === true || String(req.body?.busy || "").toLowerCase() === "true";
@@ -1406,6 +1449,9 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
     const nextCpuInfo = normalizeAgentText(cpuInfo, 256);
     const nextAgentVersion = normalizeAgentText(agentVersion, 64);
     const agentVersionChanged = hasAgentVersionChanged((host as any).agentVersion, nextAgentVersion);
+    const agentIdentityChanged = agentVersionChanged
+      || reportedAgentDistribution !== normalizeAgentDistribution((host as any).agentDistribution)
+      || reportedAgentBuildId !== normalizeAgentBuildId((host as any).agentBuildId);
     const agentBootId = normalizeAgentText(req.body?.agentBootId, 128);
     const agentBootedAtSeconds = Number(req.body?.agentBootedAt || 0);
     const agentProcessId = Math.max(0, Math.floor(Number(req.body?.agentProcessId || 0)));
@@ -1531,7 +1577,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
       || upgradedFirewallCounterAgent
       || upgradedProtocolGuardBackendAgent
       || addressChanged
-      || agentVersionChanged
+      || agentIdentityChanged
       || (!!nextCpuInfo && nextCpuInfo !== String(previousHost.cpuInfo || ""))
       || (Number(memoryTotal || 0) > 0 && Number(memoryTotal) !== Number(previousHost.memoryTotal || 0))
       || (!!agentBootId && agentBootId !== normalizeAgentText(previousHost.agentBootId, 128))
@@ -1556,6 +1602,8 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
       ipv4: reportedAddress.ipv4,
       ipv6: reportedAddress.ipv6,
       agentVersion: nextAgentVersion || (host as any).agentVersion || null,
+      agentDistribution: reportedAgentDistribution,
+      agentBuildId: reportedAgentBuildId,
       cpuInfo: nextCpuInfo || (host as any).cpuInfo || null,
       memoryTotal: memoryTotal || (host as any).memoryTotal || null,
       ...(agentBootId ? { agentBootId } : {}),
@@ -1595,7 +1643,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
       } : {}),
     } as any);
     Object.assign(host as any, reportedAddress);
-    if (agentVersionChanged) {
+    if (agentIdentityChanged) {
       invalidateAgentDesiredStateCache(host.id, { preserveLocalRuntimeState: !!localRuntimeState.state });
       appendPanelLog(
         "info",
@@ -1690,8 +1738,9 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
     const pluginInventorySignature = agentPluginInventorySignature(reportedPluginInventoryForFastPath);
     const mimicEnvironmentSignature = stableStateSignature(mimicEnvironment || null);
     const panelMigrationForFastPath = await getPanelMigrationAgentDirective(Number(host.id));
-    const hasPendingXrayTasksForFastPath = (await hasQueuedXrayPortProbeTasks(host.id))
-      || (await hasQueuedXrayRealityScanTasks(host.id));
+    const hasPendingXrayTasksForFastPath = acceptsForwardplusCapabilities && (
+      (await hasQueuedXrayPortProbeTasks(host.id)) || (await hasQueuedXrayRealityScanTasks(host.id))
+    );
     const stablePlan = agentStableHeartbeatPlanCache.match(host.id, {
       forceReconcile,
       hasBlockingWork: !!(host as any).agentUpgradeRequested
@@ -5884,9 +5933,15 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
     }
 
     const requestedTargetVersion = (host as any).agentUpgradeTargetVersion || AGENT_VERSION;
+    const requestedTargetDistribution = (host as any).agentUpgradeTargetDistribution || "forwardplus";
     const agentUpgradeCompleted = (host as any).agentUpgradeRequested
-      && agentVersion
-      && isAgentUpgradeTargetSatisfied(agentVersion, requestedTargetVersion, AGENT_VERSION);
+      && isAgentUpgradeTargetSatisfied(
+        effectiveAgentVersion,
+        requestedTargetVersion,
+        AGENT_VERSION,
+        effectiveAgentDistribution,
+        requestedTargetDistribution,
+      );
     if (agentUpgradeCompleted) {
       await db.clearHostAgentUpgradeRequest(host.id);
     }
@@ -5901,6 +5956,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
     const agentUpgradeDue = agentUpgradeRequestedAt <= 0 || agentUpgradeRequestedAt <= responseIssuedAt;
     const agentUpgrade = (host as any).agentUpgradeRequested && agentUpgradeDue && !agentUpgradeCompleted && !staleMigrationUpgrade ? {
       targetVersion: requestedTargetVersion,
+      targetDistribution: requestedTargetDistribution,
       panelUrl: agentMigrationTargetPanelUrl || panelUrl,
       releaseVersion: (host as any).agentUpgradeReleaseVersion || null,
     } : null;
@@ -6370,17 +6426,17 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
           && reportedPluginInventory.versions.get(task.pluginId) === task.pluginVersion
         ))
       : [];
-    const xrayTasks = [
+    const xrayTasks = acceptsForwardplusCapabilities ? [
       ...await takeXrayRuntimeTasks(host.id, 1),
       ...await takeXrayPortProbeTasks(host.id, 4),
       ...await takeXrayRealityScanTasks(host.id, 1),
-    ];
+    ] : [];
     const hasPendingPluginTasks = supportsPluginTasks && hasQueuedPluginAgentTasks(host.id);
-    const hasPendingXrayTasks = (await hasQueuedXrayPortProbeTasks(host.id))
+    const hasPendingXrayTasks = acceptsForwardplusCapabilities && ((await hasQueuedXrayPortProbeTasks(host.id))
       || (await hasQueuedXrayRealityScanTasks(host.id))
-      || (await hasQueuedXrayRuntimeTasks(host.id));
+      || (await hasQueuedXrayRuntimeTasks(host.id)));
     const deferXrayDesiredForInstall = await shouldDeferXrayDesiredForInstall(host.id);
-    const xrayDesired = xrayHeartbeatReport.compatible && supportsDesiredState && !deferXrayDesiredForInstall
+    const xrayDesired = acceptsForwardplusCapabilities && xrayHeartbeatReport.compatible && supportsDesiredState && !deferXrayDesiredForInstall
       ? await buildXrayHeartbeatDesiredState(host.id)
       : null;
     const xrayDesiredApplied = !xrayHeartbeatReport.requestXrayState
@@ -6389,7 +6445,7 @@ agentRouter.post("/api/agent/heartbeat", async (req: Request, res: Response) => 
     if (sendXrayDesired) await markXrayDesiredDispatched(host.id, xrayDesired.generation);
     let managedServicesDesired: Awaited<ReturnType<typeof buildXrayManagedServicesDesiredState>> = null;
     let managedServicesDesiredBuildFailed = false;
-    if (managedServicesHeartbeatReport.compatible && supportsDesiredState) {
+    if (acceptsForwardplusCapabilities && managedServicesHeartbeatReport.compatible && supportsDesiredState) {
       try {
         managedServicesDesired = await buildXrayManagedServicesDesiredState(host.id);
       } catch {

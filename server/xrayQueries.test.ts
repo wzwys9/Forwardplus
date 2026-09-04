@@ -42,8 +42,9 @@ test("Xray admin read APIs derive availability and runtime state without exposin
         [7, "no-ipv4", "example.invalid", null, 1, now, versions.AGENT_VERSION],
       ];
       for (const row of hostRows) {
-        await runtime.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, userId) VALUES (?, ?, ?, ?, ?, ?, ?, 1)", row);
+        await runtime.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, agentDistribution, userId) VALUES (?, ?, ?, ?, ?, ?, ?, 'forwardplus', 1)", row);
       }
+      await runtime.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, userId) VALUES (8, 'original-high-version', '8.8.8.9', '8.8.8.9', 1, ?, '9.0.0', 1)", [now]);
       for (const hostId of [1, 2, 3, 6, 7]) {
         const arch = hostId === 6 ? "arm64" : "amd64";
         await runtime.executeRaw("INSERT INTO xray_runtime_reports (hostId, capabilitySchemaVersion, supportedOS, supportedArch, supportsArtifactInstall, supportsPortProbe, supportsRealityScan) VALUES (?, 1, 'linux', ?, 1, 1, 1)", [hostId, arch]);
@@ -72,6 +73,7 @@ test("Xray admin read APIs derive availability and runtime state without exposin
         5: "PLATFORM_UNSUPPORTED",
         6: "ARTIFACT_UNAVAILABLE",
         7: "PUBLIC_IPV4_MISSING",
+        8: "AGENT_UPGRADE_REQUIRED",
       });
       assert.equal(options.find((item) => item.id === 1).canCreateXrayInbound, true);
       assert.equal(options.find((item) => item.id === 5).os, "freebsd");

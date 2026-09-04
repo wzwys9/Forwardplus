@@ -13,6 +13,7 @@ GITHUB_TOKEN="${FORWARDPLUS_GITHUB_TOKEN:-${FORWARDX_GITHUB_TOKEN:-}}"
 unset FORWARDPLUS_GITHUB_TOKEN FORWARDX_GITHUB_TOKEN
 ASSETS_PENDING_EXIT_CODE=12
 ENABLE_ADMIN_ACCOUNT="false"
+MIGRATE_FORWARDX_AGENTS="false"
 EXPLICIT_FORWARDX_IMAGE="${FORWARDX_IMAGE:-}"
 DATA_VOLUME_REUSE_NOTIFIED="false"
 RESOLVED_IMAGE=""
@@ -34,7 +35,7 @@ fi
 
 usage() {
   cat <<EOF
-Usage: $0 install|upgrade|uninstall|reset-admin|reset-password [--github-accelerator URL] [--enable-account]
+Usage: $0 install|upgrade|migrate-forwardx|uninstall|reset-admin|reset-password [--github-accelerator URL] [--enable-account]
 
 Options:
   --github-accelerator URL   Prefix GitHub API/raw/release URLs with this HTTP(S) accelerator.
@@ -52,7 +53,7 @@ parse_args() {
   local value=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      install|upgrade|update|uninstall|remove|reset-admin|reset-password)
+      install|upgrade|update|migrate-forwardx|uninstall|remove|reset-admin|reset-password)
         if [ "$action_seen" = "true" ]; then
           echo "[ERROR] Multiple actions were provided: $1" >&2
           usage >&2
@@ -101,6 +102,10 @@ parse_args() {
 }
 
 parse_args "$@"
+
+if [ "$ACTION" = "migrate-forwardx" ]; then
+  MIGRATE_FORWARDX_AGENTS="true"
+fi
 
 if [ "$ENABLE_ADMIN_ACCOUNT" = "true" ] && [ "$ACTION" != "reset-admin" ] && [ "$ACTION" != "reset-password" ]; then
   echo "[ERROR] --enable-account is only valid with reset-admin" >&2
@@ -536,6 +541,10 @@ load_existing_env() {
   if [ -n "$value" ]; then PROJECT_NAME="$value"; fi
   value="$(get_env_value FORWARDX_CONTAINER_NAME || true)"
   if [ -n "$value" ]; then CONTAINER_NAME="$value"; fi
+  value="$(get_env_value FORWARDPLUS_MIGRATE_AGENTS || true)"
+  if [ "$MIGRATE_FORWARDX_AGENTS" != "true" ] && [[ "$value" =~ ^(1|true|yes|on)$ ]]; then
+    MIGRATE_FORWARDX_AGENTS="true"
+  fi
 
   if [ -n "$EXPLICIT_PORT" ] && valid_port "$EXPLICIT_PORT"; then
     PORT="$EXPLICIT_PORT"
@@ -705,6 +714,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-change-me-to-a-random-string}
       XRAY_MASTER_KEY_PATH: ${XRAY_MASTER_KEY_PATH:-/data/xray-master.key}
       FORWARDPLUS_GITHUB_TOKEN: ${FORWARDPLUS_GITHUB_TOKEN:-}
+      FORWARDPLUS_MIGRATE_AGENTS: ${MIGRATE_FORWARDX_AGENTS}
     volumes:
       - forwardx-data:/data
     logging:
@@ -722,7 +732,7 @@ EOF
 
 write_env() {
   local image="$1"
-  local existing_jwt jwt_secret existing_xray_master_key_path xray_master_key_path existing_github_token
+  local existing_jwt jwt_secret existing_xray_master_key_path xray_master_key_path existing_github_token existing_migrate_agents
   if ! valid_port "$PORT"; then
     PORT="9810"
   fi
@@ -739,6 +749,10 @@ write_env() {
   if [ -z "$GITHUB_TOKEN" ] && [ -n "$existing_github_token" ]; then
     GITHUB_TOKEN="$existing_github_token"
   fi
+  existing_migrate_agents="$(get_env_value FORWARDPLUS_MIGRATE_AGENTS || true)"
+  if [ "$MIGRATE_FORWARDX_AGENTS" != "true" ] && [[ "$existing_migrate_agents" =~ ^(1|true|yes|on)$ ]]; then
+    MIGRATE_FORWARDX_AGENTS="true"
+  fi
   umask 077
   cat > "$APP_DIR/.env" <<EOF
 PORT=$PORT
@@ -750,6 +764,7 @@ FORWARDX_CONTAINER_NAME=$CONTAINER_NAME
 FORWARDX_IMAGE=$image
 FORWARDX_GITHUB_ACCELERATOR_URL="$GITHUB_ACCELERATOR_URL"
 FORWARDPLUS_GITHUB_TOKEN=$GITHUB_TOKEN
+FORWARDPLUS_MIGRATE_AGENTS=$MIGRATE_FORWARDX_AGENTS
 EOF
   chmod 600 "$APP_DIR/.env"
 }
@@ -1017,9 +1032,15 @@ install_panel() {
 }
 
 upgrade_panel() {
-  local image
+  local image current_image current_version
   require_root
   load_existing_env
+  if [ "$ACTION" = "migrate-forwardx" ]; then
+    current_image="$(docker inspect --format '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+    current_version="$(running_panel_version 2>/dev/null || true)"
+    echo "[INFO] Detected existing panel: image=${current_image:-unknown} version=${current_version:-unknown}"
+    echo "[INFO] Enabling automatic Agent distribution migration to Forwardplus"
+  fi
   resolve_github_accelerator
   install_docker
   resolve_image_selection
@@ -1103,7 +1124,7 @@ reset_admin_password() {
 
 case "$ACTION" in
   install) install_panel ;;
-  upgrade|update) upgrade_panel ;;
+  upgrade|update|migrate-forwardx) upgrade_panel ;;
   uninstall|remove) uninstall_panel ;;
   reset-admin|reset-password) reset_admin_password ;;
   *)

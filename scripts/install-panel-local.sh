@@ -12,6 +12,7 @@ PANEL_BUNDLE_PREFIX="${FORWARDX_PANEL_BUNDLE_PREFIX:-forwardx-panel-v}"
 PNPM_VERSION="${FORWARDX_PNPM_VERSION:-10.28.1}"
 ASSETS_PENDING_EXIT_CODE=12
 ENABLE_ADMIN_ACCOUNT="false"
+MIGRATE_FORWARDX_AGENTS="false"
 GITHUB_ACCELERATOR_URL=""
 GITHUB_ACCELERATOR_EXPLICIT="false"
 cleanup_github_curl_configs() {
@@ -29,7 +30,7 @@ fi
 
 usage() {
   cat <<EOF
-Usage: $0 install|upgrade|uninstall|reset-admin|reset-password [--github-accelerator URL] [--enable-account]
+Usage: $0 install|upgrade|migrate-forwardx|uninstall|reset-admin|reset-password [--github-accelerator URL] [--enable-account]
 
 Options:
   --github-accelerator URL   Prefix GitHub API/raw/release URLs with this HTTP(S) accelerator.
@@ -46,7 +47,7 @@ parse_args() {
   local value=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      install|upgrade|update|uninstall|remove|reset-admin|reset-password)
+      install|upgrade|update|migrate-forwardx|uninstall|remove|reset-admin|reset-password)
         if [ "$action_seen" = "true" ]; then
           echo "[ERROR] Multiple actions were provided: $1" >&2
           usage >&2
@@ -95,6 +96,10 @@ parse_args() {
 }
 
 parse_args "$@"
+
+if [ "$ACTION" = "migrate-forwardx" ]; then
+  MIGRATE_FORWARDX_AGENTS="true"
+fi
 
 if [ "$ENABLE_ADMIN_ACCOUNT" = "true" ] && [ "$ACTION" != "reset-admin" ] && [ "$ACTION" != "reset-password" ]; then
   echo "[ERROR] --enable-account is only valid with reset-admin" >&2
@@ -847,12 +852,16 @@ install_runtime_dependencies() {
 }
 
 write_env() {
-  local jwt_secret="${JWT_SECRET:-}"
+  local jwt_secret="${JWT_SECRET:-}" existing_migrate_agents
   if [ -z "$jwt_secret" ]; then
     jwt_secret="$(openssl rand -hex 32 2>/dev/null || date +%s%N | sha256sum | awk '{print $1}')"
   fi
   mkdir -p "$APP_DIR/data"
   ensure_xray_master_key
+  existing_migrate_agents="$(get_env_value FORWARDPLUS_MIGRATE_AGENTS || true)"
+  if [ "$MIGRATE_FORWARDX_AGENTS" != "true" ] && [[ "$existing_migrate_agents" =~ ^(1|true|yes|on)$ ]]; then
+    MIGRATE_FORWARDX_AGENTS="true"
+  fi
   umask 077
   cat > "$APP_DIR/.env" <<EOF
 NODE_ENV=production
@@ -866,6 +875,7 @@ FORWARDX_PORT_CONFIG_PATH=$APP_DIR/.env
 FORWARDX_PORT_MANAGEMENT=local
 FORWARDX_GITHUB_ACCELERATOR_URL="$GITHUB_ACCELERATOR_URL"
 FORWARDPLUS_GITHUB_TOKEN=$GITHUB_TOKEN
+FORWARDPLUS_MIGRATE_AGENTS=$MIGRATE_FORWARDX_AGENTS
 FORWARDX_UPGRADE_COMMAND="/bin/bash $APP_DIR/scripts/install-panel-local.sh upgrade"
 EOF
   chmod 600 "$APP_DIR/.env"
@@ -888,9 +898,14 @@ install_panel() {
 }
 
 upgrade_panel() {
-  local release_version
+  local release_version current_version
   require_root
   resolve_runtime_env
+  if [ "$ACTION" = "migrate-forwardx" ]; then
+    current_version="$(node -p "require('$APP_DIR/package.json').version" 2>/dev/null || true)"
+    echo "[INFO] Detected existing panel version: ${current_version:-unknown}"
+    echo "[INFO] Enabling automatic Agent distribution migration to Forwardplus"
+  fi
   install_deps
   release_version="$(resolve_release_version)"
   download_panel_bundle "$release_version"
@@ -966,7 +981,7 @@ reset_admin_password() {
 
 case "$ACTION" in
   install) install_panel ;;
-  upgrade|update) upgrade_panel ;;
+  upgrade|update|migrate-forwardx) upgrade_panel ;;
   uninstall|remove) uninstall_panel ;;
   reset-admin|reset-password) reset_admin_password ;;
   *)

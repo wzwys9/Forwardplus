@@ -8,7 +8,7 @@ import {
   listKnownXrayProfiles,
   resolveStoredXrayInboundDefinition,
 } from "../shared/xrayProfiles";
-import { isAgentVersionAtLeast, compareVersions } from "./agentRouteUtils";
+import { isForwardplusAgentVersionAtLeast, compareVersions } from "./agentRouteUtils";
 import { boolLiteral, quoteIdentifier } from "./dbCompat";
 import { queryRaw } from "./dbRuntime";
 import { HOST_ONLINE_TTL_MS } from "./hostHeartbeatPolicy";
@@ -131,7 +131,11 @@ function unavailableReason(row: DatabaseRow, requirePublicIpv4: boolean): XrayUn
   const heartbeat = heartbeatState(row);
   if (!heartbeat.storedOnline) return "AGENT_OFFLINE";
   if (!heartbeat.fresh) return "HEARTBEAT_STALE";
-  if (!isAgentVersionAtLeast(nullableString(row.agentVersion), AGENT_VERSION)) return "AGENT_UPGRADE_REQUIRED";
+  if (!isForwardplusAgentVersionAtLeast(
+    nullableString(row.agentVersion),
+    nullableString(row.agentDistribution),
+    AGENT_VERSION,
+  )) return "AGENT_UPGRADE_REQUIRED";
   const { os, arch } = capabilityPlatform(row);
   const capabilityVersion = numberValue(row.capabilitySchemaVersion);
   if (capabilityVersion !== 1) return os || arch || row.capabilityErrorCode ? "PLATFORM_UNSUPPORTED" : "AGENT_UPGRADE_REQUIRED";
@@ -155,7 +159,7 @@ function hostCapabilityColumns() {
   return [
     `h.${q("id")} AS ${q("hostId")}`, `h.${q("name")} AS ${q("hostName")}`, `h.${q("ip")} AS ${q("ip")}`,
     `h.${q("ipv4")} AS ${q("ipv4")}`, `h.${q("isOnline")} AS ${q("isOnline")}`, `h.${q("lastHeartbeat")} AS ${q("lastHeartbeat")}`,
-    `h.${q("agentVersion")} AS ${q("agentVersion")}`,
+    `h.${q("agentVersion")} AS ${q("agentVersion")}`, `h.${q("agentDistribution")} AS ${q("agentDistribution")}`,
     ...["capabilitySchemaVersion", "supportedOS", "supportedArch", "supportsArtifactInstall", "supportsPortProbe", "supportsRealityScan", "capabilityErrorCode"]
       .map((column) => `r.${q(column)} AS ${q(column)}`),
     `a.${q("version")} AS ${q("artifactVersion")}`, `a.${q("os")} AS ${q("artifactOS")}`, `a.${q("arch")} AS ${q("artifactArch")}`,

@@ -54,7 +54,7 @@ test("Xray client CRUD isolates credentials, defers deletion, and shares only no
       const now = Math.floor(Date.now() / 1000);
       await runtime.executeRaw("INSERT INTO users (id, username, password, role) VALUES (1, 'admin', 'hash', 'admin')");
       await runtime.executeRaw("INSERT INTO users (id, username, password, role) VALUES (2, 'member', 'hash', 'user')");
-      await runtime.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, userId) VALUES (1, 'edge', '8.8.8.8', '8.8.8.8', 1, ?, '2.3.1', 1)", [now]);
+      await runtime.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, agentDistribution, userId) VALUES (1, 'edge', '8.8.8.8', '8.8.8.8', 1, ?, '2.3.1', 'forwardplus', 1)", [now]);
       await runtime.executeRaw("INSERT INTO xray_runtime_reports (hostId, capabilitySchemaVersion, supportedOS, supportedArch, supportsArtifactInstall, supportsPortProbe, supportsRealityScan, isInstalled, installedVersion, runningVersion, serviceStatus, appliedGeneration) VALUES (1, 1, 'linux', 'amd64', 1, 1, 1, 1, ?, ?, 'RUNNING', 1)", [artifacts.XRAY_DEFAULT_VERSION, artifacts.XRAY_DEFAULT_VERSION]);
 
       const runtimeTag = "forwardx-inbound-client-test";

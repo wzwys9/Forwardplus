@@ -5,7 +5,7 @@ import {
   type XrayProfileSummary,
 } from "../shared/xrayProfiles";
 import { AGENT_VERSION } from "../shared/versions";
-import { isAgentVersionAtLeast } from "./agentRouteUtils";
+import { isForwardplusAgentVersionAtLeast } from "./agentRouteUtils";
 import net from "node:net";
 
 import { pushAgentRefresh } from "./agentEvents";
@@ -487,7 +487,7 @@ async function requireWritableHost(hostId: number, listenerNetworks: readonly ("
   if (!host) throw new XrayInboundCreateError("HOST_NOT_FOUND");
   if (!host.isOnline) throw new XrayInboundCreateError("HOST_OFFLINE");
   const runtime = await getXrayRuntimeReport(hostId);
-  if (!isAgentVersionAtLeast(host.agentVersion, AGENT_VERSION) || !runtime || runtime.capabilitySchemaVersion !== 1
+  if (!isForwardplusAgentVersionAtLeast(host.agentVersion, host.agentDistribution, AGENT_VERSION) || !runtime || runtime.capabilitySchemaVersion !== 1
     || runtime.supportedOS !== "linux" || (runtime.supportedArch !== "amd64" && runtime.supportedArch !== "arm64")
     || !runtime.supportsArtifactInstall || !runtime.supportsPortProbe || !runtime.supportsRealityScan) {
     throw new XrayInboundCreateError("AGENT_CAPABILITY_MISSING");

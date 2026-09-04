@@ -50,7 +50,7 @@ test("managed TLS certificate API enforces admin, host, rotation, reference, and
       secrets.createXrayMasterKeyFile({ path: process.env.XRAY_MASTER_KEY_PATH });
       const now = Math.floor(Date.now() / 1000);
       await db.executeRaw("INSERT INTO users (id, username, password, role) VALUES (1, 'admin', 'hash', 'admin'), (2, 'member', 'hash', 'user')");
-      await db.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, userId) VALUES (1, 'edge-a', '8.8.8.8', '8.8.8.8', 1, ?, ?, 1), (2, 'edge-offline', '8.8.4.4', '8.8.4.4', 0, ?, ?, 1)", [now, versions.AGENT_VERSION, now, versions.AGENT_VERSION]);
+      await db.executeRaw("INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, agentDistribution, userId) VALUES (1, 'edge-a', '8.8.8.8', '8.8.8.8', 1, ?, ?, 'forwardplus', 1), (2, 'edge-offline', '8.8.4.4', '8.8.4.4', 0, ?, ?, 'forwardplus', 1)", [now, versions.AGENT_VERSION, now, versions.AGENT_VERSION]);
       for (const hostId of [1, 2]) {
         await db.executeRaw("INSERT INTO xray_runtime_reports (hostId, capabilitySchemaVersion, supportedOS, supportedArch, supportsArtifactInstall, supportsPortProbe, supportsRealityScan, reportedAt) VALUES (?, 1, 'linux', 'amd64', 1, 1, 1, ?)", [hostId, now]);
       }

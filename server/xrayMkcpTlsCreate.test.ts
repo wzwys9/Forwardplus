@@ -75,7 +75,7 @@ test("UDP TLS profiles require capabilities/reservations and keep credentials ge
       const now = Math.floor(Date.now() / 1000);
       await runtime.executeRaw("INSERT INTO users (id, username, password, role) VALUES (1, 'admin', 'hash', 'admin')");
       await runtime.executeRaw(
-        "INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, userId) VALUES (10, 'edge-a', '8.8.8.8', '8.8.8.8', 1, ?, ?, 1)",
+        "INSERT INTO hosts (id, name, ip, ipv4, isOnline, lastHeartbeat, agentVersion, agentDistribution, userId) VALUES (10, 'edge-a', '8.8.8.8', '8.8.8.8', 1, ?, ?, 'forwardplus', 1)",
         [now, versions.AGENT_VERSION],
       );
       await runtime.executeRaw(

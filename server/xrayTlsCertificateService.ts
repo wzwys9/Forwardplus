@@ -1,5 +1,5 @@
 import { AGENT_VERSION } from "../shared/versions";
-import { isAgentVersionAtLeast } from "./agentRouteUtils";
+import { isForwardplusAgentVersionAtLeast } from "./agentRouteUtils";
 import { pushAgentRefresh } from "./agentEvents";
 import { quoteIdentifier } from "./dbCompat";
 import { queryRaw } from "./dbRuntime";
@@ -80,7 +80,7 @@ async function requireWritableHost(hostId: number): Promise<void> {
   if (!host) throw new XrayTlsCertificateServiceError("HOST_NOT_FOUND");
   if (!host.isOnline) throw new XrayTlsCertificateServiceError("HOST_OFFLINE");
   const runtime = await getXrayRuntimeReport(hostId);
-  if (!isAgentVersionAtLeast(host.agentVersion, AGENT_VERSION) || !runtime || runtime.capabilitySchemaVersion !== 1
+  if (!isForwardplusAgentVersionAtLeast(host.agentVersion, host.agentDistribution, AGENT_VERSION) || !runtime || runtime.capabilitySchemaVersion !== 1
     || runtime.supportedOS !== "linux" || (runtime.supportedArch !== "amd64" && runtime.supportedArch !== "arm64")
     || !runtime.supportsArtifactInstall || !runtime.supportsPortProbe || !runtime.supportsRealityScan) {
     throw new XrayTlsCertificateServiceError("AGENT_CAPABILITY_MISSING");

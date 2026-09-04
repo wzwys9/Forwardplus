@@ -6,6 +6,7 @@ import { AGENT_ASSET_NAME_SET, getOrFetchAgentAssetPath } from "./agentAssets";
 import { appendPanelLog } from "./_core/panelLogger";
 import { generateInstallScript } from "./agentInstallScripts";
 import { isNginxForwardProtocolEnabled } from "../shared/forwardTypes";
+import { isForwardplusAgent, normalizeAgentBuildId, normalizeAgentDistribution } from "../shared/agentIdentity";
 import { registerAgentEventClient, unregisterAgentEventClient } from "./agentEvents";
 import { agentEncryptionMiddleware, getAgentTunneledPath } from "./agentEncryptionMiddleware";
 import { AGENT_PANEL_MIGRATION_VERSION, hasAgentVersionChanged, isAgentUpgradeTargetSatisfied, isAgentVersionAtLeast } from "./agentRouteUtils";
@@ -132,6 +133,8 @@ async function openAgentEventStream(input: {
   res: Response;
   token: string;
   agentVersion?: string | null;
+  agentDistribution?: string | null;
+  agentBuildId?: string | null;
 }) {
   const { req, res, token } = input;
   const migratedTo = await db.getSetting("migratedToPanelUrl");
@@ -168,7 +171,12 @@ async function openAgentEventStream(input: {
     return;
   }
   const agentVersion = normalizeAgentText(input.agentVersion, 64);
+  const agentDistribution = normalizeAgentDistribution(input.agentDistribution);
+  const agentBuildId = normalizeAgentBuildId(input.agentBuildId);
   const agentVersionChanged = hasAgentVersionChanged((host as any).agentVersion, agentVersion);
+  const agentIdentityChanged = agentVersionChanged
+    || agentDistribution !== normalizeAgentDistribution((host as any).agentDistribution)
+    || agentBuildId !== normalizeAgentBuildId((host as any).agentBuildId);
   const wasOnline = isHostStatusOnline(host);
   recordAuthenticatedAgentActivity(host.id);
   observePresenceCapableHostActivity(host.id);
@@ -177,8 +185,12 @@ async function openAgentEventStream(input: {
       && !isAgentVersionAtLeast((host as any).agentVersion, AGENT_FIREWALL_COUNTER_REFRESH_VERSION);
     const upgradedProtocolGuardBackendAgent = isAgentVersionAtLeast(agentVersion, AGENT_PROTOCOL_GUARD_BACKEND_VERSION)
       && !isAgentVersionAtLeast((host as any).agentVersion, AGENT_PROTOCOL_GUARD_BACKEND_VERSION);
-    await db.updateHostHeartbeat(host.id, { agentVersion } as any);
-    if (agentVersionChanged) {
+    await db.updateHostHeartbeat(host.id, {
+      agentVersion,
+      agentDistribution,
+      agentBuildId,
+    } as any);
+    if (agentIdentityChanged) {
       prepareAgentDesiredStateResync(host.id);
       appendPanelLog(
         "info",
@@ -192,8 +204,15 @@ async function openAgentEventStream(input: {
       await resetAgentRuntimeStateAfterReconnect(host.id, "agent-protocol-guard-backend-upgrade");
     }
     const requestedTargetVersion = (host as any).agentUpgradeTargetVersion || AGENT_VERSION;
+    const requestedTargetDistribution = (host as any).agentUpgradeTargetDistribution || "forwardplus";
     const agentUpgradeCompleted = (host as any).agentUpgradeRequested
-      && isAgentUpgradeTargetSatisfied(agentVersion, requestedTargetVersion, AGENT_VERSION);
+      && isAgentUpgradeTargetSatisfied(
+        agentVersion,
+        requestedTargetVersion,
+        AGENT_VERSION,
+        agentDistribution || (host as any).agentDistribution,
+        requestedTargetDistribution,
+      );
     if (agentUpgradeCompleted) {
       await db.clearHostAgentUpgradeRequest(host.id);
     }
@@ -290,6 +309,8 @@ agentRouter.get("/api/stream", async (req: Request, res: Response) => {
       res,
       token,
       agentVersion: payload?.agentVersion,
+      agentDistribution: payload?.agentDistribution,
+      agentBuildId: payload?.agentBuildId,
     });
   } catch (error) {
     const message = agentErrorMessage(error);
@@ -329,7 +350,14 @@ agentRouter.get("/api/agent/events", async (req: Request, res: Response) => {
       return;
     }
     res.setHeader(AGENT_AUTH_RESULT_HEADER, AGENT_AUTH_RESULT_ACCEPTED);
-    await openAgentEventStream({ req, res, token, agentVersion: req.header("X-Agent-Version") });
+    await openAgentEventStream({
+      req,
+      res,
+      token,
+      agentVersion: req.header("X-Agent-Version"),
+      agentDistribution: req.header("X-Agent-Distribution"),
+      agentBuildId: req.header("X-Agent-Build-Id"),
+    });
   } catch (error) {
     console.error("[Agent Events] Error:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -362,6 +390,8 @@ agentApiRouter.post("/api/agent/register", async (req: Request, res: Response) =
     const nextOsInfo = normalizeAgentText(osInfo, 256);
     const nextCpuInfo = normalizeAgentText(cpuInfo, 256);
     const nextAgentVersion = normalizeAgentText(agentVersion, 64);
+    const nextAgentDistribution = normalizeAgentDistribution(req.body?.agentDistribution);
+    const nextAgentBuildId = normalizeAgentBuildId(req.body?.agentBuildId);
 
     const existingHost = await db.getHostByAgentToken(token);
     if (existingHost) {
@@ -389,6 +419,8 @@ agentApiRouter.post("/api/agent/register", async (req: Request, res: Response) =
         cpuInfo: nextCpuInfo || existingHost.cpuInfo,
         memoryTotal: memoryTotal || existingHost.memoryTotal,
         agentVersion: nextAgentVersion || (existingHost as any).agentVersion,
+        agentDistribution: nextAgentDistribution,
+        agentBuildId: nextAgentBuildId,
         isOnline: true,
         lastHeartbeat: new Date(),
       });
@@ -406,10 +438,17 @@ agentApiRouter.post("/api/agent/register", async (req: Request, res: Response) =
           console.warn(`[HostStatus] Online notify failed host=${existingHost.id}: ${error instanceof Error ? error.message : String(error)}`);
         });
       }
-      await persistXrayCapabilityReport(existingHost.id, req.body?.xrayCapability);
+      await persistXrayCapabilityReport(
+        existingHost.id,
+        isForwardplusAgent(nextAgentDistribution)
+          ? req.body?.xrayCapability
+          : null,
+      );
       await processXrayManagedServicesHeartbeatReport({
         hostId: existingHost.id,
-        managedServicesCapability: req.body?.managedServicesCapability ?? null,
+        managedServicesCapability: isForwardplusAgent(nextAgentDistribution)
+          ? req.body?.managedServicesCapability ?? null
+          : null,
       });
       prepareAgentDesiredStateResync(existingHost.id);
       res.json({ success: true, hostId: existingHost.id, message: "Host updated" });
@@ -430,16 +469,20 @@ agentApiRouter.post("/api/agent/register", async (req: Request, res: Response) =
       cpuInfo: nextCpuInfo || null,
       memoryTotal: memoryTotal || null,
       agentVersion: nextAgentVersion || null,
+      agentDistribution: nextAgentDistribution,
+      agentBuildId: nextAgentBuildId,
       isOnline: true,
       lastHeartbeat: new Date(),
       userId: agentToken.userId,
     });
 
     await db.markAgentTokenUsed(token, hostId);
-    await persistXrayCapabilityReport(hostId, req.body?.xrayCapability);
+    await persistXrayCapabilityReport(hostId, isForwardplusAgent(nextAgentDistribution) ? req.body?.xrayCapability : null);
     await processXrayManagedServicesHeartbeatReport({
       hostId,
-      managedServicesCapability: req.body?.managedServicesCapability ?? null,
+      managedServicesCapability: isForwardplusAgent(nextAgentDistribution)
+        ? req.body?.managedServicesCapability ?? null
+        : null,
     });
     prepareAgentDesiredStateResync(hostId);
     res.json({ success: true, hostId, message: "Host registered" });
