@@ -85,6 +85,15 @@ export type XrayQuickConfigEditDraft = Readonly<{
   }>>;
 }>;
 
+export function xrayQuickConfigEditIdentity(
+  draft: XrayQuickConfigEditDraft,
+): Pick<XrayQuickConfigEditDraft, "quickConfigId" | "expectedRevision"> {
+  return {
+    quickConfigId: draft.quickConfigId,
+    expectedRevision: draft.expectedRevision,
+  };
+}
+
 export type XrayQuickConfigFlowState = {
   step: XrayQuickConfigStep;
   furthestStepIndex: number;

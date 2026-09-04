@@ -409,7 +409,7 @@ export class DnsPodProviderClient {
       if (!Array.isArray(response.RecordList) || response.RecordList.length > PAGE_SIZE) invalidResponse();
       const totalInfo = object(response.RecordCountInfo);
       const total = nonnegativeInteger(totalInfo.TotalCount ?? totalInfo.ListCount ?? response.RecordList.length);
-      const batch = response.RecordList.map((entry) => this.normalizeRecord(entry));
+      const batch = response.RecordList.map((entry) => this.normalizeListedRecord(entry));
       for (const record of batch) {
         const previous = records.get(record.providerRecordId);
         if (previous && JSON.stringify(previous) !== JSON.stringify(record)) invalidResponse();
@@ -426,7 +426,7 @@ export class DnsPodProviderClient {
     const response = await this.call("DescribeRecord", {
       ...zonePayload(input.zone), RecordId: providerIdNumber(input.providerRecordId),
     });
-    return this.normalizeRecord(response.RecordInfo);
+    return this.normalizeRecordInfo(response.RecordInfo);
   }
 
   async createRecord(input: DnsPodRecordWriteInput): Promise<{ providerRecordId: string }> {
@@ -451,7 +451,7 @@ export class DnsPodProviderClient {
     });
   }
 
-  private normalizeRecord(value: unknown): DnsPodRecord {
+  private normalizeListedRecord(value: unknown): DnsPodRecord {
     const row = object(value);
     const ttl = positiveInteger(row.TTL);
     if (ttl > 604_800) invalidResponse();
@@ -464,6 +464,24 @@ export class DnsPodProviderClient {
       value: boundedString(row.Value, 2_048),
       ttl,
       status: optionalString(row.Status, 32),
+    };
+  }
+
+  private normalizeRecordInfo(value: unknown): DnsPodRecord {
+    const row = object(value);
+    const ttl = positiveInteger(row.TTL);
+    if (ttl > 604_800) invalidResponse();
+    const enabled = row.Enabled;
+    if (enabled !== undefined && enabled !== null && enabled !== 0 && enabled !== 1) invalidResponse();
+    return {
+      providerRecordId: providerId(row.Id),
+      subdomain: boundedString(row.SubDomain, 253),
+      recordType: boundedString(row.RecordType, 16).toUpperCase(),
+      providerLineId: boundedString(String(row.RecordLineId ?? ""), 128),
+      lineName: boundedString(row.RecordLine, 128),
+      value: boundedString(row.Value, 2_048),
+      ttl,
+      status: enabled === 1 ? "ENABLE" : enabled === 0 ? "DISABLE" : null,
     };
   }
 

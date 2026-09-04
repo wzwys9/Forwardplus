@@ -5,6 +5,7 @@ import {
   activeXrayQuickConfigReplacementProbeToken,
   initialXrayQuickConfigFlowState,
   reduceXrayQuickConfigFlow,
+  xrayQuickConfigEditIdentity,
   type XrayQuickConfigFlowState,
   type XrayQuickConfigPortSuccess,
 } from "./xrayQuickConfigFlow";
@@ -54,5 +55,21 @@ test("quick config retains the last probe token when the port check is explicitl
   assert.deepEqual(cleared.replaceProbeResult, {
     token: success.probeResultToken,
     expiresAt: success.expiresAt,
+  });
+});
+
+test("quick config domain checks send only the strict edit identity", () => {
+  assert.deepEqual(xrayQuickConfigEditIdentity({
+    quickConfigId: 9,
+    expectedRevision: 3,
+    zoneId: 4,
+    relativeName: "edge",
+    carrierEndpoints: { TELECOM: [], UNICOM: [], MOBILE: [], EDUCATION: [] },
+    engine: "realm",
+    publicPort: 5326,
+    defaultRoutes: [],
+  }), {
+    quickConfigId: 9,
+    expectedRevision: 3,
   });
 });

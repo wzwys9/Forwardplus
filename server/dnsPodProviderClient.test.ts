@@ -130,6 +130,20 @@ test("catalog, record listing, and CRUD preserve the dynamic DNSPod line id", as
           RecordCountInfo: { TotalCount: 1 },
           RequestId: "list-request",
         });
+      case "DescribeRecord":
+        return dnsPodResponse({
+          RecordInfo: {
+            Id: 770,
+            SubDomain: "edge",
+            RecordType: "AAAA",
+            RecordLineId: "37=9",
+            RecordLine: "教育网",
+            Value: "2001:4860:4860::8888",
+            TTL: 600,
+            Enabled: 1,
+          },
+          RequestId: "record-request",
+        });
       case "CreateRecord":
         return dnsPodResponse({ RecordId: 771, RequestId: "create-request" });
       case "ModifyRecord":
@@ -150,6 +164,10 @@ test("catalog, record listing, and CRUD preserve the dynamic DNSPod line id", as
   });
   const records = await client.listRecords({ zone, subdomain: "edge", recordType: "AAAA" });
   assert.equal(records[0]?.providerRecordId, "770");
+  assert.deepEqual(await client.getRecord({ zone, providerRecordId: "770" }), {
+    ...records[0],
+    status: "ENABLE",
+  });
 
   const recordInput = {
     zone,
@@ -175,6 +193,11 @@ test("catalog, record listing, and CRUD preserve the dynamic DNSPod line id", as
     Offset: 0,
     RecordType: "AAAA",
     SubDomain: "edge",
+  });
+  assert.deepEqual(byAction.get("DescribeRecord"), {
+    Domain: "example.com",
+    DomainId: 42,
+    RecordId: 770,
   });
   for (const action of ["CreateRecord", "ModifyRecord"] as const) {
     assert.equal(byAction.get(action)?.RecordLineId, "37=9");

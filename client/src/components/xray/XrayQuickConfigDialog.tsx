@@ -25,6 +25,7 @@ import {
   XRAY_QUICK_CONFIG_CARRIERS,
   XRAY_QUICK_CONFIG_STEPS,
   xrayQuickConfigCarriersComplete,
+  xrayQuickConfigEditIdentity,
   xrayQuickConfigEndpointKey,
   type XrayQuickConfigCarrier,
   type XrayQuickConfigDomainCheck,
@@ -783,7 +784,7 @@ export function XrayQuickConfigDialog(props: {
             zones={props.zones}
             state={state}
             confirmedValid={confirmedValid}
-            editIdentity={props.edit}
+            editIdentity={props.edit ? xrayQuickConfigEditIdentity(props.edit) : undefined}
             onSetDomain={(zoneId, relativeName) => dispatch({ type: "SET_DOMAIN", zoneId, relativeName })}
             onChecked={(result) => dispatch({ type: "DOMAIN_CHECKED", result })}
             onConfirmed={(confirmedDomainToken, expiresAt) => {
