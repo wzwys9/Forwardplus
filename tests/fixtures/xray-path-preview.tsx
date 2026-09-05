@@ -3,7 +3,9 @@ import { createRoot } from "react-dom/client";
 import "../../client/src/index.css";
 import { XrayQuickConfigPathDesigner } from "../../client/src/components/xray/XrayQuickConfigPathDesigner";
 import type { XrayQuickConfigEntryHost, XrayQuickConfigTarget } from "../../client/src/components/xray/xrayQuickConfigFlow";
-import { emptyQuickConfigPaths } from "../../client/src/components/xray/xrayQuickConfigPaths";
+import { emptyQuickConfigPaths, quickConfigPathInputs } from "../../client/src/components/xray/xrayQuickConfigPaths";
+import { QuickConfigDialogFixture } from "./xray-quick-config-dialog";
+import { QuickConfigListFixture } from "./xray-quick-config-list";
 import { XrayQuickConfigCarrierPaths } from "../../client/src/components/xray/XrayQuickConfigCarrierPaths";
 import { initialXrayQuickConfigFlowState, reduceXrayQuickConfigFlow } from "../../client/src/components/xray/xrayQuickConfigFlow";
 
@@ -38,12 +40,14 @@ function Fixture() {
   </main>;
 }
 function FormalFixture() {
-  const [state, dispatch] = useReducer(reduceXrayQuickConfigFlow, reduceXrayQuickConfigFlow(initialXrayQuickConfigFlowState(), { type: "SET_CARRIER_PATHS", paths: initial }));
+  const [state, dispatch] = useReducer(reduceXrayQuickConfigFlow, reduceXrayQuickConfigFlow({ ...initialXrayQuickConfigFlowState(), engine: "realm" }, { type: "SET_CARRIER_PATHS", paths: initial }));
   const [next, setNext] = useState(false);
   return <main className="mx-auto max-w-4xl p-3"><p className="mb-3 text-sm">隔离正式路径步骤 · 不连接 API</p>
-    {next ? <><h1>已进入转发引擎</h1><pre className="break-all whitespace-pre-wrap" data-testid="accepted-paths">{JSON.stringify(state.carrierPaths)}</pre></>
+    {next ? <><h1>已进入端口检测</h1><pre className="break-all whitespace-pre-wrap" data-testid="accepted-paths">{JSON.stringify(state.carrierPaths)}</pre>
+      <pre data-testid="accepted-inputs">{JSON.stringify(state.carrierPaths?.TELECOM.flatMap(quickConfigPathInputs))}</pre></>
       : <XrayQuickConfigCarrierPaths state={state} target={target} hosts={hosts} loading={false} error={false} confirmedValid linesAvailable
         onChange={paths => dispatch({ type: "SET_CARRIER_PATHS", paths })} onBack={() => {}} onNext={() => setNext(true)} onRetry={() => {}} />}
   </main>;
 }
-createRoot(document.getElementById("root")!).render(new URLSearchParams(window.location.search).has("formal") ? <FormalFixture /> : <Fixture />);
+const params = new URLSearchParams(window.location.search);
+createRoot(document.getElementById("root")!).render(params.has("list") ? <QuickConfigListFixture /> : params.has("dialog") ? <QuickConfigDialogFixture /> : params.has("formal") ? <FormalFixture /> : <Fixture />);
