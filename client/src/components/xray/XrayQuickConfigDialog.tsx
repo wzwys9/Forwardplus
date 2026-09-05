@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { filterQuickConfigPathEngines } from "@shared/xrayQuickConfigForwardEngines";
 import { XrayQuickConfigCarrierPaths } from "./XrayQuickConfigCarrierPaths";
-import { quickConfigPathInput, quickConfigPathsFromEntries } from "./xrayQuickConfigPaths";
+import { quickConfigPathInputs, quickConfigPathsFromEntries } from "./xrayQuickConfigPaths";
 import { AlertTriangle, CheckCircle2, Clock3, Globe2, Loader2, Network } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -126,9 +125,10 @@ function selectedCarrierRoutes(
     if (!line || line.status !== "AVAILABLE") return null;
     const endpoints: CarrierRoutesInput[number]["endpoints"] = [];
     for (const path of paths[carrier]) {
-      const endpoint = quickConfigPathInput(path);
-      if (!endpoint) return null;
-      endpoints.push(endpoint);
+      for (const endpoint of quickConfigPathInputs(path)) {
+        if (!endpoint) return null;
+        endpoints.push(endpoint);
+      }
     }
     if (endpoints.length === 0) return null;
     routes.push({ carrier, providerLineId: line.providerLineId, endpoints });
@@ -343,9 +343,8 @@ function DomainStep(props: {
           )}
         </div>
       )}
-      {props.confirmedValid && <Alert><CheckCircle2 className="h-4 w-4" /><AlertTitle>域名已确认</AlertTitle><AlertDescription>确认短期有效；修改域名后需要重新检查，最终提交前不会修改解析。</AlertDescription></Alert>}
-      {props.state.confirmedDomainToken && !props.confirmedValid && <Alert variant="destructive"><Clock3 className="h-4 w-4" /><AlertTitle>域名确认已过期</AlertTitle><AlertDescription>已保留输入，请重新检查并确认。</AlertDescription></Alert>}
-      <div className="flex justify-end"><Button type="button" disabled={!props.confirmedValid || !canUseName || pending} onClick={props.onNext}>下一步：运营商入口</Button></div>
+      {props.confirmedValid && <Alert><CheckCircle2 className="h-4 w-4" /><AlertTitle>域名已确认</AlertTitle><AlertDescription>后续将自动实时复核，不会因配置时间较长而清空路径。最终提交前不会修改解析。</AlertDescription></Alert>}
+      <div className="flex justify-end"><Button type="button" disabled={!props.confirmedValid || !canUseName || pending} onClick={props.onNext}>下一步：转发引擎</Button></div>
     </div>
   );
 }
@@ -368,17 +367,17 @@ function EngineStep(props: {
   const canContinue = !!selectedItem?.eligible;
   return (
     <div className="space-y-5">
-      <div><h3 className="font-semibold">选择统一转发引擎</h3><p className="mt-1 text-sm text-muted-foreground">{props.lockedEngine ? "编辑拓扑时保持当前引擎；如需更换，请先退出并使用详情页的“切换引擎”。" : "一种引擎会应用到全部所选入口服务器；服务端已按主机、地址族、全局开关和 Agent 能力计算交集。"}</p></div>
+      <div><h3 className="font-semibold">选择统一转发引擎</h3><p className="mt-1 text-sm text-muted-foreground">{props.lockedEngine ? "编辑拓扑时保持当前引擎；如需更换，请先退出并使用详情页的“切换引擎”。" : "先选择本次统一使用的引擎，下一步会根据引擎和已选路径禁用不兼容服务器；未使用的服务器不会影响选择。"}</p></div>
       {props.loading ? <div className="grid gap-3 sm:grid-cols-2" aria-busy="true" aria-label="正在计算共同可用引擎"><Skeleton className="h-24 w-full" /><Skeleton className="h-24 w-full" /><Skeleton className="h-24 w-full" /><Skeleton className="h-24 w-full" /></div>
         : props.error || !props.catalog ? <Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>引擎目录加载失败</AlertTitle><AlertDescription className="space-y-3"><p>请确认所选入口仍在线后重试。</p><Button type="button" size="sm" variant="outline" onClick={props.onRetry}>重新计算</Button></AlertDescription></Alert>
           : <div className="grid gap-3 sm:grid-cols-2">{props.catalog.items.map((item) => {
               const selected = props.selected === item.engine;
               return <button key={item.engine} type="button" disabled={!item.eligible || !!props.lockedEngine && item.engine !== props.lockedEngine} aria-pressed={selected} onClick={() => props.onSelect(item.engine)} className="flex min-h-24 items-start justify-between gap-3 rounded-lg border p-4 text-left transition-colors enabled:hover:bg-muted/60 disabled:cursor-not-allowed disabled:opacity-55 aria-pressed:border-primary aria-pressed:bg-primary/5"><span><span className="block font-medium">{item.label}</span><span className="mt-1 block text-xs text-muted-foreground">{props.lockedEngine && item.engine === props.lockedEngine ? "当前引擎（已锁定）" : item.isDefault ? "默认推荐" : "可选转发方式"}</span>{item.disabledReasonCode && <span className="mt-2 block text-xs text-destructive">{engineReasonLabels[item.disabledReasonCode] ?? "当前组合不可用"}</span>}</span>{item.eligible && selected && <CheckCircle2 className="h-5 w-5 shrink-0 text-primary" aria-hidden="true" />}</button>;
             })}</div>}
-      {props.catalog && !props.catalog.items.some((item) => item.eligible) && <Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>没有共同可用的转发引擎</AlertTitle><AlertDescription>请返回调整入口服务器，或在系统设置中启用并安装相同的转发方式。</AlertDescription></Alert>}
+      {props.catalog && !props.catalog.items.some((item) => item.eligible) && <Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>没有启用的转发引擎</AlertTitle><AlertDescription>请在系统设置中启用所需转发方式。</AlertDescription></Alert>}
       <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
-        <Button type="button" variant="outline" onClick={props.onBack}>返回：运营商入口</Button>
-        <Button type="button" disabled={!canContinue} onClick={props.onNext}>下一步：端口检测</Button>
+        <Button type="button" variant="outline" onClick={props.onBack}>返回：域名</Button>
+        <Button type="button" disabled={!canContinue} onClick={props.onNext}>下一步：运营商路径</Button>
       </div>
     </div>
   );
@@ -440,7 +439,7 @@ function PortStep(props: {
         <Button type="button" variant="outline" onClick={props.onUseOriginal}>重新检测落地原端口 {props.target.endpoint.port}</Button>
       )}
       <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
-        <Button type="button" variant="outline" onClick={props.onBack}>返回：转发引擎</Button>
+        <Button type="button" variant="outline" onClick={props.onBack}>返回：运营商路径</Button>
         <Button type="button" disabled={!success || props.busy} onClick={props.onNext}>下一步：默认线路</Button>
       </div>
     </div>
@@ -574,9 +573,8 @@ export function XrayQuickConfigDialog(props: {
   const usableZones = props.zones.filter((zone) => zone.catalogUsable);
   const usableZoneKey = usableZones.map((zone) => zone.zoneId).join(":");
   const selectedZone = props.zones.find((zone) => zone.zoneId === state.zoneId);
-  const confirmedValid = !!state.confirmedDomainToken && !!state.confirmedDomainExpiresAt
-    && Date.parse(state.confirmedDomainExpiresAt) > now;
-  const entryHostsQuery = trpc.xray.quickConfigs.entryHostsList.useQuery(undefined, {
+  const confirmedValid = !!state.confirmedDomainToken;
+  const entryHostsQuery = trpc.xray.quickConfigs.entryHostsList.useQuery({ engine: state.engine ?? undefined }, {
     enabled: state.step !== "DOMAIN",
     retry: false,
     refetchInterval: state.step === "CARRIERS" ? 15_000 : false,
@@ -585,17 +583,18 @@ export function XrayQuickConfigDialog(props: {
   const entryHosts = (entryHostsQuery.data?.items ?? []) as XrayQuickConfigEntryHost[];
   const carrierRoutes = useMemo(() => selectedCarrierRoutes(state, selectedZone), [selectedZone, state]);
   const engineEntries = useMemo(() => selectedEngineEntries(carrierRoutes), [carrierRoutes]);
-  const engineDraftKey = JSON.stringify(engineEntries);
-  const engineQuery = trpc.xray.quickConfigs.forwardEngines.useQuery({ entries: engineEntries }, {
-    enabled: engineEntries.length > 0 && xrayQuickConfigCarriersComplete(state),
+  const engineDraftKey = "global";
+  const engineQuery = trpc.xray.quickConfigs.forwardEngines.useQuery({ entries: [] }, {
+    enabled: state.step !== "DOMAIN",
     retry: false,
     refetchInterval: state.step === "ENGINE" ? 15_000 : false,
     refetchOnWindowFocus: true,
   });
-  const directLandingHostId = !state.manualPort || Number(state.manualPort) === props.target.endpoint.port
-    ? props.target.host?.id : undefined;
-  const engineCatalog = useMemo(() => filterQuickConfigPathEngines(engineQuery.data,
-    carrierRoutes?.flatMap(route => route.endpoints.map(endpoint => [endpoint, ...(endpoint.relays ?? [])])) ?? [], props.target.endpoint.address, directLandingHostId), [engineQuery.data, carrierRoutes, props.target.endpoint.address, directLandingHostId]);
+  const selectedEngineQuery = trpc.xray.quickConfigs.forwardEngines.useQuery({ entries: engineEntries }, {
+    enabled: state.step === "PORT" && engineEntries.length > 0,
+    retry: false,
+  });
+  const engineCatalog = engineQuery.data;
   const portResultQuery = trpc.xray.quickConfigs.portChecksResult.useQuery({ portCheckId: state.portCheckId ?? "" }, {
     enabled: !!state.portCheckId,
     retry: false,
@@ -613,13 +612,6 @@ export function XrayQuickConfigDialog(props: {
     if (state.zoneId && usableZones.some((zone) => zone.zoneId === state.zoneId)) return;
     dispatch({ type: "SET_DOMAIN", zoneId: usableZones[0]?.zoneId ?? null, relativeName: state.relativeName });
   }, [state.relativeName, state.zoneId, usableZoneKey, usableZones]);
-
-  useEffect(() => {
-    if (!state.confirmedDomainExpiresAt) return;
-    const expiresAt = Date.parse(state.confirmedDomainExpiresAt);
-    const timer = window.setTimeout(() => setNow(Date.now()), Math.max(0, expiresAt - Date.now() + 50));
-    return () => window.clearTimeout(timer);
-  }, [state.confirmedDomainExpiresAt]);
 
   useEffect(() => {
     if (state.portResult?.status !== "SUCCESS") return;
@@ -643,26 +635,26 @@ export function XrayQuickConfigDialog(props: {
 
   useEffect(() => {
     const catalog = engineCatalog;
-    if (!catalog || engineEntries.length === 0) return;
+    if (!catalog) return;
     if (state.engine) {
       const selected = catalog.items.find((item) => item.engine === state.engine);
-      if (!selected?.eligible) {
-        autoEngineDraftRef.current = engineDraftKey;
-        dispatch({ type: "SET_ENGINE", engine: null });
-      }
+      // Keep a disabled choice visible so the user's path draft is not reset.
+      if (!selected?.eligible) autoEngineDraftRef.current = engineDraftKey;
       return;
     }
     if (autoEngineDraftRef.current === engineDraftKey) return;
     autoEngineDraftRef.current = engineDraftKey;
     const preferred = catalog.items.find((item) => item.engine === (props.edit?.engine ?? catalog.defaultEngine));
     if (preferred?.eligible) dispatch({ type: "SET_ENGINE", engine: preferred.engine });
-  }, [engineDraftKey, engineEntries.length, engineCatalog, props.edit?.engine, state.engine]);
+  }, [engineDraftKey, engineCatalog, props.edit?.engine, state.engine]);
 
   const startPortCheck = async (choice: { mode: "TARGET_ORIGINAL" } | { mode: "MANUAL"; port: number } | { mode: "RECOMMENDED"; recommendationToken: string }) => {
     if (!state.confirmedDomainToken || !carrierRoutes || !state.engine) return;
     setPortError(null);
     setPreviewError(null);
     try {
+      const selected = selectedEngineQuery.data?.items.find(item => item.engine === state.engine);
+      if (selected && !selected.eligible) throw new Error(selected.disabledReasonCode ?? "QUICK_CONFIG_HOST_UNAVAILABLE");
       const replaceProbeResultToken = activeXrayQuickConfigReplacementProbeToken(state);
       const result = await portCheckCreate.mutateAsync({
         confirmedDomainToken: state.confirmedDomainToken,
@@ -794,7 +786,7 @@ export function XrayQuickConfigDialog(props: {
             onChecked={(result) => dispatch({ type: "DOMAIN_CHECKED", result })}
             onConfirmed={(confirmedDomainToken, expiresAt, advance) => {
               dispatch({ type: "DOMAIN_CONFIRMED", confirmedDomainToken, expiresAt });
-              if (advance) dispatch({ type: "GO_TO_STEP", step: "CARRIERS" });
+              if (advance) dispatch({ type: "GO_TO_STEP", step: "ENGINE" });
             }}
             onNext={goNext}
           /> : state.step === "CARRIERS" ? <XrayQuickConfigCarrierPaths

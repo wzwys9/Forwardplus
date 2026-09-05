@@ -1,10 +1,10 @@
 import type { AppRouterOutputs } from "@/lib/trpc";
-import type { QuickConfigPaths } from "./xrayQuickConfigPaths";
+import { mergeQuickConfigPaths, quickConfigEntryKeys, type QuickConfigPaths } from "./xrayQuickConfigPaths";
 
 export const XRAY_QUICK_CONFIG_STEPS = [
   "DOMAIN",
-  "CARRIERS",
   "ENGINE",
+  "CARRIERS",
   "PORT",
   "DEFAULT",
   "PREVIEW",
@@ -147,7 +147,7 @@ export const XRAY_QUICK_CONFIG_CARRIERS: readonly XrayQuickConfigCarrier[] = [
 
 export function initialXrayQuickConfigFlowState(draft?: XrayQuickConfigEditDraft): XrayQuickConfigFlowState {
   return {
-    carrierPaths: draft?.carrierPaths ?? null,
+    carrierPaths: draft?.carrierPaths ? mergeQuickConfigPaths(draft.carrierPaths) : null,
     editDomainMode: draft ? "KEEP" : null,
     step: "DOMAIN",
     furthestStepIndex: 0,
@@ -200,11 +200,11 @@ export function reduceXrayQuickConfigFlow(
     if (action.type === "SET_DOMAIN" && state.zoneId === action.zoneId && state.relativeName === action.relativeName) return state;
     return {
       ...initialXrayQuickConfigFlowState(),
-      ...(state.editDomainMode === null ? {} : {
+      ...{
         editDomainMode: state.editDomainMode,
         carrierEndpoints: state.carrierEndpoints, carrierPaths: state.carrierPaths, engine: state.engine, manualPort: state.manualPort,
         editDefaultRoutes: state.editDefaultRoutes,
-      }),
+      },
       ...(action.type === "SET_DOMAIN_MODE" ? { editDomainMode: action.mode } : {}),
       zoneId: action.zoneId,
       relativeName: action.relativeName,
@@ -216,10 +216,6 @@ export function reduceXrayQuickConfigFlow(
       domainCheck: action.result,
       confirmedDomainToken: null,
       confirmedDomainExpiresAt: null,
-      carrierEndpoints: state.editDomainMode === null ? { TELECOM: [], UNICOM: [], MOBILE: [], EDUCATION: [] } : state.carrierEndpoints,
-      carrierPaths: state.editDomainMode === null ? null : state.carrierPaths,
-      engine: state.editDomainMode === null ? null : state.engine,
-      manualPort: state.editDomainMode === null ? "" : state.manualPort,
       portCheckId: null,
       portResult: null,
       replaceProbeResult: null,
@@ -239,12 +235,12 @@ export function reduceXrayQuickConfigFlow(
   }
   if (action.type === "TOGGLE_CARRIER_ENDPOINT" || action.type === "SET_CARRIER_PATHS") {
     if (action.type === "SET_CARRIER_PATHS" && XRAY_QUICK_CONFIG_CARRIERS.every(carrier =>
-      JSON.stringify(action.paths[carrier].map(path => path.hops)) === JSON.stringify(
-        state.carrierPaths?.[carrier].map(path => path.hops) ?? state.carrierEndpoints[carrier].map(key => [key]),
+      JSON.stringify(action.paths[carrier].map(path => [quickConfigEntryKeys(path), path.hops.slice(1)])) === JSON.stringify(
+        state.carrierPaths?.[carrier].map(path => [quickConfigEntryKeys(path), path.hops.slice(1)]) ?? state.carrierEndpoints[carrier].map(key => [[key], []]),
       ))) return state;
     const endpoints = { ...state.carrierEndpoints };
     if (action.type === "SET_CARRIER_PATHS") {
-      for (const carrier of XRAY_QUICK_CONFIG_CARRIERS) endpoints[carrier] = action.paths[carrier].flatMap(path => path.hops[0] ? [path.hops[0]] : []);
+      for (const carrier of XRAY_QUICK_CONFIG_CARRIERS) endpoints[carrier] = action.paths[carrier].flatMap(quickConfigEntryKeys);
     } else {
       const current = endpoints[action.carrier];
       endpoints[action.carrier] = current.includes(action.endpointKey) ? current.filter(key => key !== action.endpointKey) : [...current, action.endpointKey];
@@ -253,15 +249,13 @@ export function reduceXrayQuickConfigFlow(
       ...state,
       carrierEndpoints: endpoints,
       carrierPaths: action.type === "SET_CARRIER_PATHS" ? structuredClone(action.paths) : null,
-      engine: null,
-      manualPort: "",
       portCheckId: null,
       portResult: null,
       replaceProbeResult: replacementProbeResult(state),
       defaultCandidateIds: [],
       preview: null,
       applyResult: null,
-      furthestStepIndex: Math.min(state.furthestStepIndex, 1),
+      furthestStepIndex: Math.min(state.furthestStepIndex, 2),
     };
   }
   if (action.type === "SET_ENGINE") {
@@ -269,16 +263,13 @@ export function reduceXrayQuickConfigFlow(
     return {
       ...state,
       engine: action.engine,
-      manualPort: "",
       portCheckId: null,
       portResult: null,
       replaceProbeResult: replacementProbeResult(state),
       defaultCandidateIds: [],
       preview: null,
       applyResult: null,
-      furthestStepIndex: action.engine
-        ? Math.max(Math.min(state.furthestStepIndex, 2), 2)
-        : Math.min(state.furthestStepIndex, 2),
+      furthestStepIndex: Math.min(state.furthestStepIndex, 1),
     };
   }
   if (action.type === "SET_MANUAL_PORT") {
@@ -366,8 +357,8 @@ export function reduceXrayQuickConfigFlow(
   if (state.applyResult && action.step !== "APPLY") return state;
   if (index < 0 || index > state.furthestStepIndex + 1) return state;
   if (index >= 1 && !state.confirmedDomainToken) return state;
-  if (index >= 2 && !xrayQuickConfigCarriersComplete(state)) return state;
-  if (index >= 3 && !state.engine) return state;
+  if (index >= 2 && !state.engine) return state;
+  if (index >= 3 && !xrayQuickConfigCarriersComplete(state)) return state;
   if (index >= 4 && state.portResult?.status !== "SUCCESS") return state;
   if (index >= 5 && state.defaultCandidateIds.length === 0) return state;
   if (index >= 6 && !state.preview) return state;
