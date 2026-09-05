@@ -95,7 +95,7 @@ export function quickConfigPathEndpoint(key: string | null, hosts: readonly Xray
 }
 
 type PathIssueCode = "MISSING_PATH" | "MISSING_ENDPOINT" | "ENDPOINT_UNAVAILABLE"
-  | "REPEATED_HOST" | "LANDING_AS_RELAY" | "NEXT_HOP_CONFLICT" | "PATH_LIMIT" | "DUPLICATE_ENTRY";
+  | "REPEATED_HOST" | "LANDING_AS_RELAY" | "NEXT_HOP_CONFLICT" | "PATH_LIMIT" | "DUPLICATE_ENTRY" | "ADDRESS_FAMILY_UNSUPPORTED";
 export type QuickConfigPathIssue = {
   carrier: XrayQuickConfigCarrier; pathId: string | null; code: PathIssueCode; message: string;
 };
@@ -137,10 +137,12 @@ export function inspectQuickConfigPaths(paths: QuickConfigPaths, hosts: readonly
   for (const [hostId, entries] of listeners) {
     if (new Set(entries.map((entry) => entry.next)).size < 2) continue;
     const hostName = hosts.find((host) => host.hostId === hostId)?.name ?? `Host #${hostId}`;
+    const locations = [...new Set(entries.map(entry => `${QUICK_CONFIG_CARRIER_LABELS[entry.carrier]}路径 ${paths[entry.carrier].findIndex(path => path.id === entry.pathId) + 1}`))].join("、");
     for (const entry of entries) issues.push({ ...entry, code: "NEXT_HOP_CONFLICT",
-      message: `${hostName} 的下一跳不一致。同一服务器共用监听，不能按运营商或 IPv4/IPv6 分流到不同下一跳。请统一后续路径或改用其他服务器。` });
+      message: `${hostName} 的下一跳不一致（${locations}）。同一服务器共用监听，请统一后续路径或改用其他服务器。` });
   }
   if (listeners.size > 64) issues.push({ carrier: "TELECOM", pathId: null, code: "PATH_LIMIT", message: "一个快速配置最多使用 64 台转发服务器" });
+  if (dnsEntries.length > 64) issues.push({ carrier: "TELECOM", pathId: null, code: "PATH_LIMIT", message: "四类运营商合计最多 64 个入口地址（双栈计两个地址）" });
   return { issues, dnsEntries, uniqueForwardHostCount: listeners.size };
 }
 
