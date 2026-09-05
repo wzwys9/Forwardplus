@@ -30,6 +30,29 @@ test("one dual-stack ingress expands to two DNS routes with the same suffix and 
   assert.equal(path.entryFamilies!.length, 2);
 });
 
+test("the per-carrier 32-address limit counts both families of each dual-stack ingress", () => {
+  const catalog: XrayQuickConfigEntryHost[] = Array.from({ length: 17 }, (_, index) => ({
+    hostId: index + 1, name: `Host ${index + 1}`, eligible: true, disabledReasonCode: null,
+    endpoints: [{ addressFamily: "IPV4", address: `8.8.8.${index + 1}` },
+      { addressFamily: "IPV6", address: `2606:4700::${(index + 1).toString(16)}` }],
+  }));
+  const paths = emptyQuickConfigPaths();
+  paths.TELECOM = Array.from({ length: 16 }, (_, index) => ({
+    id: `telecom-${index}`, hops: [`${index + 1}:IPV4`], entryFamilies: ["IPV4", "IPV6"],
+  }));
+  for (const carrier of ["UNICOM", "MOBILE", "EDUCATION"] as const) {
+    paths[carrier] = [{ id: carrier, hops: ["1:IPV4"] }];
+  }
+  assert.equal(paths.TELECOM.flatMap(quickConfigPathInputs).length, 32);
+  assert.deepEqual(inspectQuickConfigPaths(paths, catalog).issues, []);
+
+  paths.TELECOM.push({ id: "telecom-16", hops: ["17:IPV4"], entryFamilies: ["IPV4", "IPV6"] });
+  const inspected = inspectQuickConfigPaths(paths, catalog);
+  assert.equal(inspected.dnsEntries.length, 37, "the global 64-address limit has not been reached");
+  assert.equal(paths.TELECOM.flatMap(quickConfigPathInputs).length, 34);
+  assert.ok(inspected.issues.some(issue => issue.carrier === "TELECOM" && issue.code === "PATH_LIMIT"));
+});
+
 test("legacy IPv4/IPv6 merge only when their ordered suffixes match", () => {
   const paths = emptyQuickConfigPaths();
   paths.TELECOM = [{ id: "v4", hops: ["1:IPV4", "2:IPV4"] }, { id: "v6", hops: ["1:IPV6", "2:IPV4"] }];

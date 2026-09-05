@@ -32,3 +32,12 @@ test("IPv4-only entry can be selected while a dual-stack bridge is still needed,
   paths.TELECOM[0].hops.push("2:IPV4");
   assert.equal(inspectQuickConfigPathDraft(paths, hosts, v6Target, "realm").issues.some(issue => issue.pathId === "t"), false);
 });
+
+test("repairing one of three conflicting paths is allowed while the other two remain invalid", () => {
+  const paths = emptyQuickConfigPaths();
+  paths.TELECOM = [{ id: "t", hops: ["1:IPV4", "2:IPV4"] }];
+  paths.UNICOM = [{ id: "u", hops: ["1:IPV4", "3:IPV4"] }];
+  paths.MOBILE = [{ id: "m", hops: ["1:IPV4", "4:IPV4"] }];
+  const extra = { ...hosts[0], hostId: 5, name: "Host 5" };
+  assert.equal(quickConfigPathActionReason(paths, "TELECOM", "t", { type: "SET", index: 0, endpointKey: "5:IPV4" }, [...hosts, extra], target, "realm"), null);
+});

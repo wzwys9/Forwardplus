@@ -102,12 +102,17 @@ export type QuickConfigPathIssue = {
 
 /** A draft consistency check, NOT a port probe or proof of network reachability. */
 export function inspectQuickConfigPaths(paths: QuickConfigPaths, hosts: readonly XrayQuickConfigEntryHost[], landingHostId?: number) {
+  const endpointByKey = new Map(hosts.flatMap(host => host.endpoints.map(endpoint => [
+    xrayQuickConfigEndpointKey(host.hostId, endpoint.addressFamily),
+    { ...endpoint, hostId: host.hostId, hostName: host.name, eligible: host.eligible },
+  ] as const)));
   const issues: QuickConfigPathIssue[] = [];
   const dnsEntries: Array<{ carrier: XrayQuickConfigCarrier; pathId: string; addressFamily: "IPV4" | "IPV6"; address: string }> = [];
   const listeners = new Map<number, Array<{ next: string; carrier: XrayQuickConfigCarrier; pathId: string }>>();
   for (const carrier of XRAY_QUICK_CONFIG_CARRIERS) {
     if (paths[carrier].length > 32 || Object.values(paths).flat().length > 64) issues.push({ carrier, pathId: null, code: "PATH_LIMIT", message: "每类最多 32 条路径，四类合计最多 64 条" });
     const ingress = new Set<string>();
+    if (paths[carrier].flatMap(quickConfigEntryKeys).length > 32) issues.push({ carrier, pathId: null, code: "PATH_LIMIT", message: "每类运营商最多 32 个入口地址（双栈计两个地址）" });
     if (paths[carrier].length === 0) issues.push({ carrier, pathId: null, code: "MISSING_PATH", message: "尚未添加路径" });
     for (const path of paths[carrier].flatMap(expandedPaths)) {
       const addIssue = (code: PathIssueCode, message: string) => issues.push({ carrier, pathId: path.id, code, message });
@@ -116,7 +121,7 @@ export function inspectQuickConfigPaths(paths: QuickConfigPaths, hosts: readonly
       if (path.hops[0]) ingress.add(path.hops[0]);
       const seen = new Set<number>();
       path.hops.forEach((key, index) => {
-        const endpoint = quickConfigPathEndpoint(key, hosts);
+        const endpoint = key ? endpointByKey.get(key) : null;
         if (!key) { addIssue("MISSING_ENDPOINT", `请为${index === 0 ? "入口" : `中转 ${index}`}选择服务器与地址`); return; }
         if (!endpoint || !endpoint.eligible) { addIssue("ENDPOINT_UNAVAILABLE", "所选服务器离线、地址失效或暂不可用，请重新选择"); return; }
         if (seen.has(endpoint.hostId)) addIssue("REPEATED_HOST", "同一路径不能重复经过同一服务器（IPv4/IPv6 也视为同一台）");

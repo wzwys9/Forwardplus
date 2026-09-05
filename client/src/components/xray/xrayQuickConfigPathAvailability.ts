@@ -43,7 +43,16 @@ const identity = (issue: QuickConfigPathIssue) => `${issue.carrier}:${issue.path
 export function quickConfigPathActionReason(paths: QuickConfigPaths, carrier: XrayQuickConfigCarrier, pathId: string,
   action: QuickConfigPathAction, hosts: readonly XrayQuickConfigEntryHost[], target: XrayQuickConfigTarget,
   engine?: XrayQuickConfigEngine | null): string | null {
+  return createQuickConfigPathActionChecker(paths, carrier, pathId, hosts, target, engine)(action);
+}
+
+export function createQuickConfigPathActionChecker(paths: QuickConfigPaths, carrier: XrayQuickConfigCarrier, pathId: string,
+  hosts: readonly XrayQuickConfigEntryHost[], target: XrayQuickConfigTarget, engine?: XrayQuickConfigEngine | null) {
   const path = paths[carrier].find(item => item.id === pathId);
+  const previous = new Set(inspectQuickConfigPaths(paths, hosts, target.host?.id).issues.map(identity));
+  const before = new Set(path && engine ? familyIssues(path, hosts, target, engine).map(issue => `${issue.index}:${issue.message}`) : []);
+  const cache = new Map<string, string | null>();
+  const check = (action: QuickConfigPathAction): string | null => {
   if (!path) return "路径已不存在";
   const changed = changeQuickConfigPath(path, action);
   if (action.type === "SET") {
@@ -51,12 +60,11 @@ export function quickConfigPathActionReason(paths: QuickConfigPaths, carrier: Xr
     if (!endpoint?.eligible) return "服务器离线、引擎不兼容或地址不可用";
   }
   const nextPaths = { ...paths, [carrier]: paths[carrier].map(item => item.id === pathId ? changed : item) };
-  const previous = new Set(inspectQuickConfigPaths(paths, hosts, target.host?.id).issues.map(identity));
   const structural = inspectQuickConfigPaths(nextPaths, hosts, target.host?.id).issues.find(issue =>
+    (issue.code === "PATH_LIMIT" || issue.carrier === carrier && issue.pathId === pathId) &&
     issue.code !== "MISSING_ENDPOINT" && issue.code !== "MISSING_PATH" && !previous.has(identity(issue)));
   if (structural) return structural.message;
   if (!engine) return null;
-  const before = new Set(familyIssues(path, hosts, target, engine).map(issue => `${issue.index}:${issue.message}`));
   const failures = familyIssues(changed, hosts, target, engine).filter(issue => !before.has(`${issue.index}:${issue.message}`));
   if (!failures.length) return null;
   // A process engine can complete an unfinished last leg by adding a dual-stack
@@ -71,4 +79,10 @@ export function quickConfigPathActionReason(paths: QuickConfigPaths, carrier: Xr
     if (canBridge) return null;
   }
   return failures[0].message;
+  };
+  return (action: QuickConfigPathAction) => {
+    const key = JSON.stringify(action);
+    if (!cache.has(key)) cache.set(key, check(action));
+    return cache.get(key)!;
+  };
 }
