@@ -710,6 +710,8 @@ type QuickConfigDetail = QuickConfigSummary & {
 
 ### 19.2 域名检查与确认
 
+MAINT-029：以下十分钟确认期限不再表示用户必须返回向导第一步。服务端确认消费点可以重新验证过期 DOMAIN_CONFIRMED 的签名及原授权，实时重查全部 revision、域名占用和远端集合，相同才继续；不延长未确认 DOMAIN_CHECK 或 probe/preview 的期限。token 字节不变，保留 probe 的域名 hash 绑定。双栈 UI 展开为现有多个 endpoint，新增引擎前置目录允许 `forwardEngines({entries:[]})` 仅查询全局开关；entryHostsList 可选 engine 参数按引擎返回安全禁用原因。旧调用兼容。
+
 `xray.quickConfigs.domainChecksCreate` 输入：
 
 ```ts
