@@ -79,7 +79,7 @@ export async function listXrayQuickConfigForwardEngines(input: {
   const q = quoteIdentifier;
   const ids = inList(hostIds);
   const [entryHostCatalog, protocolSettings, versionRows] = await Promise.all([
-    listXrayQuickConfigEntryHosts(),
+    hostIds.length ? listXrayQuickConfigEntryHosts() : Promise.resolve({ items: [] }),
     getForwardProtocolSettings(),
     hostIds.length ? queryRaw<Row>(
       `SELECT ${q("id")}, ${q("agentVersion")}, ${q("agentDistribution")} FROM ${q("hosts")} WHERE ${q("id")} IN ${ids.sql}`,

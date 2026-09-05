@@ -364,7 +364,7 @@ function EngineStep(props: {
   lockedEngine?: XrayQuickConfigEngine;
 }) {
   const selectedItem = props.catalog?.items.find((item) => item.engine === props.selected);
-  const canContinue = !!selectedItem?.eligible;
+  const canContinue = !!selectedItem?.eligible && !props.loading && !props.error;
   return (
     <div className="space-y-5">
       <div><h3 className="font-semibold">选择统一转发引擎</h3><p className="mt-1 text-sm text-muted-foreground">{props.lockedEngine ? "编辑拓扑时保持当前引擎；如需更换，请先退出并使用详情页的“切换引擎”。" : "先选择本次统一使用的引擎，下一步会根据引擎和已选路径禁用不兼容服务器；未使用的服务器不会影响选择。"}</p></div>

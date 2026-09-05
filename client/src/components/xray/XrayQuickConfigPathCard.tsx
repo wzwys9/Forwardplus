@@ -41,7 +41,7 @@ function EndpointPicker(props: {
         className="h-11 min-w-0 aria-pressed:border-primary aria-pressed:bg-primary/5"
         aria-label={`${props.label.trim()} 使用 ${family === "IPV4" ? "IPv4" : "IPv6"}`}
         aria-pressed={props.entryKeys ? props.entryKeys.includes(xrayQuickConfigEndpointKey(host.hostId, family)) : selected?.addressFamily === family}
-        disabled={!host.endpoints.some((endpoint) => endpoint.addressFamily === family) || !!props.familyReason(family)}
+        disabled={!host.eligible || !host.endpoints.some((endpoint) => endpoint.addressFamily === family) || !!props.familyReason(family)}
         onClick={() => props.onToggleFamily ? props.onToggleFamily(family) : props.onChange(xrayQuickConfigEndpointKey(host.hostId, family))}>
         {family === "IPV4" ? "IPv4" : "IPv6"}
       </Button>)}
