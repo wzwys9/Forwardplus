@@ -707,7 +707,7 @@ function signDomainToken(payload: DomainTokenPayload, key: Buffer): string {
   return `${unsigned}.${crypto.createHmac("sha256", key).update(unsigned, "utf8").digest("base64url")}`;
 }
 
-function parseDomainToken(raw: string, kind: TokenKind, key: Buffer, now: Date): DomainTokenPayload {
+function parseDomainToken(raw: string, kind: TokenKind, key: Buffer, now: Date, revalidateExpiredConfirmation = false): DomainTokenPayload {
   const invalidCode = kind === "DOMAIN_CHECK" ? "DOMAIN_CHECK_INVALID" : "DOMAIN_CONFIRMATION_INVALID";
   const expiredCode = kind === "DOMAIN_CHECK" ? "DOMAIN_CHECK_EXPIRED" : "DOMAIN_CONFIRMATION_EXPIRED";
   if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > MAX_TOKEN_BYTES) fail(invalidCode);
@@ -743,7 +743,7 @@ function parseDomainToken(raw: string, kind: TokenKind, key: Buffer, now: Date):
   if (hasEditId !== hasEditRevision
     || hasEditId && (!Number.isSafeInteger(value.editQuickConfigId) || Number(value.editQuickConfigId) <= 0
       || !Number.isSafeInteger(value.editExpectedRevision) || Number(value.editExpectedRevision) <= 0)) fail(invalidCode);
-  if (Number(value.expiresAt) <= now.getTime()) fail(expiredCode);
+  if (Number(value.expiresAt) <= now.getTime() && !(kind === "DOMAIN_CONFIRMED" && revalidateExpiredConfirmation)) fail(expiredCode);
   if (Number(value.issuedAt) > now.getTime() + 30_000 || Number(value.expiresAt) - Number(value.issuedAt)
     > (kind === "DOMAIN_CHECK" ? DOMAIN_CHECK_TTL_MS : DOMAIN_CONFIRMED_TTL_MS)) fail(invalidCode);
   return value as unknown as DomainTokenPayload;
@@ -910,7 +910,11 @@ export async function resolveConfirmedQuickConfigDomain(input: {
   try {
     const now = resolvedNow(options);
     const key = tokenKey(options.tokenSecret);
-    const payload = parseDomainToken(input.confirmedDomainToken, "DOMAIN_CONFIRMED", key, now);
+    // An expired confirmation is only evidence of the previously approved set.
+    // Every consumer below rechecks identity, revisions, ownership and the full
+    // remote set before returning a usable domain. Keep its bytes unchanged so
+    // existing short-lived probe hashes still bind to the same confirmation.
+    const payload = parseDomainToken(input.confirmedDomainToken, "DOMAIN_CONFIRMED", key, now, true);
     const userId = positiveSafeInteger(input.userId, "DOMAIN_CONFIRMATION_INVALID");
     if (payload.userId !== userId || !payload.action) fail("DOMAIN_CONFIRMATION_INVALID");
     const targetRef: QuickConfigTargetRef = {
