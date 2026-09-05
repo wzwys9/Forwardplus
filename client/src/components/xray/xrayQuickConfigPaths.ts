@@ -8,11 +8,12 @@ export const QUICK_CONFIG_HOP_LIMIT = 9; // One ingress and up to eight relays.
 export const QUICK_CONFIG_CARRIER_LABELS: Record<XrayQuickConfigCarrier, string> = {
   TELECOM: "电信", UNICOM: "联通", MOBILE: "移动", EDUCATION: "教育网",
 };
-export type QuickConfigPath = { id: string; hops: Array<string | null> };
+export type QuickConfigPath = { id: string; hops: Array<string | null>; entryFamilies?: Array<"IPV4" | "IPV6"> };
 export type QuickConfigPaths = Record<XrayQuickConfigCarrier, QuickConfigPath[]>;
 export type QuickConfigPathAction =
   | { type: "ADD" }
   | { type: "SET"; index: number; endpointKey: string }
+  | { type: "TOGGLE_ENTRY_FAMILY"; family: "IPV4" | "IPV6" }
   | { type: "REMOVE"; index: number }
   | { type: "MOVE"; index: number; direction: -1 | 1 };
 
@@ -21,17 +22,57 @@ export function emptyQuickConfigPaths(): QuickConfigPaths {
 }
 
 export function copyQuickConfigPath(path: QuickConfigPath, id: string): QuickConfigPath {
-  return { id, hops: [...path.hops] };
+  return { ...path, id, hops: [...path.hops], ...(path.entryFamilies ? { entryFamilies: [...path.entryFamilies] } : {}) };
+}
+
+export function quickConfigEntryKeys(path: QuickConfigPath): string[] {
+  const match = path.hops[0]?.match(/^([1-9]\d*):(IPV4|IPV6)$/);
+  if (!match) return [];
+  return (path.entryFamilies ?? [match[2] as "IPV4" | "IPV6"]).map(family => `${match[1]}:${family}`);
+}
+
+function expandedPaths(path: QuickConfigPath): QuickConfigPath[] {
+  const entries = quickConfigEntryKeys(path);
+  return entries.length ? entries.map(key => ({ id: path.id, hops: [key, ...path.hops.slice(1)] })) : [path];
+}
+
+export function mergeQuickConfigPaths(paths: QuickConfigPaths): QuickConfigPaths {
+  const result = emptyQuickConfigPaths();
+  for (const carrier of XRAY_QUICK_CONFIG_CARRIERS) {
+    for (const path of paths[carrier]) {
+      const keys = quickConfigEntryKeys(path);
+      const existing = result[carrier].find(item => keys.length > 0
+        && item.hops[0]?.split(":")[0] === path.hops[0]?.split(":")[0]
+        && JSON.stringify(item.hops.slice(1)) === JSON.stringify(path.hops.slice(1))
+        && !quickConfigEntryKeys(item).some(key => keys.includes(key)));
+      if (existing) existing.entryFamilies = [...quickConfigEntryKeys(existing), ...keys]
+        .map(key => key.split(":")[1] as "IPV4" | "IPV6").sort();
+      else result[carrier].push(copyQuickConfigPath(path, path.id));
+    }
+  }
+  return result;
 }
 
 export function changeQuickConfigPath(path: QuickConfigPath, action: QuickConfigPathAction): QuickConfigPath {
   const hops = [...path.hops];
+  if (action.type === "TOGGLE_ENTRY_FAMILY") {
+    const keys = quickConfigEntryKeys(path);
+    if (!keys.length) return path;
+    const families = keys.map(key => key.split(":")[1] as "IPV4" | "IPV6");
+    if (families.length === 1 && families.includes(action.family)) return path;
+    const entryFamilies = families.includes(action.family) ? families.filter(family => family !== action.family) : [...families, action.family].sort();
+    hops[0] = `${keys[0].split(":")[0]}:${entryFamilies[0]}`;
+    return { ...path, hops, entryFamilies };
+  }
   if (action.type === "ADD") {
     if (hops.length >= QUICK_CONFIG_HOP_LIMIT) return path;
     hops.push(null);
   } else {
     if (action.index < 0 || action.index >= hops.length) return path;
-    if (action.type === "SET") hops[action.index] = action.endpointKey;
+    if (action.type === "SET") {
+      hops[action.index] = action.endpointKey;
+      if (action.index === 0) return { ...path, hops, entryFamilies: [action.endpointKey.split(":")[1] as "IPV4" | "IPV6"] };
+    }
     else {
       if (action.index === 0) return path;
       if (action.type === "REMOVE") hops.splice(action.index, 1);
@@ -68,7 +109,7 @@ export function inspectQuickConfigPaths(paths: QuickConfigPaths, hosts: readonly
     if (paths[carrier].length > 32 || Object.values(paths).flat().length > 64) issues.push({ carrier, pathId: null, code: "PATH_LIMIT", message: "每类最多 32 条路径，四类合计最多 64 条" });
     const ingress = new Set<string>();
     if (paths[carrier].length === 0) issues.push({ carrier, pathId: null, code: "MISSING_PATH", message: "尚未添加路径" });
-    for (const path of paths[carrier]) {
+    for (const path of paths[carrier].flatMap(expandedPaths)) {
       const addIssue = (code: PathIssueCode, message: string) => issues.push({ carrier, pathId: path.id, code, message });
       if (!path.hops.length || path.hops.length > 9) addIssue("PATH_LIMIT", "每条路径需要入口，且最多 8 个中转");
       if (path.hops[0] && ingress.has(path.hops[0])) addIssue("DUPLICATE_ENTRY", "同一运营商不能重复添加相同入口地址，请修改已有路径");
@@ -106,7 +147,7 @@ export function inspectQuickConfigPaths(paths: QuickConfigPaths, hosts: readonly
 export function quickConfigPathsFromEntries(entries: Record<XrayQuickConfigCarrier, string[]>): QuickConfigPaths {
   const paths = emptyQuickConfigPaths();
   for (const carrier of XRAY_QUICK_CONFIG_CARRIERS) paths[carrier] = entries[carrier].map((key, index) => ({ id: `${carrier}-${index}`, hops: [key] }));
-  return paths;
+  return mergeQuickConfigPaths(paths);
 }
 
 export function quickConfigPathInput(path: QuickConfigPath) {
@@ -118,4 +159,8 @@ export function quickConfigPathInput(path: QuickConfigPath) {
   }
   if (!hops.length || hops.length > 9) return null;
   return { ...hops[0], ...(hops.length > 1 ? { relays: hops.slice(1) } : {}) };
+}
+
+export function quickConfigPathInputs(path: QuickConfigPath) {
+  return expandedPaths(path).map(quickConfigPathInput);
 }

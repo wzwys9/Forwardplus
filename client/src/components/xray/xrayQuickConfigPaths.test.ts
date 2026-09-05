@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   changeQuickConfigPath, copyQuickConfigPath, emptyQuickConfigPaths,
   inspectQuickConfigPaths, type QuickConfigPath,
+  quickConfigPathInputs, mergeQuickConfigPaths,
 } from "./xrayQuickConfigPaths";
 import type { XrayQuickConfigEntryHost } from "./xrayQuickConfigFlow";
 
@@ -11,6 +12,33 @@ const hosts: XrayQuickConfigEntryHost[] = [1, 2, 3, 4].map((hostId) => ({
   endpoints: [{ addressFamily: "IPV4", address: `192.0.2.${hostId}` },
     { addressFamily: "IPV6", address: `2001:db8::${hostId}` }],
 }));
+
+test("one dual-stack ingress expands to two DNS routes with the same suffix and one listener", () => {
+  const path: QuickConfigPath = { id: "dual", hops: ["1:IPV4", "2:IPV6"], entryFamilies: ["IPV4", "IPV6"] };
+  assert.deepEqual(quickConfigPathInputs(path), [
+    { hostId: 1, addressFamily: "IPV4", relays: [{ hostId: 2, addressFamily: "IPV6" }] },
+    { hostId: 1, addressFamily: "IPV6", relays: [{ hostId: 2, addressFamily: "IPV6" }] },
+  ]);
+  const paths = emptyQuickConfigPaths();
+  for (const carrier of Object.keys(paths) as Array<keyof typeof paths>) paths[carrier] = [path];
+  const inspected = inspectQuickConfigPaths(paths, hosts, 4);
+  assert.equal(inspected.dnsEntries.length, 8);
+  assert.equal(inspected.uniqueForwardHostCount, 2);
+  assert.deepEqual(inspected.issues, []);
+  const copy = copyQuickConfigPath(path, "copy");
+  copy.entryFamilies!.pop();
+  assert.equal(path.entryFamilies!.length, 2);
+});
+
+test("legacy IPv4/IPv6 merge only when their ordered suffixes match", () => {
+  const paths = emptyQuickConfigPaths();
+  paths.TELECOM = [{ id: "v4", hops: ["1:IPV4", "2:IPV4"] }, { id: "v6", hops: ["1:IPV6", "2:IPV4"] }];
+  const merged = mergeQuickConfigPaths(paths);
+  assert.equal(merged.TELECOM.length, 1);
+  assert.deepEqual(merged.TELECOM[0].entryFamilies, ["IPV4", "IPV6"]);
+  paths.TELECOM[1].hops[1] = "3:IPV4";
+  assert.equal(mergeQuickConfigPaths(paths).TELECOM.length, 2);
+});
 
 test("路径增删改与触控排序不修改入口或原草稿，复制后独立编辑", () => {
   const original: QuickConfigPath = { id: "one", hops: ["1:IPV4", "2:IPV4", "3:IPV6"] };
