@@ -400,25 +400,46 @@ export class DnsPodProviderClient {
   }
 
   async listRecords(input: { zone: DnsPodZone; subdomain?: string; recordType?: string }): Promise<DnsPodRecord[]> {
+    const budget = { remainingPages: this.maxPages };
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const records = await this.listRecordSnapshot(input, budget);
+      if (records !== null) return records;
+      if (attempt < 2 && budget.remainingPages > 0) await this.sleep(400 * (2 ** attempt));
+      else break;
+    }
+    invalidResponse();
+  }
+
+  private async listRecordSnapshot(
+    input: { zone: DnsPodZone; subdomain?: string; recordType?: string },
+    budget: { remainingPages: number },
+  ): Promise<DnsPodRecord[] | null> {
     const records = new Map<string, DnsPodRecord>();
     let offset = 0;
-    for (let page = 0; page < this.maxPages; page += 1) {
+    let expectedTotal: number | undefined;
+    while (budget.remainingPages > 0) {
+      budget.remainingPages -= 1;
       const payload: DnsPodObject = { ...zonePayload(input.zone), Offset: offset, Limit: PAGE_SIZE, ErrorOnEmpty: "no" };
       if (input.subdomain !== undefined) payload.SubDomain = normalizedSubdomain(input.subdomain);
       if (input.recordType !== undefined) payload.RecordType = safeRequestString(input.recordType, 16).toUpperCase();
       const response = await this.call("DescribeRecordList", payload);
-      if (!Array.isArray(response.RecordList) || response.RecordList.length > PAGE_SIZE) invalidResponse();
       const totalInfo = object(response.RecordCountInfo);
-      const total = nonnegativeInteger(totalInfo.TotalCount ?? totalInfo.ListCount ?? response.RecordList.length);
-      const batch = response.RecordList.map((entry) => this.normalizeListedRecord(entry));
+      if (typeof totalInfo.TotalCount !== "number") invalidResponse();
+      const total = nonnegativeInteger(totalInfo.TotalCount);
+      const recordList = response.RecordList === null && total === 0 ? [] : response.RecordList;
+      if (!Array.isArray(recordList) || recordList.length > PAGE_SIZE) invalidResponse();
+      const batch = recordList.map((entry) => this.normalizeListedRecord(entry));
+      // A concurrent delete or lagging index can invalidate pagination. Discard
+      // the entire attempt; never expose a partial snapshot as an empty domain.
+      if (expectedTotal !== undefined && total !== expectedTotal) return null;
+      expectedTotal = total;
       for (const record of batch) {
-        const previous = records.get(record.providerRecordId);
-        if (previous && JSON.stringify(previous) !== JSON.stringify(record)) invalidResponse();
+        if (records.has(record.providerRecordId)) return null;
         records.set(record.providerRecordId, record);
       }
       offset += batch.length;
-      if (offset >= total) return [...records.values()];
-      if (batch.length < PAGE_SIZE) invalidResponse();
+      if (offset === total) return [...records.values()];
+      if (offset > total || batch.length < PAGE_SIZE) return null;
     }
     invalidResponse();
   }

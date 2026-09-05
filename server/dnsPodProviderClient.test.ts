@@ -206,6 +206,69 @@ test("catalog, record listing, and CRUD preserve the dynamic DNSPod line id", as
   assert.equal(byAction.get("DeleteRecord")?.RecordId, 771);
 });
 
+test("empty record lists require explicit valid counts and tolerate the null empty container", async () => {
+  const zone = { providerZoneId: "42", name: "example.com", grade: "DP_FREE" };
+  for (const RecordList of [[], null]) {
+    const client = clientWith((async () => dnsPodResponse({
+      RecordList, RecordCountInfo: { TotalCount: 0, ListCount: 0 }, RequestId: "empty-list",
+    })) as typeof fetch);
+    assert.deepEqual(await client.listRecords({ zone }), []);
+  }
+  for (const invalid of [
+    { RecordList: null, RecordCountInfo: { TotalCount: 1 } },
+    { RecordCountInfo: { TotalCount: 0 } },
+    { RecordList: [], RecordCountInfo: null },
+    { RecordList: {}, RecordCountInfo: { TotalCount: 0 } },
+    { RecordList: [], RecordCountInfo: {} },
+    { RecordList: [], RecordCountInfo: { TotalCount: null } },
+    { RecordList: [], RecordCountInfo: { TotalCount: false } },
+    { RecordList: [], RecordCountInfo: { ListCount: 0 } },
+  ]) {
+    const client = clientWith((async () => dnsPodResponse({ ...invalid, RequestId: "invalid-list" })) as typeof fetch);
+    await assert.rejects(client.listRecords({ zone }), { code: "DNS_PROVIDER_INVALID_RESPONSE" });
+  }
+  const missingTotal = clientWith((async () => dnsPodResponse({
+    RecordList: Array.from({ length: 100 }, (_, index) => ({
+      RecordId: index + 1, Name: "edge", Type: "A", LineId: "0", Line: "默认", Value: "1.1.1.1", TTL: 600,
+    })), RecordCountInfo: { ListCount: 100 }, RequestId: "missing-total",
+  })) as typeof fetch);
+  await assert.rejects(missingTotal.listRecords({ zone }), { code: "DNS_PROVIDER_INVALID_RESPONSE" });
+});
+
+test("record listing restarts a temporarily incomplete post-delete snapshot without returning partial data", async () => {
+  const zone = { providerZoneId: "42", name: "example.com", grade: "DP_FREE" };
+  const offsets: number[] = [];
+  const record = (RecordId: number) => ({ RecordId, Name: "edge", Type: "A", LineId: "0", Line: "默认", Value: "1.1.1.1", TTL: 600 });
+  const client = clientWith((async (_url, init) => {
+    offsets.push(Number(requestPayload(init).Offset));
+    const index = offsets.length;
+    return dnsPodResponse({
+      RecordList: index === 1 ? Array.from({ length: 100 }, (_, i) => record(i + 1)) : [],
+      RecordCountInfo: { TotalCount: index === 3 ? 0 : 101 }, RequestId: "post-delete-list",
+    });
+  }) as typeof fetch);
+  assert.deepEqual(await client.listRecords({ zone }), []);
+  assert.deepEqual(offsets, [0, 100, 0]);
+
+  let calls = 0;
+  const incomplete = clientWith((async () => {
+    calls += 1;
+    return dnsPodResponse({ RecordList: [], RecordCountInfo: { TotalCount: 1 }, RequestId: "still-incomplete" });
+  }) as typeof fetch);
+  await assert.rejects(incomplete.listRecords({ zone }), { code: "DNS_PROVIDER_INVALID_RESPONSE" });
+  assert.equal(calls, 3);
+});
+
+test("record snapshot retries share the original page limit", async () => {
+  let calls = 0;
+  const client = clientWith((async () => {
+    calls += 1;
+    return dnsPodResponse({ RecordList: [], RecordCountInfo: { TotalCount: 1 }, RequestId: "bounded-list" });
+  }) as typeof fetch, { maxPages: 2 });
+  await assert.rejects(client.listRecords({ zone: { providerZoneId: "42", name: "example.com", grade: "DP_FREE" } }), { code: "DNS_PROVIDER_INVALID_RESPONSE" });
+  assert.equal(calls, 2);
+});
+
 test("a DNSPod-invalid deleted record id is normalized as a missing record without leaking provider details", async () => {
   const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
     assert.equal(requestAction(init), "DescribeRecord");
