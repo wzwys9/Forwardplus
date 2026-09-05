@@ -21,6 +21,10 @@ test("persisted multihop sync restores every segment and protects relay hosts wi
       try {
         await runtime.connectDatabase({type:"sqlite",sqlite:{path:process.env.FORWARDPLUS_TEST_DB}});
         await schema.ensureDatabaseSchema();
+        const { listXrayQuickConfigForwardEngines } = await import("./server/xrayQuickConfigForwardEngineService.ts");
+        const globalEngines = await listXrayQuickConfigForwardEngines({ entries: [] });
+        assert.equal(globalEngines.items.length, 6);
+        assert.equal(globalEngines.items.find(item => item.engine === "realm").eligible, true);
         await insert("users",{id:1,username:"fixture",password:"hash",role:"admin"});
         for (const id of [1,2]) await insert("hosts",{id,name:"Host "+id,ip:id===1?"8.8.8.8":"1.1.1.1",userId:1});
         await insert("global_port_allocations",{id:1,allocationTag:"port:5326",port:5326,status:"ACTIVE",primaryOwnerType:"QUICK_CONFIG",primaryOwnerTag:"quick-config:test",version:1});

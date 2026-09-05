@@ -50,7 +50,7 @@ function invalidSelection(): never {
 }
 
 function normalizeSelections(value: readonly XrayQuickConfigForwardEngineSelection[]): NormalizedSelection[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 128) invalidSelection();
+  if (!Array.isArray(value) || value.length > 128) invalidSelection();
   const unique = new Map<string, NormalizedSelection>();
   for (const item of value) {
     const hostId = Number(item?.hostId);
@@ -81,10 +81,10 @@ export async function listXrayQuickConfigForwardEngines(input: {
   const [entryHostCatalog, protocolSettings, versionRows] = await Promise.all([
     listXrayQuickConfigEntryHosts(),
     getForwardProtocolSettings(),
-    queryRaw<Row>(
+    hostIds.length ? queryRaw<Row>(
       `SELECT ${q("id")}, ${q("agentVersion")}, ${q("agentDistribution")} FROM ${q("hosts")} WHERE ${q("id")} IN ${ids.sql}`,
       ids.params,
-    ),
+    ) : Promise.resolve([] as Row[]),
   ]);
   const entryHosts = new Map(entryHostCatalog.items.map((host) => [host.hostId, host]));
   const agentIdentities = new Map(versionRows.map((row) => [Number(row.id), {

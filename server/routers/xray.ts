@@ -969,7 +969,7 @@ export const xrayRouter = router({
   quickConfigs: router({
     entryHostsList: xrayQuickConfigEntryHostsListProcedure,
     forwardEngines: adminProcedure
-      .input(z.object({ entries: z.array(quickConfigEndpoint).min(1).max(128) }).strict())
+      .input(z.object({ entries: z.array(quickConfigEndpoint).max(128) }).strict())
       .query(async ({ input }) => {
         try {
           return await listXrayQuickConfigForwardEngines(input);

@@ -4,12 +4,16 @@ import { isPresenceCapableHostConfirmedOffline } from "./agentFastLiveness";
 import { quoteIdentifier } from "./dbCompat";
 import { queryRaw } from "./dbRuntime";
 import { HOST_ONLINE_TTL_MS } from "./hostHeartbeatPolicy";
+import { isForwardplusAgentVersionAtLeast } from "./agentRouteUtils";
+import { getForwardProtocolSettings } from "./forwardProtocolSettings";
+import { XRAY_QUICK_CONFIG_FORWARD_ENGINE_MIN_AGENT_VERSION, type XrayQuickConfigForwardEngine } from "../shared/xrayQuickConfigForwardEngines";
 
 export const QUICK_CONFIG_ENTRY_HOST_DISABLED_REASON_CODES = [
   "HOST_OFFLINE",
   "AGENT_CAPABILITY_MISSING",
   "UDP_CAPABILITY_REQUIRED",
   "QUICK_CONFIG_HOST_UNAVAILABLE",
+  "FORWARD_PROTOCOL_DISABLED",
 ] as const;
 
 export type QuickConfigEntryHostDisabledReasonCode =
@@ -154,10 +158,11 @@ function hostDisabledReason(
   return null;
 }
 
-export async function listXrayQuickConfigEntryHosts(): Promise<{ items: QuickConfigEntryHost[] }> {
+export async function listXrayQuickConfigEntryHosts(engine?: XrayQuickConfigForwardEngine): Promise<{ items: QuickConfigEntryHost[] }> {
   const q = quoteIdentifier;
   const rows = await queryRaw<EntryHostRow>(
       `SELECT h.${q("id")} AS ${q("hostId")}, h.${q("name")} AS ${q("hostName")},
+          h.${q("agentVersion")} AS ${q("agentVersion")}, h.${q("agentDistribution")} AS ${q("agentDistribution")},
           h.${q("ip")} AS ${q("primaryAddress")}, h.${q("ipv4")} AS ${q("ipv4")},
           h.${q("ipv6")} AS ${q("ipv6")}, h.${q("isOnline")} AS ${q("isOnline")},
           h.${q("lastHeartbeat")} AS ${q("lastHeartbeat")},
@@ -170,10 +175,14 @@ export async function listXrayQuickConfigEntryHosts(): Promise<{ items: QuickCon
         LEFT JOIN ${q("xray_runtime_reports")} r ON r.${q("hostId")} = h.${q("id")}
         ORDER BY h.${q("name")} ASC, h.${q("id")} ASC`,
     );
+  const protocolSettings = engine ? await getForwardProtocolSettings() : null;
   return {
     items: rows.map((row) => {
       const endpoints = hostEndpoints(row);
-      const disabledReasonCode = hostDisabledReason(row, endpoints);
+      const disabledReasonCode = engine && protocolSettings?.[engine] === false ? "FORWARD_PROTOCOL_DISABLED"
+        : hostDisabledReason(row, endpoints) ?? (engine && !isForwardplusAgentVersionAtLeast(
+          String(row.agentVersion ?? ""), String(row.agentDistribution ?? ""), XRAY_QUICK_CONFIG_FORWARD_ENGINE_MIN_AGENT_VERSION,
+        ) ? "AGENT_CAPABILITY_MISSING" : null);
       return {
         hostId: Number(row.hostId),
         name: String(row.hostName ?? ""),
