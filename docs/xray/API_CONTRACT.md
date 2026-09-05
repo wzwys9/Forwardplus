@@ -590,6 +590,7 @@ profileId 固定为 `VLESS_RAW_TLS`、`VLESS_RAW_TLS_VISION`、`TROJAN_RAW_TLS`�
 - `create({ zoneId, subdomain, recordType, lineId, value, ttl })` 只允许 A/AAAA/CNAME。`lineId` 是面板目录 id，服务端解析并复核 providerLineId/name；成功后只返回 `{ providerRecordId }`，界面再实时重读列表。
 - `update({ zoneId, providerRecordId, expectedRecordRevision, subdomain, recordType, lineId, value, ttl })` 在写入前用 `DescribeRecord` 回读并比对 revision，远端已变更时返回 `DNS_RECORD_CHANGED`，不覆盖。
 - `remove({ zoneId, providerRecordId, expectedRecordRevision })` 同样先回读并比对 revision，仅删除该精确 recordId。
+- `deletionPreview({ zoneId, subdomain })` 是只读 query，不接受搜索或页码；一次有界 provider 列表读取并精确过滤完整名称，返回 `{ zoneId, subdomain, fqdn, records, preservedCount }`。records 仅含 A/AAAA/CNAME 的既有安全 DTO 与 recordRevision，其他类型只计入 preservedCount。沿用当前账号、目录和管理员门禁，重新计算名称在用状态，在用即拒绝；空名称正常返回 records=[]。浏览器仅将该快照标记为删除草稿，最终保存逐条调用 remove，不能扩展到快照外后来新建的记录。
 
 `groups({ zoneId, search?, page=1, pageSize=20 })` 实时读取完整的有界 DNSPod 列表，按规范完整名称聚合后分页，返回每组 `{ subdomain, fqdn, recordCount, recordTypes, inUse }`。未删除配置、有效 claim、未清理托管记录和活动 operation 涉及的名称即使远端零记录也进入聚合列表。`list` 增加可选精确 `subdomain` 过滤；返回 `subdomain:{name,fqdn,inUse}|null`，每条记录增加 `inUse`，原 zone 聚合占用字段继续保留但不代表记录写权限。聚合搜索命中任一记录时返回整个组的真实记录数。
 
