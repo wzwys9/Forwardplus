@@ -1,10 +1,28 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { stageDnsRecordDraft, saveDnsRecordDrafts, type DnsRecordDraft } from "./dnsRecordDraft";
+import { stageDnsRecordDraft, saveDnsRecordDrafts, createDnsRecordDeletionDrafts, type DnsRecordDraft } from "./dnsRecordDraft";
 
 const lines = [{ lineId: 1, providerLineId: "0", name: "默认" }];
 const original = { providerRecordId: "123", subdomain: "www", fqdn: "www.example.com", recordType: "A", providerLineId: "0", lineName: "默认", value: "192.0.2.1", ttl: 600, status: "ENABLE", recordRevision: "original-revision", inUse: false };
 const draft = (key = "123"): DnsRecordDraft => ({ key, original, values: { subdomain: "www", recordType: "A", lineId: 1, value: "192.0.2.2", ttl: 600 }, deleted: false });
+
+test("bulk deletion stages only exact-name address records and retains their revisions until Save", async () => {
+  const records = ["A", "AAAA", "CNAME", "TXT", "MX", "NS"].map((recordType, index) => ({
+    ...original, recordType, providerRecordId: String(index + 1), recordRevision: `revision-${index}`,
+  }));
+  const staged = createDnsRecordDeletionDrafts(records, original.fqdn, lines);
+  assert.equal(staged.length, 3);
+  assert.ok(staged.every(draft => draft.deleted));
+  assert.deepEqual(records.map(record => record.recordType), ["A", "AAAA", "CNAME", "TXT", "MX", "NS"]);
+  assert.throws(() => createDnsRecordDeletionDrafts([{ ...original, fqdn: "other.example.com" }], original.fqdn, lines));
+  assert.throws(() => createDnsRecordDeletionDrafts([{ ...original, inUse: true }], original.fqdn, lines));
+  const calls: unknown[] = [];
+  await saveDnsRecordDrafts(staged, 42, {
+    create: async () => assert.fail("no creates"), update: async () => assert.fail("no updates"),
+    remove: async input => { calls.push(input); },
+  }, () => undefined);
+  assert.deepEqual(calls, [0, 1, 2].map(index => ({ zoneId: 42, providerRecordId: String(index + 1), expectedRecordRevision: `revision-${index}` })));
+});
 
 test("DNS drafts skip unchanged records, merge repeated edits and retain the original revision", () => {
   const unchanged = { ...draft(), values: { ...draft().values, subdomain: " WWW ", value: " 192.0.2.1 " } };

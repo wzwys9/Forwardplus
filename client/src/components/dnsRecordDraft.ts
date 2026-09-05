@@ -16,6 +16,22 @@ export type DnsRecordDraft = Readonly<{
   deleted: boolean;
 }>;
 
+export function createDnsRecordDeletionDrafts(
+  records: readonly DnsRecordItem[], fqdn: string,
+  lines: readonly { lineId: number; providerLineId: string }[],
+): DnsRecordDraft[] {
+  return records.flatMap(record => {
+    if (record.fqdn !== fqdn || record.inUse) throw new Error("DNS_SUBDOMAIN_IN_USE");
+    const recordType = record.recordType;
+    if (recordType !== "A" && recordType !== "AAAA" && recordType !== "CNAME") return [];
+    return [{ key: record.providerRecordId, original: record, deleted: true, values: {
+      subdomain: record.subdomain, recordType, value: record.value, ttl: record.ttl,
+      // Delete uses only the original ID/revision, even if its line has retired.
+      lineId: lines.find(line => line.providerLineId === record.providerLineId)?.lineId ?? 0,
+    } }];
+  });
+}
+
 export function stageDnsRecordDraft(
   drafts: readonly DnsRecordDraft[],
   draft: DnsRecordDraft,
