@@ -1,7 +1,7 @@
 # 规格：ForwardX 受管 Xray
 
 状态：已批准  
-版本：0.27
+版本：0.28
 日期：2026-09-05
 
 实现状态：第一版 `XRAY-TASK-001..037`、多协议基础 `XRAY-TASK-038..042`、Xray-native profile `XRAY-TASK-043..052`、MTProto 独立服务首片 `XRAY-TASK-053`、AmneziaWG userspace 独立服务 `XRAY-TASK-054`、出口节点/中转联动 `XRAY-TASK-055` 与六种本地转发方式出口引用 `XRAY-TASK-056` 已完成；DNSPod 快速配置 `XRAY-TASK-057` 与六引擎创建/切换 `XRAY-TASK-058` 的可体验主流程已实现，集中运行验证待补；TUN 保持 `NOT_IMPLEMENTED`。Reality 默认候选为 `v2`，固定 Xray 默认版本仍为 `v26.3.27`。
