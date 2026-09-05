@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, CheckCircle2, Copy, Plus, Route, Trash2 } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -7,9 +7,10 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Skeleton } from "@/components/ui/skeleton";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "./XrayDialog";
 import { XrayQuickConfigPathCard, XrayQuickConfigPathFlow } from "./XrayQuickConfigPathCard";
-import { XRAY_QUICK_CONFIG_CARRIERS, type XrayQuickConfigCarrier, type XrayQuickConfigEntryHost, type XrayQuickConfigTarget } from "./xrayQuickConfigFlow";
+import { XRAY_QUICK_CONFIG_CARRIERS, type XrayQuickConfigCarrier, type XrayQuickConfigEngine, type XrayQuickConfigEntryHost, type XrayQuickConfigTarget } from "./xrayQuickConfigFlow";
+import { createQuickConfigPathActionChecker, inspectQuickConfigPathDraft } from "./xrayQuickConfigPathAvailability";
 import {
-  changeQuickConfigPath, copyQuickConfigPath, emptyQuickConfigPaths, inspectQuickConfigPaths,
+  changeQuickConfigPath, copyQuickConfigPath, emptyQuickConfigPaths, mergeQuickConfigPaths,
   QUICK_CONFIG_CARRIER_LABELS as labels, QUICK_CONFIG_PATH_LIMIT,
   type QuickConfigPath, type QuickConfigPaths,
 } from "./xrayQuickConfigPaths";
@@ -18,11 +19,12 @@ type DesignerProps = {
   target: XrayQuickConfigTarget; hosts: readonly XrayQuickConfigEntryHost[];
   loading: boolean; error: boolean; onRetry: () => void; onClose: () => void;
   initialPaths?: QuickConfigPaths;
+  engine?: XrayQuickConfigEngine | null;
   onAccept?: (paths: QuickConfigPaths) => void;
 };
 
-function PathSummary({ paths, hosts, target }: Pick<DesignerProps, "hosts" | "target"> & { paths: QuickConfigPaths }) {
-  const inspection = inspectQuickConfigPaths(paths, hosts, target.host?.id);
+function PathSummary({ paths, hosts, target, engine }: Pick<DesignerProps, "hosts" | "target" | "engine"> & { paths: QuickConfigPaths }) {
+  const inspection = inspectQuickConfigPathDraft(paths, hosts, target, engine);
   return <section className="min-w-0 space-y-5">
     <div><h3 data-path-summary-title tabIndex={-1} className="font-semibold outline-none">路径汇总</h3><p className="mt-1 text-sm text-muted-foreground">尚未进行端口检测或网络连通性验证</p></div>
     <Alert><Route className="h-4 w-4" /><AlertTitle>设计预览，不是实际下发配置</AlertTitle>
@@ -47,7 +49,7 @@ function PathSummary({ paths, hosts, target }: Pick<DesignerProps, "hosts" | "ta
 
 /** Accept only transfers a validated in-memory draft to the formal wizard; it never applies it. */
 export function XrayQuickConfigPathDesigner(props: DesignerProps) {
-  const [paths, setPaths] = useState<QuickConfigPaths>(() => props.initialPaths ?? emptyQuickConfigPaths());
+  const [paths, setPaths] = useState<QuickConfigPaths>(() => props.initialPaths ? mergeQuickConfigPaths(props.initialPaths) : emptyQuickConfigPaths());
   const [carrier, setCarrier] = useState<XrayQuickConfigCarrier>("TELECOM");
   const [activeId, setActiveId] = useState<string | null>(paths.TELECOM[0]?.id ?? null);
   const [mobileEditing, setMobileEditing] = useState(false);
@@ -59,7 +61,9 @@ export function XrayQuickConfigPathDesigner(props: DesignerProps) {
   const listHeadingRef = useRef<HTMLHeadingElement>(null);
   const active = paths[carrier].find((path) => path.id === activeId);
   const total = Object.values(paths).reduce((count, items) => count + items.length, 0);
-  const inspection = inspectQuickConfigPaths(paths, props.hosts, props.target.host?.id);
+  const inspection = inspectQuickConfigPathDraft(paths, props.hosts, props.target, props.engine);
+  const actionReason = useMemo(() => createQuickConfigPathActionChecker(paths, carrier, activeId ?? "", props.hosts, props.target, props.engine),
+    [paths, carrier, activeId, props.hosts, props.target, props.engine]);
   const currentIssues = [...new Set(inspection.issues.filter((issue) => issue.pathId === active?.id).map((issue) => issue.message))];
   const copyOptions = XRAY_QUICK_CONFIG_CARRIERS.flatMap((source) => source === carrier ? []
     : paths[source].map((path, index) => ({ path, label: `${labels[source]}路径 ${index + 1}` })));
@@ -111,7 +115,7 @@ export function XrayQuickConfigPathDesigner(props: DesignerProps) {
         <div ref={scrollRef} className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain p-3 sm:p-5" data-path-designer-scroll>
           {props.loading ? <div aria-busy="true" aria-label="正在读取服务器" className="space-y-3"><Skeleton className="h-24 w-full" /><Skeleton className="h-40 w-full" /></div>
             : props.error ? <Alert variant="destructive"><AlertTitle>服务器列表加载失败</AlertTitle><AlertDescription className="space-y-3"><p>已有草稿不会清空。请重试读取面板主机目录。</p><Button type="button" variant="outline" className="h-11" onClick={props.onRetry}>重新加载</Button></AlertDescription></Alert>
-              : summary ? <PathSummary paths={paths} hosts={props.hosts} target={props.target} />
+              : summary ? <PathSummary paths={paths} hosts={props.hosts} target={props.target} engine={props.engine} />
                 : <div className="grid min-w-0 items-start gap-5 lg:grid-cols-[16rem_minmax(0,1fr)]">
                   <section className={`min-w-0 space-y-3 ${mobileEditing ? "hidden lg:block" : ""}`} aria-label={`${labels[carrier]}路径列表`}>
                     <div><h3 ref={listHeadingRef} tabIndex={-1} className="font-semibold outline-none">{labels[carrier]}的访问路径</h3><p className="mt-1 text-xs text-muted-foreground">一个运营商可以使用多个入口，每条路径最终到达同一落地。</p></div>
@@ -140,6 +144,7 @@ export function XrayQuickConfigPathDesigner(props: DesignerProps) {
                     {active ? <>
                       <div><h3 ref={editingHeadingRef} tabIndex={-1} className="font-semibold outline-none">{labels[carrier]} · 路径 {paths[carrier].indexOf(active) + 1}</h3><p className="mt-1 text-xs text-muted-foreground">从上往下依次经过；添加中转后，可用上下箭头调整顺序。</p></div>
                       <XrayQuickConfigPathCard path={active} hosts={props.hosts} target={props.target}
+                        actionReason={actionReason}
                         onChange={(action) => setPaths((current) => ({ ...current, [carrier]: current[carrier].map((path) => path.id === active.id ? changeQuickConfigPath(path, action) : path) }))} />
                       {currentIssues.length > 0 && <div className="space-y-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3" role="status">
                         <h4 className="text-sm font-medium">此路径还需调整</h4>{currentIssues.map((message) => <p key={message} className="break-words text-xs text-destructive">{message}</p>)}
@@ -149,7 +154,7 @@ export function XrayQuickConfigPathDesigner(props: DesignerProps) {
                 </div>}
         </div>
         <footer className="shrink-0 space-y-2 border-t bg-background p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-5">
-          <p className="text-xs text-muted-foreground" role="status">{total} 条路径 · {props.onAccept ? "使用路径后继续引擎与端口检查，不会立即下发" : "仅预览，不下发、不保存到服务器"}</p>
+          <p className="text-xs text-muted-foreground" role="status">{total} 条路径 · {props.onAccept ? "使用路径后继续端口检查，不会立即下发" : "仅预览，不下发、不保存到服务器"}</p>
           <div className="grid grid-cols-2 gap-2 sm:flex sm:justify-end">
             <Button type="button" variant="outline" className="h-11 min-w-0 px-2" onClick={requestClose}>{props.onAccept ? "取消调整" : "关闭预览"}</Button>
             <Button type="button" className="h-11 min-w-0 px-2 sm:px-4" disabled={props.loading || props.error || total === 0} onClick={() => setSummary(!summary)}>{summary ? "继续调整路径" : "查看路径汇总"}</Button>

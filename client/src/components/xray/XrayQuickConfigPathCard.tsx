@@ -1,29 +1,38 @@
 import { ArrowDown, ArrowUp, LockKeyhole, Plus, Trash2 } from "lucide-react";
+import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { formatXrayEndpoint } from "./xrayInboundPresentation";
 import { xrayQuickConfigEndpointKey, type XrayQuickConfigEntryHost, type XrayQuickConfigTarget } from "./xrayQuickConfigFlow";
-import { QUICK_CONFIG_HOP_LIMIT, quickConfigPathEndpoint, type QuickConfigPath, type QuickConfigPathAction } from "./xrayQuickConfigPaths";
+import { QUICK_CONFIG_HOP_LIMIT, quickConfigEntryKeys, quickConfigPathEndpoint, type QuickConfigPath, type QuickConfigPathAction } from "./xrayQuickConfigPaths";
 
 function EndpointPicker(props: {
   label: string; endpointKey: string | null; hosts: readonly XrayQuickConfigEntryHost[];
   onChange: (key: string) => void;
+  entryKeys?: string[]; onToggleFamily?: (family: "IPV4" | "IPV6") => void;
+  reason: (key: string) => string | null;
+  familyReason: (family: "IPV4" | "IPV6") => string | null;
 }) {
+  const [open, setOpen] = useState(false);
   const selected = quickConfigPathEndpoint(props.endpointKey, props.hosts);
   const host = props.hosts.find((item) => item.hostId === selected?.hostId);
+  const candidates = (open ? props.hosts : host ? [host] : []).map(item => {
+    const endpoints = item.endpoints.filter(endpoint => !props.reason(xrayQuickConfigEndpointKey(item.hostId, endpoint.addressFamily)));
+    return { host: item, endpoints, reason: endpoints.length ? null : item.endpoints.length ? props.reason(xrayQuickConfigEndpointKey(item.hostId, item.endpoints[0].addressFamily)) : "未登记有效地址" };
+  });
   return <div className="min-w-0 space-y-2">
-    <Select value={host ? String(host.hostId) : ""} onValueChange={(value) => {
-      const next = props.hosts.find((item) => String(item.hostId) === value);
+    <Select open={open} onOpenChange={setOpen} value={host ? String(host.hostId) : ""} onValueChange={(value) => {
+      const next = candidates.find(item => String(item.host.hostId) === value);
       const endpoint = next?.endpoints.find((item) => item.addressFamily === selected?.addressFamily)
-        ?? next?.endpoints.find((item) => item.addressFamily === "IPV4") ?? next?.endpoints[0];
-      if (next?.eligible && endpoint) props.onChange(xrayQuickConfigEndpointKey(next.hostId, endpoint.addressFamily));
+        ?? next?.endpoints[0];
+      if (next?.host.eligible && endpoint) props.onChange(xrayQuickConfigEndpointKey(next.host.hostId, endpoint.addressFamily));
     }}>
       <SelectTrigger className="h-11 min-w-0" aria-label={`${props.label}服务器`}><SelectValue placeholder="选择服务器" /></SelectTrigger>
       <SelectContent className="max-h-72 max-w-[calc(100vw-2rem)]">
-        {props.hosts.map((item) => <SelectItem key={item.hostId} value={String(item.hostId)}
-          disabled={!item.eligible || item.endpoints.length === 0} className="min-h-11 break-all">
-          {item.name}{!item.eligible || item.endpoints.length === 0 ? " · 暂不可用" : ""}
+        {candidates.map(({ host: item, endpoints, reason }) => <SelectItem key={item.hostId} value={String(item.hostId)}
+          disabled={!item.eligible || endpoints.length === 0} className="min-h-11 break-all">
+          <span>{item.name}{reason && <span className="mt-1 block max-w-72 whitespace-normal text-xs text-muted-foreground">{reason}</span>}</span>
         </SelectItem>)}
       </SelectContent>
     </Select>
@@ -31,13 +40,19 @@ function EndpointPicker(props: {
       {(["IPV4", "IPV6"] as const).map((family) => <Button key={family} type="button" variant="outline"
         className="h-11 min-w-0 aria-pressed:border-primary aria-pressed:bg-primary/5"
         aria-label={`${props.label.trim()} 使用 ${family === "IPV4" ? "IPv4" : "IPv6"}`}
-        aria-pressed={selected?.addressFamily === family}
-        disabled={!host.eligible || !host.endpoints.some((endpoint) => endpoint.addressFamily === family)}
-        onClick={() => props.onChange(xrayQuickConfigEndpointKey(host.hostId, family))}>
+        aria-pressed={props.entryKeys ? props.entryKeys.includes(xrayQuickConfigEndpointKey(host.hostId, family)) : selected?.addressFamily === family}
+        disabled={!host.endpoints.some((endpoint) => endpoint.addressFamily === family) || !!props.familyReason(family)}
+        onClick={() => props.onToggleFamily ? props.onToggleFamily(family) : props.onChange(xrayQuickConfigEndpointKey(host.hostId, family))}>
         {family === "IPV4" ? "IPv4" : "IPv6"}
       </Button>)}
     </div>}
-    {selected && <p className="break-all font-mono text-xs text-muted-foreground">{selected.address}</p>}
+    {props.entryKeys && <p className="text-xs text-muted-foreground">可同时选择 IPv4 和 IPv6，共用同一后续路径。</p>}
+    {host?.endpoints.filter(endpoint => props.entryKeys ? props.entryKeys.includes(xrayQuickConfigEndpointKey(host.hostId, endpoint.addressFamily)) : endpoint.addressFamily === selected?.addressFamily)
+      .map(endpoint => <p key={endpoint.addressFamily} className="break-all font-mono text-xs text-muted-foreground">{endpoint.address}</p>)}
+    {host && (["IPV4", "IPV6"] as const).map(family => {
+      const reason = host.endpoints.some(endpoint => endpoint.addressFamily === family) ? props.familyReason(family) : "服务器未登记此地址";
+      return reason ? <p key={family} className="break-words text-xs text-muted-foreground">{family === "IPV4" ? "IPv4" : "IPv6"}：{reason}</p> : null;
+    })}
     {props.endpointKey && (!selected || !selected.eligible) && <p className="text-xs text-destructive">原选择已不可用，请重新选择。</p>}
   </div>;
 }
@@ -49,6 +64,7 @@ function NextHop() {
 export function XrayQuickConfigPathCard(props: {
   path: QuickConfigPath; hosts: readonly XrayQuickConfigEntryHost[]; target: XrayQuickConfigTarget;
   onChange: (action: QuickConfigPathAction) => void;
+  actionReason?: (action: QuickConfigPathAction) => string | null;
 }) {
   const directLanding = props.path.hops.length === 1 && !!props.target.host
     && quickConfigPathEndpoint(props.path.hops[0], props.hosts)?.hostId === props.target.host.id;
@@ -68,6 +84,12 @@ export function XrayQuickConfigPathCard(props: {
           </div>}
         </div>
         <EndpointPicker label={index === 0 ? "入口" : `中转 ${index} `} endpointKey={key} hosts={props.hosts}
+          entryKeys={index === 0 ? quickConfigEntryKeys(props.path) : undefined}
+          onToggleFamily={index === 0 ? family => props.onChange({ type: "TOGGLE_ENTRY_FAMILY", family }) : undefined}
+          reason={endpointKey => props.actionReason?.({ type: "SET", index, endpointKey }) ?? null}
+          familyReason={family => index === 0
+            ? props.actionReason?.({ type: "TOGGLE_ENTRY_FAMILY", family }) ?? null
+            : props.actionReason?.({ type: "SET", index, endpointKey: `${quickConfigPathEndpoint(key, props.hosts)?.hostId}:${family}` }) ?? null}
           onChange={(endpointKey) => props.onChange({ type: "SET", index, endpointKey })} />
       </section>
     </div>)}
@@ -88,7 +110,7 @@ export function XrayQuickConfigPathFlow(props: {
 }) {
   const ingress = quickConfigPathEndpoint(props.path.hops[0], props.hosts);
   if (props.path.hops.length === 1 && props.targetHostId !== undefined && ingress?.hostId === props.targetHostId) {
-    return <p className="break-all text-sm">本机直达落地 · {props.targetName}<span className="ml-1 text-xs text-muted-foreground">{ingress.addressFamily === "IPV4" ? "IPv4" : "IPv6"}</span></p>;
+    return <p className="break-all text-sm">本机直达落地 · {props.targetName}<span className="ml-1 text-xs text-muted-foreground">{quickConfigEntryKeys(props.path).map(key => key.endsWith("IPV4") ? "IPv4" : "IPv6").join(" + ")}</span></p>;
   }
   return <ol className="min-w-0 space-y-1 text-sm">
     {props.path.hops.map((key, index) => {
@@ -96,7 +118,7 @@ export function XrayQuickConfigPathFlow(props: {
       return <li key={index} className="flex min-w-0 items-start gap-2">
         <span className="shrink-0 text-xs text-muted-foreground">{index === 0 ? "入口" : `↓ ${index}`}</span>
         <span className="min-w-0 break-all">{endpoint?.hostName ?? "未选择服务器"}
-          {endpoint && <span className="ml-1 text-xs text-muted-foreground">{endpoint.addressFamily === "IPV4" ? "IPv4" : "IPv6"}</span>}
+          {endpoint && <span className="ml-1 text-xs text-muted-foreground">{index === 0 ? quickConfigEntryKeys(props.path).map(key => key.endsWith("IPV4") ? "IPv4" : "IPv6").join(" + ") : endpoint.addressFamily === "IPV4" ? "IPv4" : "IPv6"}</span>}
         </span>
       </li>;
     })}
