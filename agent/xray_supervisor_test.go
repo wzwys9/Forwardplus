@@ -241,6 +241,12 @@ func TestXrayManagedSupervisorInvalidTokenDoesNotStop(t *testing.T) {
 	if err := fixture.supervisor.Stop(); err != nil {
 		t.Fatal(err)
 	}
+	// Stop waits for process exit; the watcher persists STOPPED afterward.
+	// Status takes the same mutex, so this also waits for that final write before
+	// t.TempDir cleanup removes the managed state directory.
+	waitForXraySupervisor(t, func() bool {
+		return fixture.supervisor.Status().ServiceStatus == XrayServiceStopped
+	})
 }
 
 func TestXrayManagedSupervisorRefusesToSignalIdentityMismatch(t *testing.T) {
