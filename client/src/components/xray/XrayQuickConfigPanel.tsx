@@ -740,9 +740,10 @@ export function XrayQuickConfigPanel(props: {
   const dialogTriggerRef = useRef<HTMLButtonElement | null>(null);
   const detailTriggerRef = useRef<HTMLButtonElement | null>(null);
   const gate = gateMessage(props.account, props.zones);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
   const quickConfigsQuery = trpc.xray.quickConfigs.list.useQuery({ page: 1, pageSize: 20 }, {
     retry: false,
-    refetchInterval: (query) => query.state.data?.items.some((item) => activeQuickConfigStates.has(item.state)) ? 1_500 : false,
+    refetchInterval: (query) => query.state.status !== "error" && query.state.data?.items.some((item) => activeQuickConfigStates.has(item.state)) ? 1_500 : false,
     refetchOnWindowFocus: true,
   });
   const targetsQuery = trpc.xray.quickConfigs.targetsList.useQuery({
@@ -757,6 +758,12 @@ export function XrayQuickConfigPanel(props: {
   });
   const targets = (targetsQuery.data?.items ?? []) as XrayQuickConfigTarget[];
   const quickConfigs = quickConfigsQuery.data?.items ?? [];
+  const refreshList = async () => {
+    if (manualRefreshing) return;
+    setManualRefreshing(true);
+    try { await quickConfigsQuery.refetch(); }
+    finally { setManualRefreshing(false); }
+  };
 
   const closeDialog = () => {
     const trigger = dialogTriggerRef.current;
@@ -834,12 +841,13 @@ export function XrayQuickConfigPanel(props: {
       <CardHeader className="pb-4">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div><CardTitle>已创建的快速配置</CardTitle><CardDescription className="mt-1.5">查看当前 FQDN、统一端口、实际转发引擎、DNS 记录和持久执行状态。</CardDescription></div>
-          <Button type="button" size="sm" variant="outline" disabled={quickConfigsQuery.isFetching} onClick={() => { void quickConfigsQuery.refetch(); }}>{quickConfigsQuery.isFetching ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}刷新</Button>
+          <Button type="button" size="sm" variant="outline" disabled={manualRefreshing} aria-busy={manualRefreshing} onClick={() => { void refreshList(); }}>{manualRefreshing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}刷新</Button>
         </div>
       </CardHeader>
       <CardContent className="p-0">
+        {quickConfigsQuery.isError && !!quickConfigsQuery.data && <Alert variant="destructive" className="mb-3"><AlertTriangle className="h-4 w-4" /><AlertTitle>列表刷新失败或超时</AlertTitle><AlertDescription>保留上次读取的列表；现有 DNS 和转发不受影响，请点击刷新重试。</AlertDescription></Alert>}
         {quickConfigsQuery.isLoading ? <div className="space-y-3 px-5 pb-5" aria-busy="true" aria-label="正在加载快速配置"><Skeleton className="h-20 w-full" /><Skeleton className="h-20 w-full" /></div>
-          : quickConfigsQuery.isError ? <div className="px-5 pb-5"><Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>快速配置加载失败</AlertTitle><AlertDescription className="space-y-3"><p>已有转发和 DNS 不受页面加载失败影响。</p><Button type="button" size="sm" variant="outline" onClick={() => { void quickConfigsQuery.refetch(); }}>重新加载</Button></AlertDescription></Alert></div>
+          : quickConfigsQuery.isError && !quickConfigsQuery.data ? <div className="px-5 pb-5"><Alert variant="destructive"><AlertTriangle className="h-4 w-4" /><AlertTitle>快速配置加载失败或超时</AlertTitle><AlertDescription className="space-y-3"><p>已有转发和 DNS 不受页面加载失败影响。</p><Button type="button" size="sm" variant="outline" disabled={manualRefreshing} onClick={() => { void refreshList(); }}>重新加载</Button></AlertDescription></Alert></div>
             : quickConfigs.length === 0 ? <div className="flex min-h-28 flex-col items-center justify-center border-t px-5 py-6 text-center"><Activity className="h-6 w-6 text-muted-foreground" aria-hidden="true" /><p className="mt-2 text-sm font-medium">还没有快速配置</p><p className="mt-1 text-xs text-muted-foreground">从下方选择落地节点开始创建。</p></div>
               : <div aria-live="polite">{quickConfigs.map((config) => <QuickConfigCard key={config.id} config={config} onOpen={(trigger) => { detailTriggerRef.current = trigger; setSelectedConfigId(config.id); }} />)}{(quickConfigsQuery.data?.total ?? 0) > quickConfigs.length && <p className="border-t px-5 py-3 text-center text-xs text-muted-foreground">当前显示最近 {quickConfigs.length} 条。</p>}</div>}
       </CardContent>

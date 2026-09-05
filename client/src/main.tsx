@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import superjson from "superjson";
 import App from "./App";
 import { mobileAuth } from "./lib/mobileAuth";
+import { fetchQuickConfigList } from "./lib/quickConfigListRequest";
 import "./index.css";
 
 const LOGIN_EXPIRED_NOTICE = "登录状态已失效，请重新登录";
@@ -86,6 +87,7 @@ queryClient.getMutationCache().subscribe(event => {
 });
 
 const criticalQueryPaths = new Set([
+  "xray.quickConfigs.list",
   "auth.me",
   "setup.status",
   "dashboard.stats",
@@ -115,7 +117,10 @@ const trpcFetch = (input: RequestInfo | URL, init?: RequestInit) => {
     const token = mobileAuth.getToken();
     if (token) headers.set("Authorization", `Bearer ${token}`);
   }
-  return globalThis.fetch(requestInput, {
+  const rawRequestUrl = typeof requestInput === "string" ? requestInput : requestInput instanceof URL ? requestInput.href : requestInput.url;
+  const request = new URL(rawRequestUrl, window.location.href).pathname.endsWith("/api/trpc/xray.quickConfigs.list")
+    ? fetchQuickConfigList : globalThis.fetch;
+  return request(requestInput, {
     ...(init ?? {}),
     headers,
     credentials: "include",
