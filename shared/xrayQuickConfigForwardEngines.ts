@@ -46,9 +46,20 @@ export function xrayQuickConfigForwardEngineLabel(engine: XrayQuickConfigForward
 
 export function quickConfigPathEngineCompatible(engine: XrayQuickConfigForwardEngine,
   paths: readonly (readonly { hostId: number; addressFamily: "IPV4" | "IPV6" }[])[],
-  targetAddress: string, directLandingHostId?: number): boolean {
-  if (engine !== "iptables" && engine !== "nftables") return true;
+  targetAddress: string, directLandingHostId?: number,
+  registeredHosts?: readonly { hostId: number; endpoints: readonly { addressFamily: "IPV4" | "IPV6" }[] }[]): boolean {
   const targetFamily = targetAddress.includes(":") ? "IPV6" : /^\d+\.\d+\.\d+\.\d+$/.test(targetAddress) ? "IPV4" : null;
+  if (registeredHosts) {
+    const hosts = new Map(registeredHosts.map(host => [host.hostId, new Set(host.endpoints.map(endpoint => endpoint.addressFamily))]));
+    if (!paths.every(hops => hops.every((hop, index) => {
+      const families = hosts.get(hop.hostId);
+      if (!families?.has(hop.addressFamily)) return false;
+      if (hops.length === 1 && hop.hostId === directLandingHostId) return true;
+      const nextFamily = hops[index + 1]?.addressFamily ?? targetFamily;
+      return !nextFamily || families.has(nextFamily);
+    }))) return false;
+  }
+  if (engine !== "iptables" && engine !== "nftables") return true;
   return paths.every(hops => hops.length === 1 && hops[0].hostId === directLandingHostId
     || !!targetFamily && hops.every((hop, index) => hop.addressFamily === (hops[index + 1]?.addressFamily ?? targetFamily)));
 }

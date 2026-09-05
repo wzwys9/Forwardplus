@@ -497,7 +497,8 @@ async function assertForwardEngineAvailable(
 ): Promise<XrayQuickConfigForwardEngine> {
   const engine = forwardEngine(engineValue);
   const directLandingHostId = !rewritten && target.targetType === "XRAY_INBOUND" ? target.host.id : undefined;
-  if (!quickConfigPathEngineCompatible(engine, routes.flatMap(route => route.endpoints.map(endpoint => [endpoint, ...(endpoint.relays ?? [])])), target.endpoint.address, directLandingHostId)) fail("QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED");
+  const registeredHosts = (await listXrayQuickConfigEntryHosts()).items;
+  if (!quickConfigPathEngineCompatible(engine, routes.flatMap(route => route.endpoints.map(endpoint => [endpoint, ...(endpoint.relays ?? [])])), target.endpoint.address, directLandingHostId, registeredHosts)) fail("QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED");
   const entries = [...new Map(routes.flatMap(route => route.endpoints.flatMap(endpoint => [endpoint, ...(endpoint.relays ?? [])]))
     .map(endpoint => [`${endpoint.hostId}:${endpoint.addressFamily}`, { hostId: endpoint.hostId, addressFamily: endpoint.addressFamily }])).values()];
   const catalog = await listXrayQuickConfigForwardEngines({

@@ -22,3 +22,15 @@ test("kernel policy exempts only a genuinely direct landing path, not a rewritte
     assert.equal(filterQuickConfigPathEngines(catalog, [direct, forwarded], "8.8.8.8")?.items[0].eligible, false);
   }
 });
+test("registered addresses bound outbound family and allow a dual-stack bridge", () => {
+  const hosts = [
+    { hostId: 1, endpoints: [{ addressFamily: "IPV4" as const }] },
+    { hostId: 2, endpoints: [{ addressFamily: "IPV4" as const }, { addressFamily: "IPV6" as const }] },
+  ];
+  const v4 = { hostId: 1, addressFamily: "IPV4" as const };
+  const bridge = { hostId: 2, addressFamily: "IPV4" as const };
+  assert.equal(quickConfigPathEngineCompatible("realm", [[v4]], "2606:4700::1111", undefined, hosts), false);
+  assert.equal(quickConfigPathEngineCompatible("realm", [[v4, bridge]], "2606:4700::1111", undefined, hosts), true);
+  assert.equal(quickConfigPathEngineCompatible("nftables", [[v4, bridge]], "2606:4700::1111", undefined, hosts), false);
+  assert.equal(quickConfigPathEngineCompatible("realm", [[{ ...v4, addressFamily: "IPV6" }]], "8.8.8.8", undefined, hosts), false);
+});

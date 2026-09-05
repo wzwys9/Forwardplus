@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { quickConfigPathEngineCompatible } from "../shared/xrayQuickConfigForwardEngines";
+import { listXrayQuickConfigEntryHosts } from "./xrayQuickConfigEntryHosts";
 import { compileQuickConfigTopology, parseQuickConfigRelays, serializeQuickConfigRelays } from "./xrayQuickConfigTopology";
 
 import {
@@ -419,7 +420,7 @@ async function loadSnapshot(quickConfigId: number, expectedRevision?: number): P
 
 async function assertEngineEligible(snapshot: SwitchSnapshot, toEngine: XrayQuickConfigForwardEngine) {
   const paths = snapshot.routes.filter(route => route.routeMode === "FORWARD").map(route => [{ hostId: route.hostId!, addressFamily: route.addressFamily }, ...parseQuickConfigRelays(route.relayHopsJson)]);
-  if (!quickConfigPathEngineCompatible(toEngine, paths, snapshot.targetAddress)) fail("QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED");
+  if (!quickConfigPathEngineCompatible(toEngine, paths, snapshot.targetAddress, undefined, (await listXrayQuickConfigEntryHosts()).items)) fail("QUICK_CONFIG_PATH_ADDRESS_FAMILY_UNSUPPORTED");
   if (snapshot.routes.every((route) => route.routeMode === "DIRECT")) {
     const settings = await getForwardProtocolSettings();
     if (settings[toEngine] === false) fail("FORWARD_PROTOCOL_DISABLED");
