@@ -31,8 +31,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { saveDnsRecordDrafts, stageDnsRecordDraft, type DnsRecordDraft, type DnsRecordItem as RecordItem } from "./dnsRecordDraft";
+import { createDnsRecordDeletionDrafts, saveDnsRecordDrafts, stageDnsRecordDraft, type DnsRecordDraft, type DnsRecordItem as RecordItem } from "./dnsRecordDraft";
 import { DnsRecordPendingChanges } from "./DnsRecordPendingChanges";
+import { DnsRecordBulkDeleteDialog } from "./DnsRecordBulkDeleteDialog";
 
 const RECORD_TYPES = ["A", "AAAA", "CNAME"] as const;
 type RecordType = typeof RECORD_TYPES[number];
@@ -247,12 +248,13 @@ export default function DnsRecordManagementCard({
   const draftSequenceRef = useRef(0);
   const [saveFailure, setSaveFailure] = useState<{ message: string; failedKey: string; completed: number } | null>(null);
   const [discardOpen, setDiscardOpen] = useState(false);
-  const selectedZone = editing ? zones.find(zone => zone.zoneId === selectedZoneId) ?? null
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const selectedZone = editing || bulkDeleteOpen ? zones.find(zone => zone.zoneId === selectedZoneId) ?? null
     : availableZones.find((zone) => zone.zoneId === selectedZoneId) ?? availableZones[0] ?? null;
   const utils = trpc.useUtils();
 
   useEffect(() => {
-    if (editing) return;
+    if (editing || bulkDeleteOpen) return;
     if (selectedZoneId !== null && availableZones.some((zone) => zone.zoneId === selectedZoneId)) return;
     setSelectedZoneId(availableZones[0]?.zoneId ?? null);
     setSubdomain(null);
@@ -262,7 +264,7 @@ export default function DnsRecordManagementCard({
     setDrafts([]);
     setSaveFailure(null);
     setPage(1);
-  }, [availableZones, selectedZoneId, editing]);
+  }, [availableZones, selectedZoneId, editing, bulkDeleteOpen]);
 
   const groupsQuery = trpc.xray.dnsRecords.groups.useQuery({
     zoneId: selectedZone?.zoneId ?? 1, search: search || undefined, page, pageSize: 20,
@@ -378,6 +380,20 @@ export default function DnsRecordManagementCard({
     setRemoving(null);
   };
 
+  const confirmBulkRemove = (records: readonly RecordItem[]) => {
+    if (!selectedZone || subdomain === null || editing || draftLocked || savingRef.current || drafts.length) return;
+    const fqdn = subdomain === "@" ? selectedZone.name : `${subdomain}.${selectedZone.name}`;
+    try {
+      const pending = createDnsRecordDeletionDrafts(records, fqdn, selectedZone.lines);
+      if (!pending.length) return;
+      setDrafts(pending);
+      setEditing(true);
+      setBulkDeleteOpen(false);
+    } catch (error) {
+      toast.error(dnsErrorMessage(error, "记录范围已变化，请重新读取。"));
+    }
+  };
+
   const editDraft = (draft: DnsRecordDraft) => {
     if (!selectedZone || draftLocked) return;
     setEditor({ mode: draft.original ? "update" : "create", record: draft.original, draftKey: draft.key,
@@ -443,6 +459,11 @@ export default function DnsRecordManagementCard({
             </Button>}
             {subdomain !== null && !editing && <Button type="button" onClick={() => setEditing(true)} disabled={currentSubdomainInUse || recordsQuery.isFetching || !!recordsQuery.error || mutationPending}>
               <Pencil className="mr-2 h-4 w-4" />编辑
+            </Button>}
+            {subdomain !== null && <Button type="button" variant="outline" className="min-h-11 text-destructive hover:text-destructive"
+              onClick={() => setBulkDeleteOpen(true)} disabled={editing || draftLocked || recordsQuery.isFetching || !!recordsQuery.error}
+              title={editing ? "请先保存或取消当前编辑" : currentSubdomainInUse ? "该子域名正在被系统使用" : "只删除当前子域名的 A、AAAA、CNAME，保存才生效"}>
+              <Trash2 className="mr-2 h-4 w-4" />删除全部解析
             </Button>}
             {editing && <>
               <Button type="button" variant="outline" disabled={mutationPending} onClick={() => drafts.length || saveFailure ? setDiscardOpen(true) : endEditing()}>{saveFailure ? "结束编辑并刷新" : "取消编辑"}</Button>
@@ -621,6 +642,13 @@ export default function DnsRecordManagementCard({
           </>
         )}
       </CardContent>
+
+      {bulkDeleteOpen && selectedZone && subdomain !== null && <DnsRecordBulkDeleteDialog
+        key={`${selectedZone.zoneId}:${subdomain}`} zoneId={selectedZone.zoneId} subdomain={subdomain}
+        fqdn={subdomain === "@" ? selectedZone.name : `${subdomain}.${selectedZone.name}`}
+        disabled={draftLocked || editing || drafts.length > 0} formatError={dnsErrorMessage}
+        onClose={() => setBulkDeleteOpen(false)} onConfirm={confirmBulkRemove}
+      />}
 
       {selectedZone && (
         <RecordEditorDialog
