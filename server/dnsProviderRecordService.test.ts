@@ -283,6 +283,32 @@ test("DNS record service groups names and protects only used subdomains, includi
         lineId: defaultLine.lineId, value: "1.1.1.1", ttl: 600,
       }, options);
 
+      const bulkBase = records[0];
+      const bulkRecords = Array.from({ length: 105 }, (_, i) => ({
+        ...bulkBase, providerRecordId: String(2000 + i), subdomain: "bulk",
+        recordType: i === 103 ? "AAAA" : i === 104 ? "CNAME" : "A",
+      }));
+      records.push(...bulkRecords, ...["TXT", "MX", "NS"].map((recordType, i) => ({
+        ...bulkBase, providerRecordId: String(3000 + i), subdomain: "bulk", recordType,
+      })), { ...bulkBase, providerRecordId: "4000", subdomain: "bulk-other" });
+      const beforePreview = structuredClone(records);
+      const preview = await service.previewDnsProviderRecordDeletion({ zoneId: zone.zoneId, subdomain: "BULK" }, options);
+      assert.equal(preview.fqdn, "bulk.example.com");
+      assert.equal(preview.records.length, 105, "preview includes all pages");
+      assert.equal(preview.preservedCount, 3);
+      assert.ok(preview.records.every(r => r.subdomain === "bulk" && ["A", "AAAA", "CNAME"].includes(r.recordType)));
+      assert.deepEqual(records, beforePreview, "preview must never write");
+      for (const record of preview.records) {
+        await service.removeDnsProviderRecord({ zoneId: zone.zoneId, providerRecordId: record.providerRecordId, expectedRecordRevision: record.recordRevision }, options);
+      }
+      assert.deepEqual(records.filter(r => r.subdomain === "bulk").map(r => r.recordType), ["TXT", "MX", "NS"]);
+      assert.ok(records.some(r => r.providerRecordId === "4000"));
+      const emptyPreview = await service.previewDnsProviderRecordDeletion({ zoneId: zone.zoneId, subdomain: "gone" }, options);
+      assert.deepEqual(emptyPreview.records, []);
+      assert.equal(emptyPreview.preservedCount, 0);
+      await runtime.executeRaw("UPDATE xray_quick_configs SET state = 'ACTIVE', fqdn = 'bulk.example.com', relativeName = 'bulk' WHERE id = ?", [qc.id]);
+      await expectCode(service.previewDnsProviderRecordDeletion({ zoneId: zone.zoneId, subdomain: "bulk" }, options), "DNS_SUBDOMAIN_IN_USE");
+
       const originalGet = client.getRecord;
       client.getRecord = async (input) => {
         const result = await originalGet(input);

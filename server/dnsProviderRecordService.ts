@@ -377,6 +377,32 @@ export async function listDnsProviderRecordGroups(input: {
   }
 }
 
+/** Read-only, unfiltered deletion selection; writes still use per-record revisions. */
+export async function previewDnsProviderRecordDeletion(input: {
+  zoneId: number; subdomain: string;
+}, options: DnsProviderRecordServiceOptions = {}) {
+  const subdomain = normalizedSubdomain(input.subdomain);
+  const context = await zoneContext(input.zoneId, options);
+  try {
+    await assertNamesWritable(context, [subdomain]);
+    const remote = await clientFor(context, options).listRecords({ zone: context.providerZone });
+    const used = await usedNamesFor(context);
+    const fqdn = recordFqdn(subdomain, context.zone.name);
+    if (used.has(fqdn)) fail("DNS_SUBDOMAIN_IN_USE");
+    const records: DnsProviderRecordSafeDto[] = [];
+    let preservedCount = 0;
+    for (const record of remote) {
+      if (record.subdomain.toLowerCase() !== subdomain) continue;
+      if ((WRITABLE_RECORD_TYPES as readonly string[]).includes(record.recordType)) {
+        records.push(safeRecord(record, context.zone.name, used));
+      } else preservedCount += 1;
+    }
+    return { zoneId: context.zone.zoneId, subdomain, fqdn, records, preservedCount };
+  } catch (error) {
+    mapError(error);
+  }
+}
+
 export async function createDnsProviderRecord(input: {
   zoneId: number;
   subdomain: string;

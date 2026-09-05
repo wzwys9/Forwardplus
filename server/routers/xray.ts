@@ -106,6 +106,7 @@ import {
   DnsProviderRecordServiceError,
   listDnsProviderRecords,
   listDnsProviderRecordGroups,
+  previewDnsProviderRecordDeletion,
   removeDnsProviderRecord,
   updateDnsProviderRecord,
 } from "../dnsProviderRecordService";
@@ -896,6 +897,13 @@ export const xrayRouter = router({
       }),
   }),
   dnsRecords: router({
+    deletionPreview: adminProcedure
+      .input(z.object({ zoneId: positiveId, subdomain: z.string().trim().min(1).max(253) }).strict())
+      .query(async ({ input, ctx }) => {
+        setSensitiveResponseHeaders(ctx.res);
+        try { return await previewDnsProviderRecordDeletion(input); }
+        catch (error) { dnsProviderRecordTrpcError(error); }
+      }),
     groups: adminProcedure
       .input(z.object({ zoneId: positiveId, search: z.string().trim().max(128).optional(), page, pageSize: pageSize.default(20) }).strict())
       .query(async ({ input, ctx }) => {
