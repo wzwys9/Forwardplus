@@ -224,6 +224,28 @@ test("DNS record service groups names and protects only used subdomains, includi
       assert.equal(detail.subdomain.inUse, false);
       const exactMissing = await service.listDnsProviderRecords({ zoneId: zone.zoneId, subdomain: "ww" }, options);
       assert.equal(exactMissing.total, 0);
+      // An empty detail must not depend on validating unrelated zone records.
+      const scopedClient = new provider.DnsPodProviderClient({
+        credentials: { secretId: "secret-id-value", secretKey: "secret-key-value" },
+        sleep: async () => {},
+        fetchImpl: async (_url, init) => {
+          const request = JSON.parse(init.body);
+          assert.equal(request.ErrorOnEmpty, "no");
+          const response = request.SubDomain === "deleted"
+            ? { RecordCountInfo: { TotalCount: 0 }, RecordList: [] }
+            : { RecordCountInfo: { TotalCount: 47 }, RecordList: [] };
+          return new Response(JSON.stringify({ Response: { ...response, RequestId: "scoped-empty" } }), {
+            headers: { "content-type": "application/json" },
+          });
+        },
+      });
+      const scopedOptions = { keyring, clientFactory: () => scopedClient };
+      const deleted = await service.listDnsProviderRecords({ zoneId: zone.zoneId, subdomain: "deleted" }, scopedOptions);
+      assert.deepEqual(deleted.items, []);
+      assert.deepEqual(deleted.subdomain, { name: "deleted", fqdn: "deleted.example.com", inUse: false });
+      assert.equal(deleted.total, 0);
+      await expectCode(service.listDnsProviderRecords({ zoneId: zone.zoneId, subdomain: "invalid" }, scopedOptions), "DNS_PROVIDER_INVALID_RESPONSE");
+      await expectCode(service.listDnsProviderRecordGroups({ zoneId: zone.zoneId }, scopedOptions), "DNS_PROVIDER_INVALID_RESPONSE");
       const www = detail.items.find((r) => r.recordType === "A");
       await expectCode(service.updateDnsProviderRecord({
         zoneId: zone.zoneId, providerRecordId: www.providerRecordId,

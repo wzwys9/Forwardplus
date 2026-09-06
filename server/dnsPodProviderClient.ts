@@ -67,6 +67,10 @@ export type DnsPodRecord = Readonly<{
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 type DnsPodObject = Record<string, unknown>;
+type RecordReadBudget = {
+  remainingPages: number;
+  stage: "RESPONSE" | "RECORD_COUNT" | "RECORD_LIST" | "RECORD_FIELDS" | "SNAPSHOT_UNSTABLE" | "PAGE_LIMIT";
+};
 
 function invalidResponse(): never {
   throw new DnsPodProviderError("DNS_PROVIDER_INVALID_RESPONSE");
@@ -400,37 +404,54 @@ export class DnsPodProviderClient {
   }
 
   async listRecords(input: { zone: DnsPodZone; subdomain?: string; recordType?: string }): Promise<DnsPodRecord[]> {
-    const budget = { remainingPages: this.maxPages };
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const records = await this.listRecordSnapshot(input, budget);
-      if (records !== null) return records;
-      if (attempt < 2 && budget.remainingPages > 0) await this.sleep(400 * (2 ** attempt));
-      else break;
+    const budget: RecordReadBudget = { remainingPages: this.maxPages, stage: "RESPONSE" };
+    try {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const records = await this.listRecordSnapshot(input, budget);
+        if (records !== null) return records;
+        if (attempt < 2 && budget.remainingPages > 0) await this.sleep(400 * (2 ** attempt));
+        else break;
+      }
+      invalidResponse();
+    } catch (error) {
+      if (error instanceof DnsPodProviderError && error.code === "DNS_PROVIDER_INVALID_RESPONSE") {
+        // Only fixed local enums: never log provider payloads, names or errors.
+        console.warn("[DNSPod] Record list validation failed", {
+          stage: budget.stage, scope: input.subdomain === undefined ? "ZONE" : "SUBDOMAIN",
+        });
+      }
+      throw error;
     }
-    invalidResponse();
   }
 
   private async listRecordSnapshot(
     input: { zone: DnsPodZone; subdomain?: string; recordType?: string },
-    budget: { remainingPages: number },
+    budget: RecordReadBudget,
   ): Promise<DnsPodRecord[] | null> {
     const records = new Map<string, DnsPodRecord>();
     let offset = 0;
     let expectedTotal: number | undefined;
     while (budget.remainingPages > 0) {
       budget.remainingPages -= 1;
+      budget.stage = "RESPONSE";
       const payload: DnsPodObject = { ...zonePayload(input.zone), Offset: offset, Limit: PAGE_SIZE, ErrorOnEmpty: "no" };
-      if (input.subdomain !== undefined) payload.SubDomain = normalizedSubdomain(input.subdomain);
+      // Existing DNS names can contain wildcards or underscores; write payloads
+      // continue to use the stricter hostname validator below.
+      if (input.subdomain !== undefined) payload.SubDomain = safeRequestString(input.subdomain, 253).toLowerCase();
       if (input.recordType !== undefined) payload.RecordType = safeRequestString(input.recordType, 16).toUpperCase();
       const response = await this.call("DescribeRecordList", payload);
+      budget.stage = "RECORD_COUNT";
       const totalInfo = object(response.RecordCountInfo);
       if (typeof totalInfo.TotalCount !== "number") invalidResponse();
       const total = nonnegativeInteger(totalInfo.TotalCount);
+      budget.stage = "RECORD_LIST";
       const recordList = response.RecordList === null && total === 0 ? [] : response.RecordList;
       if (!Array.isArray(recordList) || recordList.length > PAGE_SIZE) invalidResponse();
+      budget.stage = "RECORD_FIELDS";
       const batch = recordList.map((entry) => this.normalizeListedRecord(entry));
       // A concurrent delete or lagging index can invalidate pagination. Discard
       // the entire attempt; never expose a partial snapshot as an empty domain.
+      budget.stage = "SNAPSHOT_UNSTABLE";
       if (expectedTotal !== undefined && total !== expectedTotal) return null;
       expectedTotal = total;
       for (const record of batch) {
@@ -441,6 +462,7 @@ export class DnsPodProviderClient {
       if (offset === total) return [...records.values()];
       if (offset > total || batch.length < PAGE_SIZE) return null;
     }
+    budget.stage = "PAGE_LIMIT";
     invalidResponse();
   }
 

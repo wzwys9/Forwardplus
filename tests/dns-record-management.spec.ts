@@ -1,12 +1,13 @@
 import { expect, test, type Page } from "@playwright/test";
 
-async function mockDns(page: Page, types: string[]) {
+async function mockDns(page: Page, types: string[], options: { failAfterDelete?: boolean } = {}) {
   let records = types.map((recordType, index) => ({
     providerRecordId: String(index + 1), subdomain: "www", fqdn: "www.example.com", recordType,
     providerLineId: "0", lineName: "默认", value: "192.0.2.1", ttl: 600,
     status: "ENABLE", recordRevision: `revision-${index + 1}`, inUse: false,
   }));
   let inUse = false;
+  let readFailure = false;
   const writes: string[] = [];
   await page.route("**/fixture-trpc/**", async route => {
     const request = route.request(), url = new URL(request.url());
@@ -15,6 +16,13 @@ async function mockDns(page: Page, types: string[]) {
     let data: unknown;
     if (action === "groups") data = { items: [{ subdomain: "www", fqdn: "www.example.com", recordCount: records.length, recordTypes: [...new Set(records.map(r => r.recordType))], inUse }], total: 1, page: 1, pageSize: 20 };
     else if (action === "list") {
+      if (readFailure) {
+        await route.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: { json: {
+          message: "DNS_PROVIDER_INVALID_RESPONSE", code: -32603,
+          data: { code: "BAD_GATEWAY", httpStatus: 502, path: "xray.dnsRecords.list", xrayCode: "DNS_PROVIDER_INVALID_RESPONSE" },
+        } } }) });
+        return;
+      }
       const filtered = records.filter(r => !input.search || r.recordType.includes(input.search));
       data = { items: filtered.slice((input.page - 1) * input.pageSize, input.page * input.pageSize).map(r => ({ ...r, inUse })), total: filtered.length,
         page: input.page, pageSize: input.pageSize, subdomain: { name: "www", fqdn: "www.example.com", inUse }, zone: { zoneId: 1, name: "example.com", inUse } };
@@ -29,11 +37,12 @@ async function mockDns(page: Page, types: string[]) {
       expect(["A", "AAAA", "CNAME"]).toContain(record.recordType);
       writes.push(record.providerRecordId);
       records = records.filter(r => r !== record);
+      if (options.failAfterDelete) readFailure = true;
       data = { providerRecordId: record.providerRecordId };
     } else throw new Error(`unexpected DNS action ${action}`);
     await route.fulfill({ contentType: "application/json", body: JSON.stringify({ result: { data: { json: data } } }) });
   });
-  return { writes, lock: () => { inUse = true; }, records: () => records };
+  return { writes, lock: () => { inUse = true; }, records: () => records, recoverReads: () => { readFailure = false; } };
 }
 
 test("手机批量删除覆盖搜索外分页，确认仅暂存，保存保留其他类型", async ({ page }) => {
@@ -86,4 +95,37 @@ test("删空后正常空态，在用子域名禁止批量删除", async ({ page 
   await page.getByRole("button", { name: "刷新记录", exact: true }).click();
   await expect(page.getByRole("button", { name: "删除全部解析", exact: true })).toBeDisabled();
   expect(mock.writes).toHaveLength(1);
+});
+
+test("删空后的查询错误可重新加载恢复，期间不重放删除", async ({ page }) => {
+  const errors: string[] = [];
+  const statuses: number[] = [];
+  page.on("pageerror", error => errors.push(error.message));
+  page.on("response", response => {
+    if (new URL(response.url()).pathname.endsWith("dnsRecords.list")) statuses.push(response.status());
+  });
+  const mock = await mockDns(page, ["A"], { failAfterDelete: true });
+  await page.goto("/tests/fixtures/dns-record-management.html");
+  await page.getByRole("button", { name: "管理解析" }).click();
+  await page.getByRole("button", { name: "删除全部解析", exact: true }).click();
+  await page.getByLabel("输入完整域名确认").fill("www.example.com");
+  await page.getByRole("button", { name: "标记全部删除" }).click();
+  await page.getByRole("button", { name: "保存（1）" }).click();
+  await expect(page.getByText("DNSPod 返回了无法验证的响应。", { exact: true })).toBeVisible();
+  await expect(page.getByText("当前域名没有 DNS 记录", { exact: true })).not.toBeVisible();
+  expect(mock.writes).toEqual(["1"]);
+  const failedReload = page.waitForResponse(r => new URL(r.url()).pathname.endsWith("dnsRecords.list") && r.status() === 502);
+  await page.getByRole("button", { name: "重新加载", exact: true }).click();
+  await failedReload;
+  await expect(page.getByRole("button", { name: "重新加载", exact: true })).toBeEnabled();
+  await expect(page.getByText("DNSPod 返回了无法验证的响应。", { exact: true })).toBeVisible();
+  mock.recoverReads();
+  await page.getByRole("button", { name: "重新加载", exact: true }).click();
+  await expect(page.getByText("当前域名没有 DNS 记录", { exact: true })).toBeVisible();
+  await expect(page.getByText("DNS 记录加载失败", { exact: true })).not.toBeVisible();
+  await expect(page.getByRole("button", { name: "编辑", exact: true })).toBeEnabled();
+  expect(mock.writes).toEqual(["1"]);
+  expect(statuses).toEqual([200, 502, 502, 200]);
+  expect(errors).toEqual([]);
+  await page.screenshot({ path: "test-results/dns-empty-after-error.png" });
 });

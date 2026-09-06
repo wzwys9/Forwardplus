@@ -43,6 +43,51 @@ function clientWith(
   });
 }
 
+test("record reads support existing special names without relaxing write validation", async () => {
+  const names = ["@", "*", "*.edge", "_acme-challenge", "_sip._tcp", "WWW"];
+  const requests: Record<string, unknown>[] = [];
+  const client = clientWith(async (_url, init) => {
+    requests.push(requestPayload(init));
+    assert.equal(requestAction(init), "DescribeRecordList");
+    return dnsPodResponse({ RecordCountInfo: { TotalCount: 0 }, RecordList: [], RequestId: "special-read" });
+  });
+  const zone = { providerZoneId: "42", name: "example.com", grade: "DP_FREE" };
+  for (const subdomain of names) assert.deepEqual(await client.listRecords({ zone, subdomain }), []);
+  assert.deepEqual(requests.map(r => [r.SubDomain, r.ErrorOnEmpty]), names.map(name => [name.toLowerCase(), "no"]));
+  for (const subdomain of ["bad\nname", "x".repeat(254)]) {
+    await assert.rejects(client.listRecords({ zone, subdomain }), { code: "DNS_PROVIDER_REQUEST_REJECTED" });
+  }
+  for (const subdomain of ["*", "_acme-challenge"]) {
+    await assert.rejects(client.createRecord({
+      zone, subdomain, recordType: "A", line: { providerLineId: "0", name: "默认" }, value: "1.1.1.1", ttl: 600,
+    }), { code: "DNS_PROVIDER_REQUEST_REJECTED" });
+  }
+  assert.equal(requests.length, names.length);
+});
+
+test("record validation logs only fixed stages and scope, never provider or request content", async t => {
+  const logs: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => { logs.push(args); });
+  const row = { RecordId: 1, Name: "private-name", Type: "A", LineId: "0", Line: "默认", Value: "private-value", TTL: 600 };
+  const cases = [
+    { stage: "RESPONSE", response: () => new Response("private-response", { headers: { "content-type": "text/html" } }) },
+    { stage: "RECORD_COUNT", response: () => dnsPodResponse({ RequestId: "private-id", RecordCountInfo: { TotalCount: "private-count" }, RecordList: [] }) },
+    { stage: "RECORD_LIST", response: () => dnsPodResponse({ RequestId: "private-id", RecordCountInfo: { TotalCount: 0 }, RecordList: "private-container" }) },
+    { stage: "RECORD_FIELDS", response: () => dnsPodResponse({ RequestId: "private-id", RecordCountInfo: { TotalCount: 1 }, RecordList: [{ ...row, Value: "private-value\n" }] }) },
+    { stage: "SNAPSHOT_UNSTABLE", response: () => dnsPodResponse({ RequestId: "private-id", RecordCountInfo: { TotalCount: 1 }, RecordList: [] }) },
+    { stage: "PAGE_LIMIT", maxPages: 1, response: () => dnsPodResponse({ RequestId: "private-id", RecordCountInfo: { TotalCount: 101 }, RecordList: Array.from({ length: 100 }, (_, i) => ({ ...row, RecordId: i + 1 })) }) },
+  ];
+  for (const fixture of cases) {
+    for (const subdomain of [undefined, "private-subdomain"]) {
+      const client = clientWith(async () => fixture.response(), { maxPages: fixture.maxPages });
+      await assert.rejects(client.listRecords({ zone: { providerZoneId: "42", name: "private.example.com", grade: "DP_FREE" }, subdomain }), { code: "DNS_PROVIDER_INVALID_RESPONSE" });
+      assert.deepEqual(logs.splice(0), [["[DNSPod] Record list validation failed", {
+        stage: fixture.stage, scope: subdomain === undefined ? "ZONE" : "SUBDOMAIN",
+      }]]);
+    }
+  }
+});
+
 test("TC3 request is deterministic, canonical, and fixed to the DNSPod endpoint", () => {
   const first = buildDnsPodTc3Request({
     credentials: CREDENTIALS,

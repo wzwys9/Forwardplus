@@ -295,7 +295,10 @@ export async function listDnsProviderRecords(input: {
   const context = await zoneContext(input.zoneId, options);
   const subdomain = input.subdomain === undefined ? null : boundedText(input.subdomain, 253).toLowerCase();
   try {
-    const records = await clientFor(context, options).listRecords({ zone: context.providerZone });
+    const records = await clientFor(context, options).listRecords({
+      zone: context.providerZone,
+      ...(subdomain === null ? {} : { subdomain }),
+    });
     const usedNames = await usedNamesFor(context);
     const filtered = records.map((record) => safeRecord(record, context.zone.name, usedNames)).filter((record) => (
       (subdomain === null || record.subdomain === subdomain)
