@@ -594,6 +594,8 @@ profileId 固定为 `VLESS_RAW_TLS`、`VLESS_RAW_TLS_VISION`、`TROJAN_RAW_TLS`�
 
 `groups({ zoneId, search?, page=1, pageSize=20 })` 实时读取完整的有界 DNSPod 列表，按规范完整名称聚合后分页，返回每组 `{ subdomain, fqdn, recordCount, recordTypes, inUse }`。未删除配置、有效 claim、未清理托管记录和活动 operation 涉及的名称即使远端零记录也进入聚合列表。`list` 增加可选精确 `subdomain` 过滤；返回 `subdomain:{name,fqdn,inUse}|null`，每条记录增加 `inUse`，原 zone 聚合占用字段继续保留但不代表记录写权限。聚合搜索命中任一记录时返回整个组的真实记录数。
 
+`list` 指定 `subdomain` 时向 DNSPod 传递 `SubDomain`，按此过滤范围的 `TotalCount` 验证完整分页，再本地精确过滤、搜索和显示分页；不指定时保持全域读取。只读过滤名称允许已有 `@`、`*`、下划线等 provider 名称，仍有长度与控制字符限制，不复用只允许普通主机标签的写入校验。未知错误、缺失计数和不完整快照不得降级为空；`groups` 和 `deletionPreview` 的读取范围不变。
+
 三个 mutation 均必须在 provider 写入前从数据库重新计算完整子域名占用；占用时返回 `DNS_SUBDOMAIN_IN_USE` 冲突。create 检查目标名称，update 回读 provider recordId 后同时检查原名与新名，remove 检查回读原名。账号/catalog revision 变化、记录被第三方改写、recordId 不属于选定 zone 都必须 fail closed。写请求出现结果不明时返回 `DNS_WRITE_UNCERTAIN`，界面要求刷新而不自动重试。账号和 zone 删除/换绑仍受既有引用保护。
 
 编辑域名检查的 `DomainCheckDto` 增加可选 `ownedRecordRefs:string[]`，只包含当前 edit identity 对应托管记录且 provider recordId、zone、FQDN、type、line、value、TTL/hash 完全吻合的投影引用。该字段只辅助原域名的确认交互，不进入 token 或授予写权限；最终确认与 editApply 继续实时复核完整记录快照。新建请求不返回此字段。
