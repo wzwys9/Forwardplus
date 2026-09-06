@@ -7,12 +7,51 @@ import (
 	"time"
 )
 
-func TestDetectHTTPProtocolRequiresRequestLine(t *testing.T) {
-	if detectHTTPProtocol([]byte("GET /")) {
-		t.Fatal("expected short prefix to be rejected")
+func TestDetectHTTPProtocolLongRequestTargets(t *testing.T) {
+	longTarget := "/" + string(bytes.Repeat([]byte("a"), 300))
+	for _, sample := range []string{
+		"GET " + longTarget + " HTTP/1.1\r\n",
+		"GET /" + string(bytes.Repeat([]byte("a"), protocolGuardSampleMaxBytes)),
+		"GET /" + string(bytes.Repeat([]byte("a"), protocolGuardSampleMaxBytes-10)) + " HTTP/1.",
+	} {
+		if !detectHTTPProtocol([]byte(sample)) {
+			t.Fatalf("HTTP policy missed a long request target (%d bytes)", len(sample))
+		}
 	}
-	if !detectHTTPProtocol([]byte("GET / HTTP/1.1\r\nHost: example.com\r\n")) {
-		t.Fatal("expected full request line to be detected")
+	for _, sample := range []string{
+		"GET /" + string(bytes.Repeat([]byte("a"), protocolGuardSampleMaxBytes)) + "\x00",
+		"GET " + string(bytes.Repeat([]byte("a"), protocolGuardSampleMaxBytes)),
+		"GET /" + string(bytes.Repeat([]byte("a"), protocolGuardSampleMaxBytes)) + " HTTP/3.0",
+	} {
+		if detectHTTPProtocol([]byte(sample)) {
+			t.Fatal("invalid long request target was classified as HTTP")
+		}
+	}
+}
+
+func TestDetectHTTPProtocolRequiresRequestLine(t *testing.T) {
+	for _, sample := range []string{
+		"GET /",
+		"GET / HTTP/1.1",
+		"GET / HTTP/1.1\n",
+		"GET / HTTP/3.0\r\n",
+		"GET\t/\tHTTP/1.1\r\n",
+		"GET /\x00 HTTP/1.1\r\n",
+		"GET example.com HTTP/1.1\r\n",
+	} {
+		if detectHTTPProtocol([]byte(sample)) {
+			t.Fatalf("unexpected HTTP detection for %q", sample)
+		}
+	}
+	for _, sample := range []string{
+		"GET / HTTP/1.1\r\nHost: example.com\r\n",
+		"OPTIONS * HTTP/1.0\r\n",
+		"CONNECT example.com:443 HTTP/1.1\r\n",
+		"GET https://example.com/ HTTP/1.1\r\n",
+	} {
+		if !detectHTTPProtocol([]byte(sample)) {
+			t.Fatalf("expected HTTP detection for %q", sample)
+		}
 	}
 }
 

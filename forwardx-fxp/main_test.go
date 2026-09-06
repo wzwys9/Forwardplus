@@ -13,6 +13,81 @@ import (
 	"time"
 )
 
+func TestDetectHTTPProtocolLongRequestTargets(t *testing.T) {
+	longTarget := "/" + string(bytes.Repeat([]byte("a"), 300))
+	for _, sample := range []string{
+		"GET " + longTarget + " HTTP/1.1\r\n",
+		"GET /" + string(bytes.Repeat([]byte("a"), fxpProtocolSampleMax)),
+		"GET /" + string(bytes.Repeat([]byte("a"), fxpProtocolSampleMax-10)) + " HTTP/1.",
+	} {
+		if !detectHTTPProtocol([]byte(sample)) {
+			t.Fatalf("HTTP policy missed a long request target (%d bytes)", len(sample))
+		}
+	}
+	for _, sample := range []string{
+		"GET /" + string(bytes.Repeat([]byte("a"), fxpProtocolSampleMax)) + "\x00",
+		"GET " + string(bytes.Repeat([]byte("a"), fxpProtocolSampleMax)),
+		"GET /" + string(bytes.Repeat([]byte("a"), fxpProtocolSampleMax)) + " HTTP/3.0",
+	} {
+		if detectHTTPProtocol([]byte(sample)) {
+			t.Fatal("invalid long request target was classified as HTTP")
+		}
+	}
+}
+
+func TestHTTPPolicyRejectsLongRequestBeforeWritingSecureFrame(t *testing.T) {
+	for _, targetLength := range []int{300, 600} {
+		t.Run(strconv.Itoa(targetLength), func(t *testing.T) {
+			client, source := net.Pipe()
+			defer client.Close()
+			defer source.Close()
+			output, peer := net.Pipe()
+			defer output.Close()
+			peer.Close() // Any attempted forwarding fails instead of blocking the test.
+			secure, err := newSessionSecureConn(output, "http-policy-test", make([]byte, fxpSaltSize), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := []byte("GET /" + string(bytes.Repeat([]byte("a"), targetLength)) + " HTTP/1.1\r\n")
+			go func() {
+				_, _ = client.Write(payload)
+				client.Close()
+			}()
+			var forwarded atomic.Uint64
+			err = copyPlainToSecureWithPolicy(secure, source, nil, &forwarded, protocolPolicy{BlockHTTP: true}, nil, nil)
+			if err == nil || err.Error() != "protocol blocked: http" || forwarded.Load() != 0 {
+				t.Fatalf("long HTTP request was not blocked before forwarding: err=%v bytes=%d", err, forwarded.Load())
+			}
+		})
+	}
+}
+
+func TestDetectHTTPProtocolRequiresRequestLine(t *testing.T) {
+	for _, sample := range []string{
+		"GET /",
+		"GET / HTTP/1.1",
+		"GET / HTTP/1.1\n",
+		"GET / HTTP/3.0\r\n",
+		"GET\t/\tHTTP/1.1\r\n",
+		"GET /\x00 HTTP/1.1\r\n",
+		"GET example.com HTTP/1.1\r\n",
+	} {
+		if detectHTTPProtocol([]byte(sample)) {
+			t.Fatalf("unexpected HTTP detection for %q", sample)
+		}
+	}
+	for _, sample := range []string{
+		"GET / HTTP/1.1\r\nHost: example.com\r\n",
+		"OPTIONS * HTTP/1.0\r\n",
+		"CONNECT example.com:443 HTTP/1.1\r\n",
+		"GET https://example.com/ HTTP/1.1\r\n",
+	} {
+		if !detectHTTPProtocol([]byte(sample)) {
+			t.Fatalf("expected HTTP detection for %q", sample)
+		}
+	}
+}
+
 func TestFallbackDialTimeoutIsShorterThanNormalDial(t *testing.T) {
 	singleFallback := config{
 		ExitStrategy: "fallback",

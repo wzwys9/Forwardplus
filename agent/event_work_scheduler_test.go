@@ -1,10 +1,48 @@
 package main
 
 import (
+	"fmt"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestSupportBundleSchedulerLogsExcludeUntrustedTaskAndPanic(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStdout := os.Stdout
+	os.Stdout = writer
+	defer func() {
+		os.Stdout = originalStdout
+		reader.Close()
+		writer.Close()
+	}()
+
+	secret := "sensitive-support-panic-value"
+	scheduler := newSupportBundleScheduler(func(Config, supportBundleRequest) bool {
+		panic(secret)
+	})
+	if scheduler.schedule(Config{}, supportBundleRequest{TaskID: secret + strings.Repeat("x", supportBundleMaxTaskIDLength)}) {
+		t.Fatal("oversized task ID was accepted")
+	}
+	scheduler.run(supportBundleJob{request: supportBundleRequest{TaskID: "safe-task"}})
+	writer.Close()
+	os.Stdout = originalStdout
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(output), secret) {
+		t.Fatal("support bundle logs leaked untrusted task or panic content")
+	}
+	if !strings.Contains(string(output), "processing panicked task=safe-task") {
+		t.Fatal("support bundle panic diagnostic was lost")
+	}
+}
 
 func TestDesiredStatePushSchedulerCoalescesToLatestPendingSnapshot(t *testing.T) {
 	processed := make(chan string, 3)
@@ -193,5 +231,51 @@ func TestSupportBundleSchedulerAllowsRetryAfterReportFailure(t *testing.T) {
 	case <-finished:
 	case <-time.After(time.Second):
 		t.Fatal("support-bundle retry did not run")
+	}
+}
+
+func TestSupportBundleSchedulerBoundsPendingQueue(t *testing.T) {
+	started := make(chan string, supportBundleMaxQueuedJobs+1)
+	releaseFirst := make(chan struct{})
+	scheduler := newSupportBundleScheduler(func(_ Config, request supportBundleRequest) bool {
+		started <- request.TaskID
+		if request.TaskID == "queue-first" {
+			<-releaseFirst
+		}
+		return true
+	})
+
+	if !scheduler.schedule(Config{}, supportBundleRequest{TaskID: "queue-first"}) {
+		t.Fatal("first support-bundle request was not accepted")
+	}
+	select {
+	case taskID := <-started:
+		if taskID != "queue-first" {
+			t.Fatalf("first support-bundle task = %q", taskID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first support-bundle request did not start")
+	}
+
+	for index := 0; index < supportBundleMaxQueuedJobs; index++ {
+		taskID := fmt.Sprintf("queue-%d", index)
+		if !scheduler.schedule(Config{}, supportBundleRequest{TaskID: taskID}) {
+			t.Fatalf("queued support-bundle request %q was rejected", taskID)
+		}
+	}
+	if scheduler.schedule(Config{}, supportBundleRequest{TaskID: "queue-overflow"}) {
+		t.Fatal("support-bundle queue accepted more than its configured bound")
+	}
+	if scheduler.schedule(Config{}, supportBundleRequest{TaskID: "x" + string(make([]byte, supportBundleMaxTaskIDLength))}) {
+		t.Fatal("overlong support-bundle task id was accepted")
+	}
+
+	close(releaseFirst)
+	for expected := 0; expected < supportBundleMaxQueuedJobs; expected++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("queued support-bundle request %d did not finish", expected+1)
+		}
 	}
 }
